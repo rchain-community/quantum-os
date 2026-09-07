@@ -1074,12 +1074,11 @@ function iceServersFor(stun: string): RTCIceServer[] {
 /**
  * Whether `connect()` fetches a relay from the signaling server by default.
  *
- * Chat surviving over the flood overlay used to hide that calls need this: a
- * data-channel message can flood peer-to-agent-to-peer with no direct link,
- * but a MediaStreamTrack cannot — a call between two peers who can't form a
- * direct connection (symmetric NAT, mobile CGNAT, a NAT'd container) produced
- * no video at all, silently (quantum-os#126). Default on, because that is the
- * common case this tool is actually for, not the exception. `/ice auto off`
+ * The room is a full mesh, so two peers who can't form a direct connection
+ * (symmetric NAT, mobile CGNAT, a NAT'd container) can exchange neither chat
+ * nor video — and a call between them produced no video at all, silently
+ * (quantum-os#126) — until one side has a relay. Default on, because that is
+ * the common case this tool is actually for, not the exception. `/ice auto off`
  * opts out — the credential is short-lived and Cloudflare-minted per fetch
  * (see fetchAutoTurn), but whose machine your media passes through even
  * briefly is still a decision, same reasoning as `/ice turn` never being
@@ -1154,13 +1153,13 @@ function connectedLabel(): string {
  * this, and what matters is that it SAYS so rather than looking like chat is
  * broken.
  */
-const ROOM_HOLDS = 10;
+const ROOM_HOLDS = 15;
 /**
  * How long a handshake gets before we call it failed rather than slow.
  *
- * Longer than a retry cycle, deliberately: `peer.ts` sweeps every 12s and makes
- * its first attempt after 8, so a shorter grace announces a failure while the
- * repair is still in progress — and most of those repair themselves.
+ * Longer than a retry cycle, deliberately: `peer.ts` sweeps every 8s and makes
+ * its first attempt on the peer list, so a shorter grace announces a failure
+ * while the repair is still in progress — and most of those repair themselves.
  */
 const HANDSHAKE_GRACE_MS = 30_000;
 
@@ -1198,11 +1197,8 @@ function readConnection(row: { channel: string; connection: string; ice: string 
 }
 
 function reportUnreachable(id: string): void {
-  // isReachable, not hasChannel: under the bounded-degree overlay, "no
-  // direct channel" is the normal state for most peers past a handful in
-  // the room — it's only worth surfacing once there's also been no relay
-  // traffic from them at all (see peer.ts isReachable/lastHeardVia).
-  if (!qpeer || qpeer.isReachable(id) || !peers.has(id)) return;
+  // Full mesh: a peer is reachable iff we hold an open data channel to them.
+  if (!qpeer || qpeer.hasChannel(id) || !peers.has(id)) return;
   if (unreachableWarned.has(id)) return;
   // Long enough to be a problem rather than a handshake in progress. Timed from
   // when the peer appeared, whichever way it appeared: it used to be armed only
@@ -1224,11 +1220,10 @@ function reportUnreachable(id: string): void {
     "system");
   if (row) {
     addMessage("", `   connection ${row.connection} · ice ${row.ice} — ${readConnection(row)}`, "system");
-    // "No attempt in flight" for somebody the room can see means the two
-    // rosters disagree. Repair it from the side that knows, rather than
-    // reporting it and waiting.
+    // "No attempt in flight" for somebody the room can see: dial them now from
+    // this side rather than reporting it and waiting for the next sweep.
     if (row.connection === "none") {
-      qpeer.ensureConnected(id);
+      qpeer.redial(id);
       addMessage("", "   starting one now", "system");
     }
   }
@@ -1244,7 +1239,7 @@ function reportUnreachable(id: string): void {
  */
 function unreachablePeers(): string[] {
   if (!qpeer) return [];
-  return [...peers].filter((id) => !qpeer!.isReachable(id));
+  return [...peers].filter((id) => !qpeer!.hasChannel(id));
 }
 
 function renderChatLine(line: ChatLine): void {
@@ -1582,17 +1577,15 @@ function renderPeers(): void {
   for (const id of peers) {
     const li = document.createElement("li");
     li.textContent = peerLabel(id);
-    // isReachable, not hasChannel: past a handful of peers, "no direct
-    // channel" is the ordinary state — most peers are reached over the
-    // bounded-degree overlay (ring + skip-links), not a direct link. This
-    // only lights up once there's also been no relay traffic from them.
-    if (qpeer && !qpeer.isReachable(id)) {
+    // Full mesh: reachable iff we hold an open data channel to them.
+    if (qpeer && !qpeer.hasChannel(id)) {
       li.classList.add("unreachable");
       const warn = document.createElement("span");
       warn.textContent = " ⚠";
-      warn.title = "Not reachable — no direct channel and no relay traffic seen recently. Either "
-        + "the WebRTC handshake never completed, or every path to them (direct or via other "
-        + "peers) is down. Reload, drop a peer, or run your own signaling server.";
+      warn.title = "Not connected — no data channel has opened to this peer, so nothing typed "
+        + "reaches them. The WebRTC handshake either never completed or there is no network "
+        + "path between you. It keeps retrying; /conn shows what the connection is doing, "
+        + "/ice turn … adds a relay.";
       li.appendChild(warn);
     }
     const role = peerAgents.get(id);
@@ -6246,10 +6239,6 @@ async function connect(): Promise<void> {
       try {
       if (typeof data === "object" && data !== null) {
         const d = data as Record<string, unknown>;
-        // The overlay's own liveness beacon (peer.ts's periodic flood, kept
-        // for isReachable) — nothing to do here, receiving it at all is the
-        // point (it updates lastHeardVia inside peer.ts before this fires).
-        if (d.kind === "presence") return;
         if (d.kind === "name") {
           const status = await verifyDyncapIfPresent(from, d); setActiveRoom(ctx);
           const nm = String(d.name ?? "");
@@ -6274,16 +6263,10 @@ async function connect(): Promise<void> {
           if (nm.trim()) lastKnownNames.set(from, nm);   // sticky cache — survives flaps so the label persists across reconnects
           if (typeof d.agent === "string" && d.agent.trim()) {
             peerAgents.set(from, d.agent.trim());
-            qpeer?.dataOnly.add(from);
-            // Always keep a direct link to an AI agent regardless of ring
-            // position — pins every agent-tagged peer in the room, not
-            // specifically "yours"; there's no way from this envelope alone
-            // to tell whose agent it is.
-            qpeer?.pinNeighbor(from);
+            qpeer?.dataOnly.add(from);   // never push call media to an AI agent
           } else {
             peerAgents.delete(from);
             qpeer?.dataOnly.delete(from);
-            qpeer?.unpinNeighbor(from);
           }
           // Stamp/reconcile this identity's anchor onto any group membership, so a
           // member returning on a new browser (same anchor, new peerId) is re-linked.
@@ -7399,12 +7382,6 @@ async function connect(): Promise<void> {
     onPeerJoined(id) {
       const prev = activeRoom; setActiveRoom(ctx);
       try {
-        // A call in progress has no invite list — it's for whoever's in the
-        // room — so a peer who joins mid-call needs the same guaranteed
-        // direct connection start() gives everyone already present (media
-        // can't be relayed the way a data-channel message can under the
-        // bounded-degree overlay). Harmless no-op when no call is active.
-        if (calls.inCall()) qpeer?.pinNeighbor(id);
         const pending = pendingLeaves.get(id);
         if (pending !== undefined) {
           clearTimeout(pending);
@@ -7884,7 +7861,6 @@ function initUx(): void {
       say: (t) => addMessage("", t, "system"),
       label: (id) => peerLabel(id),
       isAgent: (id) => peerAgents.has(id),
-      roomPeers: () => [...peers],
       mediaBlocked: (strict) => {
         const p = qpeer;
         if (!p) return [];

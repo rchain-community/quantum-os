@@ -31,20 +31,11 @@ export interface PeerConfig {
  * STUN only tells each side what its public address looks like; the connection
  * is still made directly. Two peers behind symmetric NAT — a corporate network,
  * a mobile carrier doing CGNAT, a NAT'd container — have no address pair that
- * works, so the handshake fails permanently and retrying cannot help. That
- * case needs a TURN relay, and **chat surviving over the flood overlay used to
- * hide this**: a data-channel message can flood peer-to-agent-to-peer with no
- * direct link, but a `MediaStreamTrack` cannot, so a call between two networks
- * produced no video at all, silently (quantum-os#126).
- *
- * `peer.ts` itself still defaults to STUN-only — this constant is what a bare
- * `new QOSPeer(...)` gets (tests, `qospeer.mjs`, anyone who doesn't ask for
- * more). The **app** (`app.ts` `fetchAutoTurn`) is what supplies a relay by
- * default for a real room: it fetches a short-lived, Cloudflare-minted TURN
- * credential from the signaling server's own `GET /turn` (the master API
- * token never leaves that server) and merges it into `iceServers` before
- * `connect()`. "Whose machine your media passes through is a decision" still
- * holds — `/ice auto off` opts out, `/ice turn ...` substitutes your own.
+ * works, so the handshake fails permanently and retrying cannot help. That case
+ * needs a TURN relay, which the app (`app.ts` `fetchAutoTurn`) supplies by
+ * default: a short-lived Cloudflare-minted credential fetched from the
+ * signaling server's own `GET /turn`, merged into `iceServers` before
+ * `connect()`. `/ice auto off` opts out, `/ice turn ...` substitutes your own.
  */
 export const DEFAULT_ICE: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
@@ -59,55 +50,12 @@ function iceUfrag(sdp: string | null | undefined): string | null {
   return m ? m[1] : null;
 }
 
-/**
- * Ring + skip-link neighbor computation for the bounded-degree connection
- * overlay: sort everyone present lexicographically and connect to the peers
- * one and two positions away in each direction (degree 4). A pure function
- * of the roster, so every peer computes the same neighbor sets independently
- * — no coordination message needed — and the relation is symmetric by
- * construction (if B is in A's neighbor set, A is in B's).
- *
- * This degenerates to full mesh automatically for five or fewer peers: at
- * that size every peer is within distance 2 of every other, which is
- * exactly today's behaviour. There is no separate "mesh vs overlay" mode to
- * maintain — one formula. Past five it caps degree at 4 regardless of room
- * size, which is what keeps a big room from exceeding what a browser (or
- * the signaling server's handshake rate limit) will actually sustain.
- */
-export function ringSkipNeighbors(sortedIds: string[], myId: string): Set<string> {
-  const n = sortedIds.length;
-  const i = sortedIds.indexOf(myId);
-  const out = new Set<string>();
-  if (i === -1 || n <= 1) return out;
-  for (const off of [1, -1, 2, -2]) {
-    const j = ((i + off) % n + n) % n;
-    if (j !== i) out.add(sortedIds[j]);
-  }
-  return out;
-}
-
 /** Key holding "a tab is currently using this id", refreshed while it lives. */
 const LEASE = "qos-peer-lease:";
 const LEASE_TICK_MS = 5_000;
 /** How long without a refresh before an id counts as abandoned. */
 const LEASE_STALE_MS = 20_000;
 
-/**
- * An identity that survives a phone discarding the tab.
- *
- * It used to live in sessionStorage alone, which is per-tab and therefore
- * distinct between two tabs — right — but which a mobile browser throws away
- * when it evicts a backgrounded tab. So a phone whose screen locked came back
- * as a NEW peer every time: the room filled with ghosts of its previous
- * incarnations, each listed and unreachable, each intro'd to again, until the
- * signaling heartbeat eventually evicted them. Every symptom of that looks like
- * a connection problem and none of it is one.
- *
- * So an id is leased. A live tab keeps saying it is using its id; a tab that
- * goes away stops, and the next load reclaims the abandoned id rather than
- * minting another. Two tabs open at once still differ, because both leases are
- * fresh and only an expired one can be taken.
- */
 /** This browser's dyncap anchor, read straight from the persisted state
  *  (`qos-dyncap-state`, written by app.ts) so peer.ts needn't import dyncap.ts.
  *  Null before the identity exists (very first launch) or if storage is off. */
@@ -131,18 +79,26 @@ function readLease(raw: string | null): { at: number; anchor: string | null } {
   return { at: Number(raw) || 0, anchor: null };
 }
 
+/**
+ * An identity that survives a phone discarding the tab.
+ *
+ * It used to live in sessionStorage alone, which is per-tab (right — two tabs
+ * must differ) but which a mobile browser throws away when it evicts a
+ * backgrounded tab. So a phone whose screen locked came back as a NEW peer every
+ * time, filling the room with unreachable ghosts of its previous incarnations.
+ *
+ * So an id is leased: a live tab keeps saying it is using its id; a tab that
+ * goes away stops, and the next load reclaims the abandoned id rather than
+ * minting another — but only a lease left by this same dyncap anchor (a
+ * different anchor's id is a prior occupant of a recycled id: taking it means
+ * every peer that TOFU-pinned that id refuses our signed envelopes).
+ */
 function claimPeerId(): string {
   try {
     const mine = sessionStorage.getItem("qos-peer-id");
     if (mine && validateCapability(mine)) { touchLease(mine); return mine; }
   } catch { /* storage unavailable */ }
 
-  // Reclaim an abandoned id rather than mint a new one — BUT only one this same
-  // identity held. A lease scoped to a different dyncap anchor belongs to a
-  // prior occupant of a recycled id (an identity recovery, a storage clear, an
-  // incognito session that leaked a key): taking it means every peer that
-  // TOFU-pinned that id refuses our signed `name`/`lemma`/… as an anchor
-  // mismatch, and we show up as a permanent hex id. Mint fresh in that case.
   const anchor = myAnchor();
   let reclaimed: string | null = null;
   try {
@@ -169,8 +125,20 @@ function touchLease(id: string): void {
   try { localStorage.setItem(LEASE + id, JSON.stringify({ at: Date.now(), anchor: myAnchor() })); } catch { /* ignore */ }
 }
 
-/// A QuantumOS browser peer.
-/// Identity is a ZFA capability token — possessing the peer ID IS authorization.
+/**
+ * A QuantumOS browser peer — full mesh over an untrusted signaling relay.
+ *
+ * Every browser opens a data channel to every other browser in the room. For
+ * any pair, the peer with the lexicographically-SMALLER id is the one that
+ * dials; the larger only answers. Because only one side ever sends an offer for
+ * establishment, there is no glare to arbitrate. The larger side steps in as a
+ * fallback dialler only if a peer has sat unconnected for a while (a dead or
+ * old-build smaller peer). Media renegotiation is the one path where either
+ * side may offer, so a standard perfect-negotiation collision guard is kept for
+ * that alone.
+ *
+ * Identity is a ZFA capability token — possessing the peer ID IS authorization.
+ */
 export class QOSPeer {
   readonly peerId: string;
   private ws: WebSocket | null = null;
@@ -181,9 +149,8 @@ export class QOSPeer {
    * has to be retried.
    */
   private roster = new Set<string>();
-  /** peerId → when to try dialling again, and how many times we have. */
+  /** peerId → when to try dialling again. */
   private retryAt = new Map<string, number>();
-  private retryN = new Map<string, number>();
   /** peerId → when the current connection attempt began. */
   private attemptAt = new Map<string, number>();
   private sweepTimer?: ReturnType<typeof setInterval>;
@@ -195,96 +162,46 @@ export class QOSPeer {
   private _stableTimer: ReturnType<typeof setTimeout> | null = null;
   // Peers that are data-only (AI agents): never push call media to them. They have no
   // speaker/headset, can echo our audio back through their WebRTC stack, and the call
-  // renegotiation needlessly churns their connection. Populated by the app from its
-  // agent map.
+  // renegotiation needlessly churns their connection. Populated by the app.
   readonly dataOnly = new Set<string>();
+
   // Reconnect backoff: doubles on each failed attempt up to a cap, with ±50% jitter
-  // (so concurrent peers/tabs desync instead of retrying in lock-step). The free
-  // signaling server rate-limits; a fixed/instant retry makes a dropped tab re-hammer
-  // it → "rate limit exceeded" → drop → storm. CRUCIAL: the backoff only RESETS to the
-  // floor after a connection stays up ≥ STABLE_MS — a rate-limited open-then-instant-
-  // close must keep backing off, not reset to the floor every cycle and re-storm (the
-  // old bug: resetting on `open` alone).
+  // (so concurrent peers/tabs desync instead of retrying in lock-step). CRUCIAL: the
+  // backoff only RESETS to the floor after a connection stays up ≥ STABLE_MS — a
+  // rate-limited open-then-instant-close must keep backing off, not reset every cycle.
   private _reconnectDelay = 1500;
   private static readonly RECONNECT_MIN = 1500;
   private static readonly RECONNECT_MAX = 30000;
-  /// Gap between offers when dialling a room's existing peers (see "peers" below).
-  private static readonly JOIN_STAGGER_MS = 250;
-  /**
-   * How many handshakes may be in flight at once.
-   *
-   * A dial is not one message: it is an offer and then a trickle of ICE
-   * candidates, and doing that to everybody at once makes a join cost a burst
-   * that grows with the room. Past what the signaling server will carry per
-   * connection, handshakes stop completing — which from inside a browser looks
-   * exactly like peers who never arrived. Three at a time finishes a room of
-   * ten in a few seconds and never spikes.
-   */
-  private static readonly MAX_IN_FLIGHT = 3;
+  private static readonly STABLE_MS = 15000;
+
   /// How often to look for peers in the room we have no channel to.
-  private static readonly SWEEP_MS = 12_000;
-  /// Backoff between attempts at one peer, doubling to a ceiling.
-  /// Long enough for a slow path to finish: mobile networks gather more
-  /// candidates and check them for longer than a laptop on wifi does.
-  private static readonly RETRY_MIN_MS = 20_000;
-  /// How long a connection may be "connecting" before it counts as stuck.
+  private static readonly SWEEP_MS = 8_000;
+  /// Minimum gap between dial attempts at one peer.
+  private static readonly RETRY_INTERVAL_MS = 10_000;
+  /// Extra wait before the LARGER-id side steps in as a fallback dialler. The
+  /// smaller id is the normal initiator; the larger only dials if the peer has
+  /// stayed unconnected past this — covers a dead or old-build smaller peer,
+  /// without both sides racing (and glaring) in the common case.
+  private static readonly FALLBACK_EXTRA_MS = 15_000;
+  /// How long a connection may be "connecting" before it counts as stuck. Long
+  /// enough for a slow path (mobile: more candidates, longer checks) to finish.
   private static readonly ATTEMPT_PATIENCE_MS = 45_000;
-  /// How much longer the higher-id side waits, so the two rarely dial at once.
-  private static readonly POLITE_EXTRA_MS = 7_000;
-  private static readonly RETRY_MAX_MS = 90_000;
-  private static readonly STABLE_MS = 15000;   // a connection must survive this long to reset the backoff
+
   // Live-call media: the local mic/cam stream shared into all connections, and a
-  // per-peer "we have an outstanding offer" flag for perfect-negotiation glare.
+  // per-peer "we have an outstanding offer" flag for perfect-negotiation glare
+  // (only reachable via media renegotiation now, not establishment).
   private localStream: MediaStream | null = null;
   private makingOffer = new Map<string, boolean>();
+
   // Per-peer grace timer for a transient ICE "disconnected": WebRTC can briefly
-  // flap to "disconnected" and recover to "connected". We only declare the peer
-  // gone if it has not recovered within this window — preventing a ghost from
-  // lingering (handled) AND a healthy peer from being evicted on a blip.
+  // flap to "disconnected" and recover. We only act if it has not recovered
+  // within this window.
   private disconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private static readonly DISCONNECT_GRACE_MS = 8000;
-
-  // Bounded-degree overlay (ring + skip-links, see ringSkipNeighbors above).
-  // `pins` are peers we want a direct link to regardless of ring position
-  // (an agent, a diagnostic /conn "connect now", a future call participant)
-  // — additive on top of the computed neighbor set.
-  private pins = new Set<string>();
-  // Grace-then-close timers for open connections that fell outside the
-  // target neighbor set (roster reshuffle, or an unpin). Mirrors
-  // disconnectTimers' shape, but a prune is not a departure — see prunePeer.
-  private pruneTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  // Between DISCONNECT_GRACE_MS (8s, a real ICE blip) and RETRY_MAX_MS (90s,
-  // a failing dial's backoff ceiling) — enough for a couple of SWEEP_MS
-  // cycles to let a roster reshuffle (peers joining/leaving close together)
-  // settle before actually closing a link that's still working.
-  private static readonly PRUNE_GRACE_MS = 30_000;
-
-  // Message relay (flooding, no routing table) for reaching a peer beyond
-  // direct reach — see broadcast()/send()/handleRelay(). `seenRelay` dedupes
-  // a message that reaches us by two paths (a ring link and its skip-link);
-  // bounded like bridge.mjs's own durable dedupe (firstState), since this
-  // must survive the message's full multi-hop lifetime, not just one burst.
-  private seenRelay = new Set<string>();
-  private static readonly SEEN_RELAY_MAX = 5000;
-  private relayCounter = 0;
-
-  // "Can we reach this peer at all" (direct channel OR recent relay
-  // traffic), as opposed to hasChannel's "are we directly linked to them" —
-  // see isReachable. Updated from relay traffic's _from field, and kept
-  // fresh for otherwise-silent peers by a periodic presence flood.
-  private lastHeardVia = new Map<string, number>();
-  private static readonly REACHABLE_WINDOW_MS = 45_000;
-  private presenceTimer?: ReturnType<typeof setInterval>;
-  // 1.5x this is REACHABLE_WINDOW_MS — tolerates one missed beat before a
-  // silent peer reads as unreachable, the same "miss one, not two" idiom as
-  // qospeer.mjs's own ping/pong keepalive.
-  private static readonly PRESENCE_FLOOD_MS = 30_000;
 
   constructor(config: PeerConfig) {
     this.config = config;
     this.peerId = config.peerId ?? claimPeerId();
-    // Keep saying this id is live, so a tab that goes away stops saying it and
-    // the next one can take it back.
     try {
       this.leaseTimer = setInterval(() => touchLease(this.peerId), LEASE_TICK_MS);
     } catch { /* no storage, no lease */ }
@@ -296,21 +213,12 @@ export class QOSPeer {
       console.warn(`[qos-peer] roomId ZFA check failed (may be cached token): ${this.config.roomId}`);
     }
     this._openSignaling().catch(() => this._scheduleReconnect());
-    // A peer in the room we have no channel to is a peer nothing we type
-    // reaches. Look for those on a timer rather than only when the server
-    // happens to re-send the room's list.
     if (!this.sweepTimer) this.sweepTimer = setInterval(() => this.sweep(), QOSPeer.SWEEP_MS);
-    // Keeps isReachable() honest for peers who are relay-only (past direct
-    // reach) and otherwise never send anything themselves.
-    if (!this.presenceTimer) {
-      this.presenceTimer = setInterval(() => this.broadcast({ kind: "presence" }), QOSPeer.PRESENCE_FLOOD_MS);
-    }
   }
 
   disconnect(): void {
     this._disconnected = true;
     if (this.sweepTimer) clearInterval(this.sweepTimer);
-    if (this.presenceTimer) clearInterval(this.presenceTimer);
     if (this.leaseTimer) clearInterval(this.leaseTimer);
     if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
     if (this._stableTimer) clearTimeout(this._stableTimer);
@@ -321,22 +229,18 @@ export class QOSPeer {
     this.channels.clear();
     for (const t of this.disconnectTimers.values()) clearTimeout(t);
     this.disconnectTimers.clear();
-    for (const t of this.pruneTimers.values()) clearTimeout(t);
-    this.pruneTimers.clear();
   }
 
   /// Recover promptly after a background-throttled / frozen tab returns to the
-  /// foreground. Browsers throttle hidden tabs (starving WebRTC consent-freshness)
-  /// and clamp our reconnect setTimeout, so peers drop and come back only slowly.
-  /// Called from a visibilitychange/focus handler: if signaling is dead, reconnect
-  /// NOW (cancel the throttled backoff and reset it); if it's alive, re-join so the
-  /// server re-sends the peer list and we re-establish any channels that lapsed.
+  /// foreground. If signaling is dead, reconnect NOW (cancel the throttled
+  /// backoff and reset it); if it's alive, re-join so the server re-sends the
+  /// peer list and we re-establish any channels that lapsed.
   wake(): void {
     if (this._disconnected) return;
     const ws = this.ws;
     if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
       if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
-      this._reconnectDelay = QOSPeer.RECONNECT_MIN;        // reset backoff — we're foreground again
+      this._reconnectDelay = QOSPeer.RECONNECT_MIN;
       void this._reconnectSignaling();
     } else if (ws.readyState === WebSocket.OPEN) {
       this.signal({ type: "join", roomId: this.config.roomId, peerId: this.peerId });
@@ -344,80 +248,34 @@ export class QOSPeer {
   }
 
   /**
-   * Make sure we are at least trying to reach this peer.
-   *
-   * The room's roster and this one can disagree: a `peers` list replaces this
-   * set wholesale, so a peer the server omitted once — mid-flap, or joining as
-   * the list was built — is dropped here while the app still shows them
-   * present. Nothing then dials them, and the room reports somebody present
-   * that no attempt is being made to reach, which is as useless as it sounds.
-   * The app can say "this one, now".
+   * Manual "connect to this peer now" for the `/conn` diagnostic. Unlike the
+   * sweep it dials regardless of which side is the normal initiator — a person
+   * asking for it wants the link, not the etiquette.
    */
-  ensureConnected(peerId: string): void {
+  redial(peerId: string): void {
     if (this._disconnected || peerId === this.peerId) return;
     this.roster.add(peerId);
-    this.pinNeighbor(peerId);
-  }
-
-  /**
-   * Always keep a direct link to this peer, regardless of ring/skip
-   * position — additive on top of the computed overlay neighbor set (see
-   * ringSkipNeighbors). Used for peers we deliberately want reachable no
-   * matter how the room is shaped: an AI agent, a diagnostic "connect now",
-   * a live-call participant (media can't be relayed).
-   *
-   * Pinning is a local, one-sided decision — the other side has no wire
-   * signal that we just pinned them — so it dials immediately rather than
-   * waiting for the next sweep/reconcile pass, the same way ensureConnected
-   * always has.
-   */
-  pinNeighbor(peerId: string): void {
-    if (peerId === this.peerId) return;
-    this.pins.add(peerId);
+    this.retryAt.delete(peerId);
     if (this.channels.get(peerId)?.readyState === "open") return;
     if (this.connecting(peerId)) return;
-    this.retryAt.delete(peerId);
     void this.initiateConnection(peerId);
   }
 
-  /// Release a pin. The link doesn't close instantly — it goes through the
-  /// same grace-then-prune path as any other connection that's fallen
-  /// outside the target set, in case it's still a ring/skip neighbor anyway.
-  unpinNeighbor(peerId: string): void {
-    this.pins.delete(peerId);
-    this.reconcilePrune();
-  }
+  /// Whether the signaling WebSocket is currently open (used to label status).
+  isSignalingUp(): boolean { return this.ws?.readyState === WebSocket.OPEN; }
 
-  /// Who we should be directly connected to right now: ring+skip neighbors
-  /// (see ringSkipNeighbors) plus anything pinned. Full mesh falls out of
-  /// this automatically for five or fewer peers.
-  private targetPeers(): Set<string> {
-    const sorted = [...new Set([...this.roster, this.peerId])].sort();
-    const set = ringSkipNeighbors(sorted, this.peerId);
-    for (const p of this.pins) if (p !== this.peerId) set.add(p);
-    return set;
-  }
-
-  /// Can we reach this peer at all — a direct channel, or relay traffic seen
-  /// from them recently (including the periodic presence flood, so an
-  /// otherwise-silent peer isn't mistaken for unreachable)? Under the
-  /// overlay, "no direct channel" is normal for most peers past a handful in
-  /// the room — this answers "can I talk to them", where hasChannel answers
-  /// "am I directly linked to them", which stays meaningful on its own for
-  /// /conn-style diagnostics.
-  isReachable(peerId: string): boolean {
-    if (this.hasChannel(peerId)) return true;
-    const last = this.lastHeardVia.get(peerId);
-    return last !== undefined && Date.now() - last < QOSPeer.REACHABLE_WINDOW_MS;
+  /// Whether a data channel to this peer is open — whether anything we send
+  /// them can actually arrive. Being in the room is NOT the same thing: the
+  /// signaling server can list a peer whose WebRTC handshake never completed.
+  hasChannel(peerId: string): boolean {
+    return this.channels.get(peerId)?.readyState === "open";
   }
 
   /**
-   * What every connection is doing right now.
-   *
-   * The roster can say reachable or not; this says why not. "checking" that
-   * never ends is candidates that never pair; "failed" is no path at all; a
-   * connection that is "connected" with no open channel is a different fault
-   * again. Guessing between those has cost a whole evening.
+   * What every connection is doing right now. The roster says reachable or not;
+   * this says why not. "checking" that never ends is candidates that never
+   * pair; "failed" is no path at all; "connected" with no open channel is a
+   * different fault again.
    */
   connectionReport(): { peerId: string; channel: string; connection: string; ice: string }[] {
     const ids = new Set([...this.roster, ...this.connections.keys(), ...this.channels.keys()]);
@@ -430,81 +288,23 @@ export class QOSPeer {
     }));
   }
 
-  /// Whether the signaling WebSocket is currently open (used to label connection status).
-  isSignalingUp(): boolean { return this.ws?.readyState === WebSocket.OPEN; }
-
-  /// Whether a data channel to this peer is open — whether anything we send
-  /// them can actually arrive. Being in the room is NOT the same thing: the
-  /// signaling server can list a peer whose WebRTC handshake never completed,
-  /// and to that peer everything typed here is silence.
-  hasChannel(peerId: string): boolean {
-    return this.channels.get(peerId)?.readyState === "open";
-  }
-
-  /// Send data to a specific peer. Direct and raw — byte-identical to
-  /// today, no format change — if we hold an open channel to them (still
-  /// true for everyone in a room of five or fewer, and for anyone pinned).
-  /// Otherwise flood-routes it over the overlay: tagged with a dedupe id, a
-  /// remaining-hop budget, and who it's actually for, so every neighbor
-  /// relays it onward (whether or not they're the target) until it reaches
-  /// someone who is. No routing table — a deliberate simplicity tradeoff,
-  /// accepted for how infrequent a direct send to a non-neighbor is.
+  /// Send data to a specific peer. Returns false if no open channel to them.
   send(targetPeerId: string, data: unknown): boolean {
     const ch = this.channels.get(targetPeerId);
     if (ch && ch.readyState === "open") {
       ch.send(JSON.stringify(data));
       return true;
     }
-    if (this.channels.size === 0) return false;
-    const relayId = this.nextRelayId();
-    const tagged = {
-      ...(data as Record<string, unknown>),
-      _relayId: relayId, _hops: this.hopBudget(), _from: this.peerId, _relayTo: targetPeerId,
-    };
-    for (const other of this.channels.values()) {
-      if (other.readyState === "open") other.send(JSON.stringify(tagged));
-    }
-    return true;
+    return false;
   }
 
-  /// Broadcast to the room. Sent as a flood over the bounded-degree overlay
-  /// (see ringSkipNeighbors) — tagged with a dedupe id and a remaining-hop
-  /// budget so a peer beyond direct reach still gets it via relay, once,
-  /// with no routing table. A room of five or fewer is still direct to
-  /// everyone, so this degenerates to exactly today's fan-out.
+  /// Broadcast to every peer we hold an open channel to (full mesh — that is
+  /// everyone in the room).
   broadcast(data: unknown): void {
-    const relayId = this.nextRelayId();
-    const tagged = {
-      ...(data as Record<string, unknown>),
-      _relayId: relayId, _hops: this.hopBudget(), _from: this.peerId,
-    };
-    const payload = JSON.stringify(tagged);
-    // Write directly rather than through send(): every entry here is by
-    // definition an open channel (we're iterating this.channels itself), so
-    // send()'s no-direct-link flood-fallback branch — which would add a
-    // _relayTo that doesn't belong on a broadcast — must never run here.
+    const payload = JSON.stringify(data);
     for (const ch of this.channels.values()) {
       if (ch.readyState === "open") ch.send(payload);
     }
-  }
-
-  /// Unique id for one flood — `${peerId}:${counter}` is globally unique, so
-  /// dedupe never collides across peers. Marked seen immediately, not just
-  /// on receipt: without this, a broadcast that loops all the way around the
-  /// ring back to its own originator would be delivered to onMessage twice.
-  private nextRelayId(): string {
-    const id = `${this.peerId}:${this.relayCounter++}`;
-    this.seenRelay.add(id);
-    if (this.seenRelay.size > QOSPeer.SEEN_RELAY_MAX) this.seenRelay.clear();
-    return id;
-  }
-
-  /// Remaining-hop budget for a new flood — roughly 2x the true worst-case
-  /// ring+skip diameter (~n/4), erring generous: dedupe already bounds the
-  /// redundant-relay cost of an oversized budget, while an undersized one
-  /// would mean a directed send genuinely fails to arrive.
-  private hopBudget(): number {
-    return Math.max(4, Math.ceil((this.roster.size + 1) / 2));
   }
 
   /// Largest send-buffer backlog across open channels (bytes) — used to pace
@@ -530,11 +330,8 @@ export class QOSPeer {
     }
   }
 
-  /// The senders carrying our video, one per connection that has one.
-  ///
-  /// A screen share replaces the track on all of them: one connection per peer,
-  /// so swapping only the first would share with one person and leave everyone
-  /// else looking at the camera.
+  /// The senders carrying our video, one per connection that has one. A screen
+  /// share replaces the track on all of them.
   videoSenders(): RTCRtpSender[] {
     const out: RTCRtpSender[] = [];
     for (const [peerId, pc] of this.connections) {
@@ -585,14 +382,10 @@ export class QOSPeer {
     this.ws = ws;
 
     // CONNECT-TIMEOUT WATCHDOG. A hung/half-open signaling socket can fire NEITHER
-    // `onopen` NOR `onerror`: the server accepts the TCP then never completes the WS
-    // handshake (e.g. a free-tier signaling server that died mid-flight). Without a
-    // bound this connect promise never settles, so `_openSignaling` hangs forever and
-    // the peer wedges — alive but permanently disconnected, never rescheduling a
-    // reconnect (the post-open heartbeat cannot help, because `onopen` never fired).
-    // Bound the handshake: if `onopen` hasn't arrived within CONNECT_TIMEOUT_MS, close
-    // the socket and reject so the caller (`connect`/`_reconnectSignaling`) reschedules
-    // with backoff. Self-heals the wedge a hard signaling-server drop used to cause.
+    // `onopen` NOR `onerror` (the server accepts the TCP then never completes the WS
+    // handshake). Without a bound this connect promise never settles and the peer
+    // wedges — alive but permanently disconnected. Bound it: close and reject so the
+    // caller reschedules with backoff.
     const CONNECT_TIMEOUT_MS = 20000;
     await new Promise<void>((resolve, reject) => {
       const t = setTimeout(() => {
@@ -627,14 +420,11 @@ export class QOSPeer {
       this._scheduleReconnect();
     };
 
-    // Join the room
     this.signal({ type: "join", roomId: this.config.roomId, peerId: this.peerId });
     this.config.onSignalingOpen?.();
   }
 
   /// Schedule a reconnect with exponential backoff + ±50% jitter, single-flight.
-  /// Grows the delay each call; the stability timer in `_openSignaling` resets it
-  /// once a connection has lasted ≥ STABLE_MS.
   private _scheduleReconnect(): void {
     if (this._disconnected || this._reconnectTimer) return;
     this._reconnectDelay = Math.min(this._reconnectDelay * 2, QOSPeer.RECONNECT_MAX);
@@ -653,73 +443,42 @@ export class QOSPeer {
     }
   }
 
+  /// For any pair, the lexicographically-smaller id is the one that dials.
+  private initiates(peerId: string): boolean {
+    return this.peerId < peerId;
+  }
+
   private handleSignal(msg: SignalMsg): void {
     switch (msg.type) {
       case "peers": {
-        // On signaling reconnect the server re-sends the peers list. Skip peers
-        // where the WebRTC data channel is still open — no need to re-establish.
-        //
-        // We dial our overlay targets only (see targetPeers/ringSkipNeighbors),
-        // not everyone in the room — but onPeerJoined still fires for every
-        // peer in the list, unfiltered, so the app's roster keeps showing
-        // everyone present, whether or not they're a direct neighbor.
-        //
-        // The dial is staggered. Firing every offer at once is a burst the
-        // joiner inflicts on itself: each connection follows its offer with
-        // its own ICE candidates, so N-1 offers plus their candidate storms
-        // land in the same instant, tripping the server's per-connection rate
-        // limit exactly when a room needs every handshake to land. A join
-        // spread over a second or two is not slower in any way a person
-        // notices — and bounded degree means N-1 was never really the count
-        // anyway, just the four-ish targets below.
+        // On signaling reconnect the server re-sends the peers list. onPeerJoined
+        // fires for everyone (the app's roster shows all present); we dial only
+        // the peers we're the initiator for and have no open channel to.
         this.roster = new Set(msg.peers);
-        const targets = this.targetPeers();
-        let nth = 0;
         for (const peerId of msg.peers) {
           this.config.onPeerJoined?.(peerId);
-          if (!targets.has(peerId)) continue;
-          const ch = this.channels.get(peerId);
-          if (ch?.readyState === "open") continue;
-          const at = nth++ * QOSPeer.JOIN_STAGGER_MS;
-          if (at === 0) { void this.initiateConnection(peerId); continue; }
-          setTimeout(() => {
-            if (this._disconnected) return;
-            if (this.channels.get(peerId)?.readyState === "open") return;
-            // Wait rather than pile on: the sweep will pick up whoever is left.
-            if (this.inFlight() >= QOSPeer.MAX_IN_FLIGHT) return;
-            void this.initiateConnection(peerId);
-          }, at);
+          if (peerId === this.peerId) continue;
+          if (this.channels.get(peerId)?.readyState === "open") continue;
+          if (this.connecting(peerId)) continue;
+          if (this.initiates(peerId)) void this.initiateConnection(peerId);
         }
-        // A roster arriving fresh (we just (re)connected) is the one moment
-        // we're the unilateral initiator — safe to dial immediately above.
-        // Pruning is always safe (a local, unilateral decision), so it runs
-        // here too.
-        this.reconcilePrune();
         break;
       }
       case "joined":
-        // The joiner dials us, which is why nothing is initiated here — but a
-        // dial that never lands has to be retried by somebody, and the sweep
-        // below is what does it. (Both sides now potentially want to dial
-        // each other under the new roster — sweep's existing polite/impolite
-        // glare handling is what makes that safe; reconcilePrune below only
-        // ever closes a link, never opens one, so it can't glare.)
         this.roster.add(msg.peerId);
         this.config.onPeerJoined?.(msg.peerId);
-        this.reconcilePrune();
+        // The joiner dials us if it's the initiator; we dial it if we are.
+        if (this.initiates(msg.peerId)
+          && this.channels.get(msg.peerId)?.readyState !== "open"
+          && !this.connecting(msg.peerId)) {
+          void this.initiateConnection(msg.peerId);
+        }
         break;
       case "left":
         this.roster.delete(msg.peerId);
         this.retryAt.delete(msg.peerId);
-        this.retryN.delete(msg.peerId);
-        // A genuine departure clears any pin too — otherwise ensureConnected
-        // or an agent-tag pin would keep sweep() chasing someone provably
-        // gone forever (pins are sticky by design, but "gone" overrides it).
-        this.pins.delete(msg.peerId);
         this.cleanup(msg.peerId);
-        this.clearPruneTimer(msg.peerId);
         this.config.onPeerLeft?.(msg.peerId);
-        this.reconcilePrune();
         break;
       case "offer":
         this.handleOffer(msg.from, msg.sdp);
@@ -731,10 +490,8 @@ export class QOSPeer {
         this.handleIce(msg.from, msg.candidate);
         break;
       case "error":
-        // Surfaced, not swallowed. "rate limit exceeded" is the server telling
-        // us the room is bigger than the join burst it will carry — the exact
-        // failure that looks, from inside a browser, like peers who never
-        // arrived. Nobody could see it, so it was argued about instead.
+        // Surfaced, not swallowed. "rate limit exceeded" is the server telling us
+        // the join burst was bigger than it will carry.
         console.error("[signaling]", msg.message);
         this.config.onSignalingError?.(msg.message);
         break;
@@ -744,67 +501,35 @@ export class QOSPeer {
   /**
    * Dial the peers we are in a room with and have no channel to.
    *
-   * A handshake that fails once used to stay failed: connections are only
-   * initiated from the server's peers list, which arrives when *we* join or
-   * reconnect. So two people who failed to connect stayed silent to each other
-   * indefinitely — until somebody else joined and the list was re-sent, which
-   * is a fix arriving by coincidence.
-   *
-   * Only one side of a pair retries, chosen by comparing ids. Two peers dialling
-   * each other at the same moment is glare — each answering an offer while
-   * holding one of its own — and the recovery for glare is worse than the
-   * failure it would be recovering from.
+   * The smaller-id side of each pair is the normal initiator and retries every
+   * RETRY_INTERVAL_MS. The larger-id side only dials after an extra
+   * FALLBACK_EXTRA_MS — so a peer whose smaller side is dead or on an old build
+   * still connects, without both sides racing (and glaring) in the common case.
    */
   private sweep(): void {
     if (this._disconnected || !this.isSignalingUp()) return;
-    // Cheap backstop: reconcilePrune is called on every roster/pin change
-    // already, but this catches anything a missed event would otherwise
-    // leave stuck open past its target window.
-    this.reconcilePrune();
     const now = Date.now();
-    for (const peerId of this.targetPeers()) {
+    for (const peerId of this.roster) {
       if (peerId === this.peerId) continue;
       if (this.channels.get(peerId)?.readyState === "open") continue;
-      // An attempt already under way is not a failure to retry. Redialling one
-      // sends a fresh offer with a new ICE ufrag, the far side rebuilds, and
-      // the negotiation in flight is thrown away — so a peer whose path is
-      // simply slow (mobile, more candidates, longer checks) would be reset
-      // before it could ever finish, forever.
+      // An attempt already under way is not a failure to retry. Redialling it
+      // sends a fresh offer with a new ICE ufrag, the far side rebuilds, and the
+      // negotiation in flight is discarded — a slow path would never finish.
       if (this.connecting(peerId)) continue;
       if (now < (this.retryAt.get(peerId) ?? 0)) continue;
-      if (this.inFlight() >= QOSPeer.MAX_IN_FLIGHT) break;
-      const n = (this.retryN.get(peerId) ?? 0) + 1;
-      this.retryN.set(peerId, n);
-      // Both sides may dial, and the one with the higher id waits a little
-      // longer before doing so. Deferring to the other side entirely — the
-      // earlier rule — assumed the other side also retries, which is false the
-      // moment the room is a mix of builds: nobody dialled and the connection
-      // never came back. Waiting instead means the usual case is still one
-      // dialler (the other's attempt is in flight, so `connecting()` skips this
-      // one), while a peer that will never dial is no longer fatal.
-      const polite = this.peerId > peerId ? QOSPeer.POLITE_EXTRA_MS : 0;
-      const wait = Math.min(QOSPeer.RETRY_MAX_MS, QOSPeer.RETRY_MIN_MS * 2 ** (n - 1)) + polite;
+      const wait = QOSPeer.RETRY_INTERVAL_MS + (this.initiates(peerId) ? 0 : QOSPeer.FALLBACK_EXTRA_MS);
       // Jitter, so a room that all failed at once does not all retry at once.
       this.retryAt.set(peerId, now + Math.round(wait * (0.75 + Math.random() * 0.5)));
-      console.log(`[qos-peer] retrying ${peerId} (attempt ${n})`);
+      console.log(`[qos-peer] dialling ${peerId.slice(-8)}`);
       void this.initiateConnection(peerId);
     }
   }
 
   /**
-   * Is a connection to this peer still being made?
-   *
-   * "connecting" and "new" mean ICE is still working; a check that has been
-   * running for longer than any real handshake takes is treated as stuck, so a
-   * negotiation that silently died cannot block retries indefinitely.
+   * Is a connection to this peer still being made? "connecting"/"new" mean ICE
+   * is still working; a check running longer than any real handshake takes is
+   * treated as stuck, so a negotiation that silently died can't block retries.
    */
-  /** Handshakes currently under way, which is what a burst is made of. */
-  private inFlight(): number {
-    let n = 0;
-    for (const peerId of this.connections.keys()) if (this.connecting(peerId)) n++;
-    return n;
-  }
-
   private connecting(peerId: string): boolean {
     const pc = this.connections.get(peerId);
     if (!pc) return false;
@@ -815,9 +540,6 @@ export class QOSPeer {
   }
 
   private async initiateConnection(remotePeerId: string): Promise<void> {
-    // When this attempt began, so the sweep can tell "still working on it" from
-    // "died quietly" without asking the connection, which says "connecting"
-    // either way.
     this.attemptAt.set(remotePeerId, Date.now());
     const pc = this.createPeerConnection(remotePeerId);
 
@@ -838,18 +560,15 @@ export class QOSPeer {
 
   private async handleOffer(fromPeerId: string, sdp: string): Promise<void> {
     // Answering is an attempt too: the sweep must not dial a peer we are in the
-    // middle of answering, or the two sides tear each other's work down.
+    // middle of answering.
     this.attemptAt.set(fromPeerId, Date.now());
-    // Reuse the existing connection for a renegotiation (e.g. media tracks added
-    // mid-call). Only create a fresh connection for a first-time offer — the old
-    // "always recreate" behaviour would have torn down the live data channel.
     let pc = this.connections.get(fromPeerId);
-    // …but a fresh ICE session (different ice-ufrag) under a known peerId means the
-    // peer reconnected / reloaded: the stale pc's data channel is dead, and answering
-    // on it would NOT surface the peer's new data channel (`ondatachannel` doesn't
-    // re-fire on a renegotiation), so the peer would connect-but-stay-silent — no
-    // name announce, no messages, just a hex id in the roster. Rebuild a clean pc
-    // (which resurfaces the data channel) instead of renegotiating the corpse.
+    // A fresh ICE session (different ice-ufrag) under a known peerId means the
+    // peer reconnected / reloaded: the stale pc's data channel is dead, and
+    // answering on it would NOT surface the peer's new data channel
+    // (`ondatachannel` doesn't re-fire on a renegotiation) — the peer would
+    // connect-but-stay-silent. Rebuild a clean pc instead of renegotiating the
+    // corpse.
     if (pc && iceUfrag(pc.remoteDescription?.sdp) && iceUfrag(pc.remoteDescription?.sdp) !== iceUfrag(sdp)) {
       this.makingOffer.set(fromPeerId, false);
       pc = undefined;
@@ -859,7 +578,9 @@ export class QOSPeer {
       pc.ondatachannel = (event) => this.setupDataChannel(fromPeerId, event.channel);
     }
 
-    // Perfect-negotiation glare handling: the peer with the smaller ID is polite.
+    // Perfect-negotiation glare handling — only reachable now via media
+    // renegotiation (both sides may offer) or a mixed-build peer that still
+    // both-dials for establishment. The peer with the smaller ID is polite.
     const polite = this.peerId < fromPeerId;
     const collision = (this.makingOffer.get(fromPeerId) ?? false) || pc.signalingState !== "stable";
     if (collision && !polite) return;   // impolite peer ignores — its own offer wins
@@ -894,20 +615,14 @@ export class QOSPeer {
   private async handleIce(fromPeerId: string, candidate: RTCIceCandidateInit): Promise<void> {
     const pc = this.connections.get(fromPeerId);
     if (!pc) return;
-    // Candidates can arrive while a description is being rolled back during glare;
-    // tolerate the resulting benign failures.
     try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); }
-    catch { /* ignore */ }
+    catch { /* benign during glare rollback */ }
   }
 
   private createPeerConnection(remotePeerId: string): RTCPeerConnection {
-    // Replacing our own connection is not the peer leaving.
-    //
-    // Closing a connection fires its state handlers, and those declare the peer
-    // gone — so every retry produced a "left" and then a "joined" when the new
-    // channel opened, which reads as a peer flapping when nothing of the sort
-    // happened. Detach before closing: the old object has no further part in
-    // this, and its last act should not be to lie about who is in the room.
+    // Replacing our own connection is not the peer leaving. Closing a connection
+    // fires its state handlers, and those declare the peer gone — so a retry
+    // would produce a spurious "left" then "joined". Detach before closing.
     const stale = this.connections.get(remotePeerId);
     if (stale) {
       stale.onconnectionstatechange = null;
@@ -941,10 +656,6 @@ export class QOSPeer {
       this.config.onRemoteTrack?.(remotePeerId, stream);
     };
 
-    // ICE is where a connection that never completes actually stops, and its
-    // state is the difference between "no candidate pair works" (a network that
-    // cannot be crossed) and "checking forever" (candidates arriving too late,
-    // or not at all). Neither is visible from the connection state alone.
     pc.oniceconnectionstatechange = () => {
       console.log(`[qos-peer] ice to ${remotePeerId.slice(-8)} → ${pc.iceConnectionState}`);
     };
@@ -956,45 +667,35 @@ export class QOSPeer {
       const state = pc.connectionState;
       console.log(`[qos-peer] connection to ${remotePeerId.slice(-8)} → ${state}`);
       if (state === "connected") {
-        // Recovered (or first connected) — cancel any pending disconnect grace.
         this.clearDisconnectTimer(remotePeerId);
         return;
       }
       if (state === "failed" || state === "closed") {
         this.clearDisconnectTimer(remotePeerId);
-        // "failed" means no candidate pair worked — we could not open a *direct*
-        // path to this peer. That is NOT the same as "they left". If signaling
-        // still lists them in the room they are present, and if there is a relay
-        // overlay (an agent, another peer we share) their chat still reaches us.
-        // Calling declarePeerGone here (→ onPeerLeft → the app drops them from
-        // the roster) is what makes a cross-network peer with no working TURN
-        // *vanish* for everyone they cannot dial directly, even while the room
-        // works over the relay. Keep them: tear down the dead pc so the sweep
+        // "failed" means no candidate pair worked — not "they left". If signaling
+        // still lists them, keep them: tear down the dead pc so the sweep
         // redials, back the retry off one cycle, and let the app mark them
-        // unreachable (⚠) instead of gone. The authoritative "they left" is the
-        // signaling "left" message; a peer we actually had a channel to also
-        // reports departure through the data-channel onclose path.
+        // unreachable (⚠). The authoritative "they left" is the signaling "left"
+        // message; a peer we held a channel to also reports departure via the
+        // data-channel onclose path.
         if (remotePeerId !== this.peerId && this.roster.has(remotePeerId)) {
           this.cleanup(remotePeerId);
-          this.retryAt.set(remotePeerId, Date.now() + QOSPeer.RETRY_MIN_MS);
+          this.retryAt.set(remotePeerId, Date.now() + QOSPeer.RETRY_INTERVAL_MS);
           return;
         }
         this.declarePeerGone(remotePeerId);
         return;
       }
       if (state === "disconnected") {
-        // Possibly transient: start a grace timer, evict only if it does not
-        // recover. Don't stack timers if one is already running.
+        // Possibly transient: start a grace timer, act only if it doesn't recover.
         if (!this.disconnectTimers.has(remotePeerId)) {
           const t = setTimeout(() => {
             this.disconnectTimers.delete(remotePeerId);
             const cur = this.connections.get(remotePeerId)?.connectionState;
             if (cur === "connected") return;   // recovered
-            // Same reasoning as "failed" above: a peer still in the signaling
-            // roster is unreachable, not gone.
             if (this.roster.has(remotePeerId)) {
               this.cleanup(remotePeerId);
-              this.retryAt.set(remotePeerId, Date.now() + QOSPeer.RETRY_MIN_MS);
+              this.retryAt.set(remotePeerId, Date.now() + QOSPeer.RETRY_INTERVAL_MS);
               return;
             }
             this.declarePeerGone(remotePeerId);
@@ -1011,15 +712,12 @@ export class QOSPeer {
   private setupDataChannel(peerId: string, ch: RTCDataChannel): void {
     ch.onopen = () => {
       this.channels.set(peerId, ch);
-      // It worked: forget the backoff, so a later failure starts from patient
-      // rather than from wherever this one left off.
       this.retryAt.delete(peerId);
-      this.retryN.delete(peerId);
       this.attemptAt.delete(peerId);
       this.config.onChannelOpen?.(peerId);
       console.log(`[qos-peer] data channel open with ${peerId}`);
-      // If a call is already in progress, push our media to the newcomer (but never
-      // to data-only agents — they'd echo it back and churn on the renegotiation).
+      // If a call is already in progress, push our media to the newcomer (never
+      // to data-only agents).
       if (this.localStream && !this.dataOnly.has(peerId)) {
         const pc = this.connections.get(peerId);
         if (pc) {
@@ -1035,116 +733,20 @@ export class QOSPeer {
       console.log(`[qos-peer] data channel closed with ${peerId}`);
       // A closed data channel is the most reliable "peer is gone" signal for a
       // clean tab-close — the underlying connection may never reach "failed".
-      // Declare the peer gone (the app debounces with its own short grace, and
-      // re-establishment fires onPeerJoined / onChannelOpen again).
       this.declarePeerGone(peerId);
     };
     ch.onmessage = (event) => {
       let data: unknown;
       try { data = JSON.parse(event.data); }
       catch { this.config.onMessage?.(peerId, event.data); return; }
-      // A tagged flood — either a broadcast, or a directed send() to a peer
-      // we have no direct link to. Anything untagged is a direct message
-      // exactly as before (old build or new, on either end) — unchanged.
-      if (data && typeof data === "object" && typeof (data as Record<string, unknown>)._relayId === "string") {
-        this.handleRelay(peerId, data as Record<string, unknown>);
-        return;
-      }
       this.config.onMessage?.(peerId, data);
     };
-  }
-
-  /**
-   * A message tagged for the flood overlay. `_relayId` dedupes so a message
-   * that reaches us by two paths (a ring link and its skip-link) is only
-   * delivered/relayed once; `_hops` bounds how much farther it can travel;
-   * `_relayTo`, if present, means only that one peer should actually receive
-   * it — everyone else on the path still relays it onward without
-   * delivering it, which is what lets a directed send() reach through
-   * peers who aren't the target. `_from` is who actually sent it — not
-   * `fromPeerId`, which is only the last hop.
-   */
-  private handleRelay(fromPeerId: string, data: Record<string, unknown>): void {
-    const relayId = data._relayId as string;
-    if (this.seenRelay.has(relayId)) return;
-    this.seenRelay.add(relayId);
-    if (this.seenRelay.size > QOSPeer.SEEN_RELAY_MAX) this.seenRelay.clear();
-
-    const hopsLeft = typeof data._hops === "number" ? data._hops : 0;
-    const relayTo = typeof data._relayTo === "string" ? data._relayTo : undefined;
-    const from = typeof data._from === "string" ? data._from : fromPeerId;
-
-    const cleaned = { ...data };
-    delete cleaned._relayId;
-    delete cleaned._hops;
-    delete cleaned._from;
-    delete cleaned._relayTo;
-
-    this.lastHeardVia.set(from, Date.now());
-
-    if (relayTo === undefined || relayTo === this.peerId) {
-      this.config.onMessage?.(from, cleaned);
-    }
-
-    if (hopsLeft > 0) {
-      const out: Record<string, unknown> = { ...cleaned, _relayId: relayId, _hops: hopsLeft - 1, _from: from };
-      if (relayTo !== undefined) out._relayTo = relayTo;
-      const payload = JSON.stringify(out);
-      for (const [peerId, ch] of this.channels) {
-        if (peerId === fromPeerId) continue;
-        if (ch.readyState === "open") ch.send(payload);
-      }
-    }
   }
 
   private cleanup(peerId: string): void {
     this.connections.get(peerId)?.close();
     this.connections.delete(peerId);
     this.channels.delete(peerId);
-  }
-
-  /**
-   * DELIBERATELY INERT — does not arm any close timer. See prunePeer for why
-   * it once did, and why that's off.
-   *
-   * Closing a working connection because ring math shifted turned out to have
-   * a real cost: a roster change reshuffles ring positions for *everyone*,
-   * so one flaky peer bouncing in and out of the room could cascade into
-   * closing OTHER peers' entirely healthy connections as a side effect —
-   * amplifying one device's instability into churn across the room, observed
-   * live during testing. The grace period (PRUNE_GRACE_MS) bounded how often
-   * that could happen, not whether it could.
-   *
-   * So: targetPeers() / ringSkipNeighbors still bound who gets *newly*
-   * dialled (the actual fix for the join-burst / signaling rate-limit
-   * problem this overlay exists for), but an already-open connection is now
-   * never actively closed just because it fell outside the ring. Degree
-   * can only grow past 4 over a long session with a lot of churn passing
-   * through, never shrink back — an accepted tradeoff for never being the
-   * cause of a working connection dropping. prunePeer/clearPruneTimer stay
-   * in place (and covered by tests) so this can be re-enabled deliberately,
-   * behind something better than a fixed per-peer grace timer — e.g. only
-   * pruning once the *room*, not just one peer, has been stable for a while.
-   */
-  private reconcilePrune(): void {
-    // no-op — see above
-  }
-
-  private clearPruneTimer(peerId: string): void {
-    const t = this.pruneTimers.get(peerId);
-    if (t !== undefined) { clearTimeout(t); this.pruneTimers.delete(peerId); }
-  }
-
-  /// Close a direct link that fell outside the target neighbor set. Not a
-  /// departure — the peer is (usually) still in the room, just no longer a
-  /// direct neighbor — so unlike declarePeerGone this must not fire
-  /// onPeerLeft. It doesn't need to: cleanup() empties connections/channels
-  /// synchronously, before the data channel's own onclose can fire, so
-  /// declarePeerGone's "had" idempotency guard (see below) already finds
-  /// nothing left to report by the time that async event lands.
-  private prunePeer(peerId: string): void {
-    this.clearPruneTimer(peerId);
-    this.cleanup(peerId);
   }
 
   private clearDisconnectTimer(peerId: string): void {
@@ -1154,7 +756,7 @@ export class QOSPeer {
 
   /// Tear down a peer's connection and notify the app it left. Idempotent: a
   /// data-channel close and a connection-state "failed" for the same peer both
-  /// land here, but the second call is a no-op (nothing left to clean up).
+  /// land here, but the second call is a no-op.
   private declarePeerGone(peerId: string): void {
     this.clearDisconnectTimer(peerId);
     const had = this.connections.has(peerId) || this.channels.has(peerId);
