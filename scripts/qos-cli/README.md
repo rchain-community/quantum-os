@@ -209,10 +209,9 @@ with every media m-line rejected — so werift never spins up an RTP receiver an
 never burns a core decrypting call media it will never use.
 
 `turn-relay.selftest.mjs` drives `QOSPeer._loadAutoTurn`/`_iceServers` against a
-stand-in HTTP server (not the real signaling server, not Cloudflare) — see
-CLAUDE.md "Calls must work across networks" for why an agent needs this too:
-the flood relay only works if some agent actually holds a direct link to both
-sides of a NAT boundary.
+stand-in HTTP server (not the real signaling server, not Cloudflare) — an agent
+needs the same TURN relay a browser does: the room is a full mesh, so a
+cross-network agent needs a relay on at least one side to form its direct links.
 
 ```bash
 node optimize-demo.mjs   # collective-annealing demo on a classic problem (TSP)
@@ -253,40 +252,34 @@ node agent.mjs --room <cap:room:… | room-URL> [--role facilitator] [--name <s>
 ```
 
 **Run the persistent room** (detached, on a Claude subscription): `bash run-agents.sh`
-launches `facilitator` and `skeptic` on the `claude-code` backend with stable per-role
-identities. The **room's memory rides with the first role** (`--persist`), so lemmas,
-currencies, note terms-series, gov groups, dyncap chains and the transcript are kept on
-disk and re-served to every joiner — room state survives when every browser leaves —
-without spending a peer on a separate daemon. `NO_MEMORY=1` turns it off, `PERSIST_DIR`
-moves the store. Logs/pids under `.agents/`; `bash stop-agents.sh` stops everything with
-a pidfile.
+launches the **`facilitator` alone** on the `claude-code` backend with a stable
+identity. The **room's memory rides with it** (`--persist`), so lemmas, currencies,
+note terms-series, gov groups, dyncap chains and the transcript are kept on disk and
+re-served to every joiner — room state survives when every browser leaves — without
+spending a peer on a separate daemon. `NO_MEMORY=1` turns it off, `PERSIST_DIR` moves
+the store. Logs/pids under `.agents/`; `bash stop-agents.sh` stops everything with a
+pidfile.
 
-Why those two roles, and not `scribe`: a scribe's duties are a strict subset of the
-facilitator's (compare `duties` in `agent-roles.mjs` — scribe sets nothing the
-facilitator does not), so it needs no peer of its own, and a facilitator carrying
-`--persist` is literally the one keeping the record. `skeptic` is separate because it
-is the only role with `verify` — which predicate a history actually passed.
+Why one role: the facilitator's `duties` (see `agent-roles.mjs`) are a superset of
+the scribe's and greeter's, so neither is worth a separate peer. Add `skeptic`
+explicitly (`bash run-agents.sh <room> facilitator skeptic`) when you want `verify` —
+the only duty it alone carries (which predicate a history actually passed).
 
-`qos-daemon.mjs` still runs the same duty standalone, sharing the implementation in
+`qos-daemon.mjs` still runs the memory duty standalone, sharing the implementation in
 `room-memory.mjs`. Prefer it when durability should not depend on an agent that also
-talks: it needs no Claude subscription and fails only if its process dies. Vary the agents by passing a room then roles
-(`bash run-agents.sh <room> facilitator skeptic`); `NO_MEMORY=1 bash run-agents.sh`
-skips the daemon. (nohup'd, so they survive closing the terminal; use tmux/screen or a
-service to survive logout/reboot.)
+talks: it needs no Claude subscription and fails only if its process dies.
+(nohup'd, so they survive closing the terminal; use tmux/screen or a service to
+survive logout/reboot.)
 
-> **How many agents a room can hold.** The free signaling server rate-limits, and the
-> limit covers the WebRTC offer/answer/ICE exchange, not just joining. Past a handful
-> of peers, handshakes stop completing: everyone still shows up in the room and no data
-> channel opens, which from a browser is indistinguishable from the agents never
-> starting. Measured on that server, same room, same code, counting *total peers in
-> the room* — an observer joining to watch counts as one: **7 → 0 of 6** channels
-> open, **5 → 1 of 4**, **4 → 3 of 3**. Four is the most that has been seen to work;
-> the default set (facilitator, memory, one browser) is three. Hence one role by
-> default and a 15s stagger (`STAGGER=n` to change it); `NO_MEMORY=1` frees a slot.
-> Add roles deliberately, and run your own signaling server if you want a full cast —
-> that removes the ceiling.
+> **How many agents a room can hold.** The room is a full mesh — every peer holds a
+> direct data channel to every other — which a browser sustains to about **15 peers**
+> (`ROOM_HOLDS`). Every agent spends one of those slots plus a connection to every
+> other peer, so the default is one. The signaling server's rate limit (200/s
+> sustained, 800 burst) is comfortably above what a 15-peer join costs, so it is no
+> longer the binding constraint; a browser still marks any peer it has no channel to
+> with `⚠` so a genuine failure is visible rather than reading as "chat is broken".
 
-**Running your own signaling server** (no ceiling, and nothing leaves the machine):
+**Running your own signaling server** (nothing leaves the machine):
 
 ```bash
 # 1. the server — the raised limit is the whole point

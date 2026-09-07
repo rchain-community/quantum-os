@@ -2,16 +2,15 @@
 // packages/browser/src/peer.ts, on `ws` + `werift`.
 //
 // Identity (peerId) is supplied by the caller (so a daemon can keep a stable
-// cap:peer across restarts). Mirrors peer.ts: data channel label "qos",
-// offer/answer/ice over signaling, signaling reconnect 3s (then 5s on a failed
-// retry), and skip re-establishing peers whose channel is still open when the
-// server re-sends the peers list after a reconnect.
+// cap:peer across restarts). Mirrors peer.ts: full mesh, data channel label
+// "qos", offer/answer/ice over signaling, signaling reconnect with backoff, and
+// the single-dialer rule — for any pair the lexicographically-SMALLER id dials,
+// the larger only answers (with a fallback dial after a grace period).
 
 import WebSocket from "ws";
 // werift, plus the RTCCertificate.getFingerprints() memo for quantum-os#125 —
 // importing it here patches the shared prototype for every werift consumer.
 import { RTCPeerConnection } from "./werift-patched.mjs";
-import { ringSkipNeighbors } from "./ring-neighbors.mjs";
 
 const DEFAULT_ICE = [{ urls: "stun:stun.l.google.com:19302" }];
 // How long a connection may sit in ICE "disconnected" before we tear it down.
@@ -19,18 +18,10 @@ const DEFAULT_ICE = [{ urls: "stun:stun.l.google.com:19302" }];
 // cannot leave an SCTP association retransmitting forever. See `_newPC`.
 const DISCONNECT_GRACE_MS = 30_000;
 
-// Bounded-degree overlay (ring + skip-links) constants — mirrors
-// packages/browser/src/peer.ts's own. PRUNE_GRACE_MS sits between
-// DISCONNECT_GRACE_MS (30s here, a real ICE blip) and the reconnect backoff
-// ceiling (60s), giving a roster reshuffle time to settle before a still-
-// working link is actually closed. REACHABLE_WINDOW_MS is 1.5x
-// PRESENCE_FLOOD_MS, tolerating one missed beat — the same "miss one, not
-// two" idiom as this file's own ping/pong heartbeat below.
-const PRUNE_GRACE_MS = 30_000;
-const SEEN_RELAY_MAX = 5000;
-const REACHABLE_WINDOW_MS = 45_000;
-const ATTEMPT_PATIENCE_MS = 45_000;   // how long a dial/answer in flight is left alone before a redial is allowed
-const PRESENCE_FLOOD_MS = 30_000;
+const ATTEMPT_PATIENCE_MS = 45_000;   // how long a dial/answer in flight is left alone before a redial
+const SWEEP_MS = 8_000;               // how often to look for roster peers with no channel
+const RETRY_INTERVAL_MS = 10_000;     // minimum gap between dial attempts at one peer
+const FALLBACK_EXTRA_MS = 15_000;     // extra wait before the LARGER-id side steps in as fallback dialler
 
 // The ICE username fragment identifies an ICE session; a peer that reconnects (or
 // reloads its browser) brings a new one. Used to tell a genuine renegotiation
@@ -49,17 +40,12 @@ export class QOSPeer {
     this.channels = new Map();            // remoteId -> data channel
     this.makingOffer = new Map();         // remoteId -> we have an outstanding offer (perfect-negotiation glare)
     this.attemptAt = new Map();           // remoteId -> when the current dial/answer began (see _connecting)
+    this.retryAt = new Map();             // remoteId -> earliest next dial attempt (see _sweep)
     this._disconnected = false;
     this._reconnectTimer = null;
     this._reconnectAttempts = 0;
-    // Bounded-degree overlay state — see ringSkipNeighbors/targetPeers.
+    this._sweepTimer = null;
     this.roster = new Set();              // who the server says is in the room
-    this.pins = new Set();                // peers we always want a direct link to
-    this.pruneTimers = new Map();         // grace-then-close timers, see _reconcilePrune
-    this.seenRelay = new Set();           // flood dedupe, see _handleRelay
-    this._relayCounter = 0;
-    this.lastHeardVia = new Map();        // peerId -> last relay-traffic timestamp, see isReachable
-    this._presenceTimer = null;
     this._autoTurn = [];                  // fetched relay, see _loadAutoTurn
   }
 
@@ -67,22 +53,19 @@ export class QOSPeer {
     this._disconnected = false;
     this._openSignaling().catch(() => this._scheduleReconnect());
     void this._loadAutoTurn();
-    // Keeps isReachable() honest for peers who are relay-only (past direct
-    // reach) and otherwise never send anything themselves.
-    if (!this._presenceTimer) {
-      this._presenceTimer = setInterval(() => this.broadcast({ kind: "presence" }), PRESENCE_FLOOD_MS);
-      this._presenceTimer.unref?.();
+    if (!this._sweepTimer) {
+      this._sweepTimer = setInterval(() => this._sweep(), SWEEP_MS);
+      this._sweepTimer.unref?.();
     }
   }
 
   /// Mirrors the browser's fetchAutoTurn (app.ts): a short-lived, Cloudflare-
   /// minted TURN credential from the signaling server's own GET /turn — never
   /// from Cloudflare directly, and the master API token never reaches this
-  /// process either. An agent's chat relay (the flood overlay) only works if
-  /// SOME agent actually holds a link to both sides of a NAT boundary, so
-  /// agents get the same relay browsers do. Skipped entirely when the caller
-  /// passed an explicit iceServers (tests, an override) — this only fills in
-  /// the default. Best-effort: any failure just leaves iceServers as-is.
+  /// process either. A cross-network peer needs a relay on at least one side to
+  /// form a direct connection, so agents get the same relay browsers do.
+  /// Skipped entirely when the caller passed an explicit iceServers (tests, an
+  /// override). Best-effort: any failure just leaves iceServers as-is.
   async _loadAutoTurn() {
     if (this.config.iceServers) return;
     try {
@@ -108,12 +91,14 @@ export class QOSPeer {
     return !!ch && (!ch.readyState || ch.readyState === "open");
   }
 
+  /// For any pair, the lexicographically-smaller id is the one that dials.
+  _initiates(peerId) {
+    return this.peerId < peerId;
+  }
+
   /// A dial or answer to this peer is still in progress — don't start another
-  /// (a fresh `_newPC` closes the pc mid-negotiation and both sides restart,
-  /// which is how a `name` re-announce or a signaling reconnect turned into a
-  /// rebuild storm). Mirrors peer.ts's `connecting()`. A stale attempt (older
-  /// than ATTEMPT_PATIENCE_MS) no longer counts, so a genuinely dead one can be
-  /// retried.
+  /// (a fresh `_newPC` closes the pc mid-negotiation and both sides restart).
+  /// A stale attempt (older than ATTEMPT_PATIENCE_MS) no longer counts.
   _connecting(peerId) {
     const pc = this.connections.get(peerId);
     if (!pc) return false;
@@ -122,91 +107,29 @@ export class QOSPeer {
     return Date.now() - (this.attemptAt.get(peerId) ?? 0) < ATTEMPT_PATIENCE_MS;
   }
 
-  /// Who we should be directly connected to right now: ring+skip neighbors
-  /// (see ringSkipNeighbors) plus anything pinned. Full mesh falls out of
-  /// this automatically for five or fewer peers.
-  targetPeers() {
-    const sorted = [...new Set([...this.roster, this.peerId])].sort();
-    const set = ringSkipNeighbors(sorted, this.peerId);
-    for (const p of this.pins) if (p !== this.peerId) set.add(p);
-    return set;
+  /// Dial roster peers we hold no channel to. The smaller-id side of each pair
+  /// is the normal initiator (retries every RETRY_INTERVAL_MS); the larger only
+  /// steps in after an extra FALLBACK_EXTRA_MS, covering a dead or old-build
+  /// smaller peer without both sides racing (and glaring) in the common case.
+  _sweep() {
+    if (this._disconnected || this.ws?.readyState !== WebSocket.OPEN) return;
+    const now = Date.now();
+    for (const peerId of this.roster) {
+      if (peerId === this.peerId) continue;
+      if (this._channelOpen(this.channels.get(peerId))) continue;
+      if (this._connecting(peerId)) continue;
+      if (now < (this.retryAt.get(peerId) ?? 0)) continue;
+      const wait = RETRY_INTERVAL_MS + (this._initiates(peerId) ? 0 : FALLBACK_EXTRA_MS);
+      this.retryAt.set(peerId, now + Math.round(wait * (0.75 + Math.random() * 0.5)));
+      this._initiate(peerId).catch((e) => this.config.onError?.(e));
+    }
   }
 
-  /// Always keep a direct link to this peer regardless of ring/skip
-  /// position — a local, one-sided decision (the other side has no wire
-  /// signal that we just pinned them), so it dials immediately.
-  pinNeighbor(peerId) {
-    if (peerId === this.peerId) return;
-    this.pins.add(peerId);
-    if (this._channelOpen(this.channels.get(peerId))) return;
-    if (this._connecting(peerId)) return;   // a dial is already in flight — don't restart it
-    this._initiate(peerId).catch((e) => this.config.onError?.(e));
-  }
-
-  /// Release a pin. The link doesn't close instantly — same grace-then-prune
-  /// path as any other connection that's fallen outside the target set.
-  unpinNeighbor(peerId) {
-    this.pins.delete(peerId);
-    this._reconcilePrune();
-  }
-
-  /// Can we reach this peer at all — a direct channel, or relay traffic seen
-  /// from them recently (including the periodic presence flood)? Distinct
-  /// from "do we have a direct channel to them" — most peers past a handful
-  /// in the room are reached over the overlay, not directly.
-  isReachable(peerId) {
-    if (this._channelOpen(this.channels.get(peerId))) return true;
-    const last = this.lastHeardVia.get(peerId);
-    return last !== undefined && Date.now() - last < REACHABLE_WINDOW_MS;
-  }
-
-  /**
-   * DELIBERATELY INERT — see peer.ts's own _reconcilePrune/reconcilePrune for
-   * the full rationale. Closing a working connection because ring math
-   * shifted meant one flaky peer bouncing in and out could cascade into
-   * closing OTHER peers' healthy connections too (a roster change reshuffles
-   * ring positions for everyone) — observed live during testing. targetPeers
-   * still bounds who gets newly dialled; an already-open connection is never
-   * actively closed for falling outside the ring. _prunePeer/_clearPruneTimer
-   * stay in place for a deliberate future re-enable.
-   */
-  _reconcilePrune() {
-    // no-op — see above
-  }
-
-  _clearPruneTimer(peerId) {
-    const t = this.pruneTimers.get(peerId);
-    if (t !== undefined) { clearTimeout(t); this.pruneTimers.delete(peerId); }
-  }
-
-  /// Close a direct link that fell outside the target neighbor set — not a
-  /// departure, so unlike the "left"/"failed" paths this never fires
-  /// onPeerLeft. Safe: unlike peer.ts's data channel, this file's channel
-  /// close/state-change handlers don't report a departure on their own, so
-  /// there's no async re-fire to guard against.
-  _prunePeer(peerId) {
-    this._clearPruneTimer(peerId);
-    this._cleanup(peerId);
-  }
-
-  _nextRelayId() {
-    const id = `${this.peerId}:${this._relayCounter++}`;
-    this.seenRelay.add(id);
-    if (this.seenRelay.size > SEEN_RELAY_MAX) this.seenRelay.clear();
-    return id;
-  }
-
-  _hopBudget() {
-    return Math.max(4, Math.ceil((this.roster.size + 1) / 2));
-  }
-
-  // Reconnect with EXPONENTIAL BACKOFF + JITTER, single-flight. The free signaling
+  // Reconnect with EXPONENTIAL BACKOFF + JITTER, single-flight. The signaling
   // server rate-limits: a fixed-interval reconnect makes N agents re-hammer it in
   // lock-step → "rate limit exceeded" → drop → storm. Backoff (3s→6→12→24→cap 60s)
-  // gives the limit time to clear; ±50% jitter desyncs the agents so they don't all
-  // retry at once. `_reconnectAttempts` only resets once a connection stays up ≥15s
-  // (see `_openSignaling`), so a connect-then-immediately-dropped (rate-limited)
-  // cycle keeps backing off instead of resetting to 3s and storming again.
+  // gives the limit time to clear; ±50% jitter desyncs the agents. `_reconnectAttempts`
+  // only resets once a connection stays up ≥15s (see `_openSignaling`).
   _scheduleReconnect() {
     if (this._disconnected || this._reconnectTimer) return; // single-flight
     const base = Math.min(3000 * 2 ** this._reconnectAttempts, 60000);
@@ -219,50 +142,26 @@ export class QOSPeer {
   disconnect() {
     this._disconnected = true;
     if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
-    if (this._presenceTimer) clearInterval(this._presenceTimer);
+    if (this._sweepTimer) clearInterval(this._sweepTimer);
     this._signal({ type: "leave", roomId: this.config.roomId, peerId: this.peerId });
     for (const pc of this.connections.values()) { try { pc.close(); } catch {} }
     try { this.ws?.close(); } catch {}
     this.connections.clear();
     this.channels.clear();
-    for (const t of this.pruneTimers.values()) clearTimeout(t);
-    this.pruneTimers.clear();
   }
 
-  /// Direct and raw if we hold an open channel to them (unchanged, byte-
-  /// identical to before). Otherwise flood-routes over the bounded-degree
-  /// overlay: tagged with a dedupe id, a remaining-hop budget, and who it's
-  /// actually for, so every neighbor relays it onward until it reaches
-  /// someone who is. No routing table — see peer.ts for the full rationale.
+  /// Send to a specific peer. Returns false if no open channel to them.
   send(targetPeerId, data) {
     const ch = this.channels.get(targetPeerId);
     if (this._channelOpen(ch)) {
       try { ch.send(JSON.stringify(data)); return true; } catch { return false; }
     }
-    if (this.channels.size === 0) return false;
-    const tagged = {
-      ...data,
-      _relayId: this._nextRelayId(), _hops: this._hopBudget(), _from: this.peerId, _relayTo: targetPeerId,
-    };
-    const payload = JSON.stringify(tagged);
-    let sent = false;
-    for (const other of this.channels.values()) {
-      if (this._channelOpen(other)) { try { other.send(payload); sent = true; } catch {} }
-    }
-    return sent;
+    return false;
   }
 
-  /// Flooded over the overlay (see ringSkipNeighbors) — tagged with a dedupe
-  /// id and a remaining-hop budget so a peer beyond direct reach still gets
-  /// it via relay. A room of five or fewer is still direct to everyone, so
-  /// this degenerates to exactly the old fan-out.
+  /// Broadcast to every peer we hold an open channel to (full mesh).
   broadcast(data) {
-    const tagged = { ...data, _relayId: this._nextRelayId(), _hops: this._hopBudget(), _from: this.peerId };
-    const payload = JSON.stringify(tagged);
-    // Write directly rather than through send(): every entry here is by
-    // definition an open channel, so send()'s no-direct-link flood-fallback
-    // — which would add a _relayTo that doesn't belong on a broadcast —
-    // must never run here.
+    const payload = JSON.stringify(data);
     for (const ch of this.channels.values()) {
       if (this._channelOpen(ch)) { try { ch.send(payload); } catch {} }
     }
@@ -277,13 +176,9 @@ export class QOSPeer {
     this.ws = ws;
     // CONNECT-TIMEOUT WATCHDOG. A hung/half-open signaling socket can fire NEITHER
     // "open" NOR "error": the server accepts the TCP then never completes the WS
-    // handshake (e.g. a free-tier signaling server that died mid-flight). Without a
-    // bound the connect promise never settles, so `_openSignaling` hangs forever and
-    // the daemon WEDGES — alive but permanently disconnected, never rescheduling a
-    // reconnect. The post-open heartbeat below cannot help, because "open" never fired.
-    // Bound the handshake: if "open" hasn't arrived within CONNECT_TIMEOUT_MS, terminate
-    // the socket and reject so the caller (`connect`/`_reconnect`) reschedules with
-    // backoff. This self-heals the wedge a hard signaling-server drop used to cause.
+    // handshake. Without a bound the connect promise never settles and the daemon
+    // WEDGES — alive but permanently disconnected. Bound the handshake and reject
+    // so the caller reschedules with backoff.
     const CONNECT_TIMEOUT_MS = 20000;
     await new Promise((resolve, reject) => {
       const t = setTimeout(() => {
@@ -293,9 +188,9 @@ export class QOSPeer {
       ws.on("open", () => { clearTimeout(t); resolve(); });
       ws.on("error", (e) => { clearTimeout(t); reject(e); });
     });
-    // Only treat the connection as healthy (and reset the backoff) once it has stayed
-    // up ≥15s. A rate-limited server opens then immediately drops us; without this gate
-    // each such cycle would reset the backoff to 3s and re-storm.
+    // Only reset the backoff once the connection has stayed up ≥15s. A rate-limited
+    // server opens then immediately drops us; without this gate each such cycle
+    // would reset the backoff to 3s and re-storm.
     const stableTimer = setTimeout(() => {
       if (this.ws === ws && ws.readyState === WebSocket.OPEN) this._reconnectAttempts = 0;
     }, 15000);
@@ -303,14 +198,12 @@ export class QOSPeer {
       let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
       this._handleSignal(msg);
     });
-    // Heartbeat. The free signaling server can drop an idle/half-open socket WITHOUT a
-    // clean close, which would leave us a zombie — still connected to current peers but
-    // blind to every new joiner (no offer reaches us, so we never appear in their peer
-    // list and never get to greet them). Ping every 30s; terminate only after TWO
-    // consecutive missed pongs (~60s of silence) so the "close" handler reconnects.
-    // Tolerating a single missed pong matters: the free server is often slow/sleepy and
-    // a one-off late pong used to false-terminate a perfectly good connection every few
-    // minutes — that was the residual leave/rejoin churn after the storm was fixed.
+    // Heartbeat. The signaling server can drop an idle/half-open socket WITHOUT a
+    // clean close, leaving us a zombie — still connected to current peers but blind
+    // to every new joiner. Ping every 30s; terminate only after TWO consecutive
+    // missed pongs (~60s of silence) so the "close" handler reconnects. Tolerating
+    // one missed pong matters: a slow/sleepy host's one-off late pong used to
+    // false-terminate a good connection.
     let missed = 0;
     ws.on("pong", () => { missed = 0; });
     const heartbeat = setInterval(() => {
@@ -323,11 +216,6 @@ export class QOSPeer {
       clearInterval(heartbeat);
       clearTimeout(stableTimer);
       if (this._disconnected) return;
-      // Why it closed, not just that it did. An agent that reconnects every
-      // half minute is either being terminated by the server (1006 with no
-      // reason, which is what a missed heartbeat looks like), sent away
-      // deliberately (1000/1001), or losing the network under it — three causes
-      // wanting three different fixes, and the log said only "dropped".
       this.config.onSignalingClose?.(code, String(reason ?? ""));
       this._scheduleReconnect();
     });
@@ -344,42 +232,32 @@ export class QOSPeer {
   _handleSignal(msg) {
     switch (msg.type) {
       case "peers": {
-        // Dial our overlay targets only (see targetPeers/ringSkipNeighbors),
-        // not everyone in the room — but onPeerJoined still fires for every
-        // peer, unfiltered, so the app keeps seeing everyone present, direct
-        // neighbor or not. This is the one moment we're a unilateral
-        // initiator (we just (re)connected), so dialing immediately here is
-        // safe; pruning is always safe (never opens a link, so it can't
-        // glare).
+        // onPeerJoined fires for everyone (the app's roster shows all present);
+        // we dial only the peers we're the initiator for and hold no channel to.
         this.roster = new Set(msg.peers);
-        const targets = this.targetPeers();
         for (const peerId of msg.peers) {
           this.config.onPeerJoined?.(peerId);
-          if (!targets.has(peerId)) continue;
+          if (peerId === this.peerId) continue;
           if (this._channelOpen(this.channels.get(peerId))) continue;
-          if (this._connecting(peerId)) continue;   // attempt in flight — leave it
-          this._initiate(peerId).catch((e) => this.config.onError?.(e));
+          if (this._connecting(peerId)) continue;
+          if (this._initiates(peerId)) this._initiate(peerId).catch((e) => this.config.onError?.(e));
         }
-        this._reconcilePrune();
         break;
       }
       case "joined":
-        // The joiner dials us — see the "peers" case above; both sides may
-        // now want each other, but only the joiner has the trigger to dial.
         this.roster.add(msg.peerId);
-        this.config.onPeerJoined?.(msg.peerId); // newcomer initiates to us
-        this._reconcilePrune();
+        this.config.onPeerJoined?.(msg.peerId);
+        if (this._initiates(msg.peerId)
+          && !this._channelOpen(this.channels.get(msg.peerId))
+          && !this._connecting(msg.peerId)) {
+          this._initiate(msg.peerId).catch((e) => this.config.onError?.(e));
+        }
         break;
       case "left":
         this.roster.delete(msg.peerId);
-        // A genuine departure clears any pin too — see peer.ts's own "left"
-        // case for the full rationale (otherwise a pin keeps chasing
-        // someone provably gone forever).
-        this.pins.delete(msg.peerId);
-        this._clearPruneTimer(msg.peerId);
+        this.retryAt.delete(msg.peerId);
         this._cleanup(msg.peerId);
         this.config.onPeerLeft?.(msg.peerId);
-        this._reconcilePrune();
         break;
       case "offer":  this._handleOffer(msg.from, msg.sdp).catch((e) => this.config.onError?.(e)); break;
       case "answer": this._handleAnswer(msg.from, msg.sdp).catch((e) => this.config.onError?.(e)); break;
@@ -403,12 +281,10 @@ export class QOSPeer {
     const stateEvt = pc.connectionStateChange ?? pc.iceConnectionStateChange;
     // Teardown on BOTH terminal states. werift never escalates "disconnected" to
     // "failed" — its ICE layer has no consent-freshness timer — so a peer that
-    // vanishes silently (browser closed, lid shut, wifi dropped) parks here forever.
-    // Cleaning up only on "failed" left `pc.close()` uncalled, so the SCTP transport
-    // was never stopped and its association retransmitted its unacked queue at full
-    // speed, re-encrypting every chunk through pure-JS DTLS — one zombie peer pegged
-    // a core indefinitely. "disconnected" can also be a recoverable blip, so give it
-    // a grace period and re-check that the SAME pc is still stuck before dropping it.
+    // vanishes silently parks here forever, its SCTP association retransmitting at
+    // full speed through pure-JS DTLS (one zombie peer pegged a core). "disconnected"
+    // can also be a recoverable blip, so give it a grace period and re-check the
+    // SAME pc is still stuck before dropping it.
     if (stateEvt?.subscribe) stateEvt.subscribe((s) => {
       if (s === "failed") { this._cleanup(remoteId); this.config.onPeerLeft?.(remoteId); }
       else if (s === "disconnected") {
@@ -426,7 +302,12 @@ export class QOSPeer {
   }
 
   _setupChannel(remoteId, ch) {
-    const onOpen = () => { this.channels.set(remoteId, ch); this.config.onChannelOpen?.(remoteId); };
+    const onOpen = () => {
+      this.channels.set(remoteId, ch);
+      this.retryAt.delete(remoteId);
+      this.attemptAt.delete(remoteId);
+      this.config.onChannelOpen?.(remoteId);
+    };
     if (ch.stateChanged?.subscribe) {
       ch.stateChanged.subscribe((state) => { if (state === "open") onOpen(); else if (state === "closed") this.channels.delete(remoteId); });
     } else {
@@ -438,56 +319,12 @@ export class QOSPeer {
       let d;
       try { d = JSON.parse(payload.toString()); }
       catch { this.config.onMessage?.(remoteId, payload?.toString?.() ?? payload); return; }
-      // A tagged flood — either a broadcast, or a directed send() to a peer
-      // we have no direct link to. Untagged is a direct message, unchanged.
-      if (d && typeof d === "object" && typeof d._relayId === "string") { this._handleRelay(remoteId, d); return; }
       this.config.onMessage?.(remoteId, d);
     };
     // werift exposes inbound as `onMessage` (an Event); browsers use `onmessage`.
     if (ch.onMessage?.subscribe) ch.onMessage.subscribe(onMsg);
     else if (ch.message?.subscribe) ch.message.subscribe(onMsg);
     else ch.onmessage = (ev) => onMsg(ev && typeof ev === "object" && "data" in ev ? ev.data : ev);
-  }
-
-  /**
-   * A message tagged for the flood overlay — mirrors peer.ts's handleRelay.
-   * `_relayId` dedupes so a message reaching us by two paths is only
-   * delivered/relayed once; `_hops` bounds how much farther it can travel;
-   * `_relayTo`, if present, means only that peer should actually receive
-   * it — everyone else on the path still relays it onward. `_from` is who
-   * actually sent it, not `fromPeerId`, which is only the last hop.
-   */
-  _handleRelay(fromPeerId, data) {
-    const relayId = data._relayId;
-    if (this.seenRelay.has(relayId)) return;
-    this.seenRelay.add(relayId);
-    if (this.seenRelay.size > SEEN_RELAY_MAX) this.seenRelay.clear();
-
-    const hopsLeft = typeof data._hops === "number" ? data._hops : 0;
-    const relayTo = typeof data._relayTo === "string" ? data._relayTo : undefined;
-    const from = typeof data._from === "string" ? data._from : fromPeerId;
-
-    const cleaned = { ...data };
-    delete cleaned._relayId;
-    delete cleaned._hops;
-    delete cleaned._from;
-    delete cleaned._relayTo;
-
-    this.lastHeardVia.set(from, Date.now());
-
-    if (relayTo === undefined || relayTo === this.peerId) {
-      this.config.onMessage?.(from, cleaned);
-    }
-
-    if (hopsLeft > 0) {
-      const out = { ...cleaned, _relayId: relayId, _hops: hopsLeft - 1, _from: from };
-      if (relayTo !== undefined) out._relayTo = relayTo;
-      const payload = JSON.stringify(out);
-      for (const [peerId, ch] of this.channels) {
-        if (peerId === fromPeerId) continue;
-        if (this._channelOpen(ch)) { try { ch.send(payload); } catch {} }
-      }
-    }
   }
 
   async _initiate(remoteId) {
@@ -508,33 +345,22 @@ export class QOSPeer {
   }
 
   async _handleOffer(fromId, sdp) {
-    // Answering is an attempt too — the sweep and pinNeighbor must not dial a
-    // peer we are mid-answer with (see _connecting).
+    // Answering is an attempt too — the sweep must not dial a peer we are
+    // mid-answer with (see _connecting).
     this.attemptAt.set(fromId, Date.now());
     // Renegotiation on a LIVE connection — e.g. a browser peer started a call and
     // added mic/cam, re-offering on the existing connection. Answer on the existing
-    // pc; NEVER tear down a working data channel (the old bug: `_newPC` closes it,
-    // so starting a call dropped every agent). Data-only node peers just answer
-    // without media; if werift can't renegotiate (glare/unsupported), keep the
-    // channel and ignore the offer rather than dropping the peer.
+    // pc; NEVER tear down a working data channel.
     //
-    // CRUCIAL — reconnect vs. renegotiation. A peer that RELOADED its browser keeps
-    // the same peerId (sessionStorage) but dials in with a BRAND-NEW ICE session
-    // (fresh ice-ufrag). If our old connection to that peerId still shows an "open"
-    // channel (the close hasn't been detected yet — racy), answering the fresh offer
-    // on the STALE pc never establishes a transport, so the reloaded peer silently
-    // never reconnects: no data channel, no name announce (it just shows as a hex
-    // id). Only treat an offer as a renegotiation when its ice-ufrag MATCHES the live
-    // connection's; a new ufrag means the peer reconnected → rebuild a clean pc.
+    // CRUCIAL — reconnect vs. renegotiation. A peer that RELOADED keeps the same
+    // peerId but dials in with a BRAND-NEW ICE session (fresh ice-ufrag). Answering
+    // the fresh offer on the STALE pc never establishes a transport, so the reloaded
+    // peer silently never reconnects. Only treat an offer as a renegotiation when
+    // its ice-ufrag MATCHES the live connection's; a new ufrag → rebuild a clean pc.
     const existing = this.connections.get(fromId);
     const sameSession = existing
       && _iceUfrag(existing.remoteDescription?.sdp) !== null
       && _iceUfrag(existing.remoteDescription?.sdp) === _iceUfrag(sdp);
-    // Only renegotiate on the live pc when it is actually idle. If we ALSO have an
-    // outstanding offer on it (renegotiation glare — both sides re-offered on the
-    // same tick, e.g. a call adding media), werift's setRemoteDescription throws
-    // "Cannot handle offer in signaling state have-local-offer" (no implicit
-    // rollback). Fall through to the glare tiebreak below instead of erroring.
     const idle = !existing || (existing.signalingState ?? "stable") === "stable";
     if (existing && sameSession && idle && this.channels.get(fromId)?.readyState === "open") {
       try {
@@ -547,15 +373,10 @@ export class QOSPeer {
       return;
     }
 
-    // Perfect-negotiation glare. We AND the far side dialed each other at once —
-    // each now holds an outstanding offer. Without arbitration both peers tear
-    // down their own offer to answer the other's, both answers land on a pc
-    // that's already been replaced, and neither side ever completes — an
-    // infinite rebuild that pegs a core on BOTH (seen live: facilitator <->
-    // skeptic, two node agents on one host, "serving state" thousands of times).
-    // Tiebreak matches peer.ts: the SMALLER peerId yields and answers; the
-    // larger keeps its own offer and ignores this one (the far side will answer
-    // it). Deterministic, symmetric, needs no extra signalling.
+    // Perfect-negotiation glare. Only reachable now via media renegotiation (both
+    // sides may re-offer) or a mixed-build peer that still both-dials for
+    // establishment. Tiebreak matches peer.ts: the SMALLER peerId yields and
+    // answers; the larger keeps its own offer and ignores this one.
     const glare = (this.makingOffer.get(fromId) ?? false)
       || (existing && existing.signalingState && existing.signalingState !== "stable");
     if (glare && this.peerId > fromId) return;   // larger id: our offer wins, ignore theirs
@@ -572,14 +393,11 @@ export class QOSPeer {
   }
 
   // A node agent is data-only. When a browser peer starts a call it renegotiates
-  // with EVERY peer — agents included — adding audio/video m-lines to the offer.
-  // werift otherwise auto-creates recvonly transceivers, registers SSRC receivers,
-  // and then decrypts + parses every inbound RTP packet in pure JS: ~20% of a core
-  // per active call PER agent, for media nothing here will ever use (measured live
-  // — three co-located agents pegged a machine on one call, RtpHeader/handleRTP/
-  // decryptRtp topping the profile). Forcing every media transceiver inactive
-  // before we answer makes werift emit a rejected m-line (port 0 / a=inactive), so
-  // a compliant peer sends us no RTP at all and the decrypt loop never runs.
+  // with EVERY peer — agents included — adding audio/video m-lines. werift otherwise
+  // auto-creates recvonly transceivers and decrypts + parses every inbound RTP
+  // packet in pure JS (~20% of a core per active call PER agent, for media nothing
+  // here will use). Forcing every media transceiver inactive before we answer makes
+  // werift emit a rejected m-line, so a compliant peer sends no RTP at all.
   _rejectMedia(pc) {
     try {
       for (const t of pc.getTransceivers?.() ?? []) {
@@ -593,12 +411,10 @@ export class QOSPeer {
   async _handleAnswer(fromId, sdp) {
     const pc = this.connections.get(fromId);
     if (!pc) return;
-    // An answer is only meaningful while our own offer is outstanding. Two
-    // peers can dial each other at the same moment — glare — and then each
-    // receives an answer to an offer it has already replaced, which werift
-    // reports as "Cannot handle answer in signaling state". Thrown, that became
-    // an error the agent treated as a broken socket and reconnected over,
-    // which is a flap caused by a message that only needed ignoring.
+    // An answer is only meaningful while our own offer is outstanding. Glare can
+    // leave each side with an answer to an offer it has already replaced, which
+    // werift reports as "Cannot handle answer in signaling state" — thrown, that
+    // became a flap over a message that only needed ignoring.
     const state = pc.signalingState;
     if (state && state !== "have-local-offer") return;
     await pc.setRemoteDescription({ type: "answer", sdp });
@@ -618,9 +434,8 @@ export class QOSPeer {
     this.channels.delete(peerId);
     this.makingOffer.delete(peerId);
     this.attemptAt.delete(peerId);
-    // close() is async — it awaits sctpTransport.stop(), which is the step that stops
-    // the retransmit timer. Fire-and-forget is fine here, but surface the rejection
-    // rather than letting a failed teardown vanish (and leave the association live).
+    // close() is async — it awaits sctpTransport.stop(), the step that stops the
+    // retransmit timer. Fire-and-forget, but surface the rejection.
     try { Promise.resolve(pc?.close()).catch((e) => this.config.onError?.(e)); } catch {}
   }
 }
