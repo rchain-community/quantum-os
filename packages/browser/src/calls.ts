@@ -24,6 +24,16 @@ export interface CallHost {
   /** Agents are data-only: their media is never rendered. */
   isAgent(peerId: string): boolean;
   /**
+   * Everyone currently in the room. A call has no invite list — it broadcasts
+   * to whoever's here — so this is who needs a guaranteed direct connection
+   * before media goes out (see start()): under the bounded-degree overlay
+   * (peer.ts), most peers past a handful aren't a direct ring/skip neighbor,
+   * and a MediaStreamTrack can't be relayed the way a data-channel message
+   * can. Without pinning, a call in a big room would silently reach only the
+   * caller's ring neighbors.
+   */
+  roomPeers(): string[];
+  /**
    * Room peers (non-agent) whose *direct* peer connection has failed or is
    * still stuck — `failed`/`disconnected` always, and `checking`/`connecting`
    * only once `strict` is set (a slow mobile handshake needs the grace).
@@ -250,12 +260,23 @@ export function createCalls(host: CallHost, els: CallElements): Calls {
     local.muted = true;
     local.srcObject = localStream;
     showBar();
-    // Full mesh: a direct connection to every room peer already exists, so
-    // addLocalMedia adds the call's tracks to each and renegotiates. A peer
-    // who joins mid-call is covered by peer.ts's data-channel onopen, which
-    // pushes media to a newcomer whenever a call is in progress (it checks
-    // `localStream`, which addLocalMedia just set).
+    // addLocalMedia adds tracks to whatever's in `peer`'s connection map RIGHT
+    // NOW, so it must run BEFORE pinning, not after: pinning a peer with no
+    // existing connection creates a brand-new RTCPeerConnection synchronously
+    // and starts its initial offer/answer asynchronously, and if addLocalMedia
+    // then also renegotiated that same still-negotiating connection, the two
+    // offers would race. Called first, addLocalMedia only ever touches
+    // connections that are already stable. The peers a fresh pin dials in are
+    // still covered — peer.ts's data-channel onopen already pushes media to a
+    // newcomer whenever a call is in progress (checking `localStream`, which
+    // addLocalMedia just set) — so once each pinned connection's handshake
+    // completes, its media follows automatically, with no race.
     peer.addLocalMedia(localStream);
+    // Under the bounded-degree overlay most room peers aren't a direct
+    // neighbor by default, and a MediaStreamTrack can't be relayed the way a
+    // data-channel message can — pin everyone so a connection actually gets
+    // made to each of them (harmless no-ops for anyone already connected).
+    for (const id of host.roomPeers()) peer.pinNeighbor(id);
     peer.broadcast({ kind: "call-start" });
     host.say("📞 you started a call");
     updateControls();
@@ -270,6 +291,17 @@ export function createCalls(host: CallHost, els: CallElements): Calls {
     if (peer) {
       peer.removeLocalMedia();
       peer.broadcast({ kind: "call-end" });
+      // Undo the pins start()/onPeerJoined made for this call — otherwise,
+      // with active pruning off (see peer.ts's reconcilePrune), a call's
+      // connections would stay pinned open for the rest of the session even
+      // after it ends, silently pushing the room toward full mesh forever
+      // the first time anyone makes a call. Unpinning doesn't itself close
+      // anything right now (pruning is inert), but keeps pin state honest
+      // for when pruning is eventually re-enabled, and for any other future
+      // reader of `pins`. Skip agents — they're pinned independently, for
+      // the life of the room, not for this call; unpinning one here would
+      // silently break that separate, permanent guarantee.
+      for (const id of host.roomPeers()) if (!host.isAgent(id)) peer.unpinNeighbor(id);
     }
     reachTimers.splice(0).forEach(clearTimeout);
     reachWarned.clear();

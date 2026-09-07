@@ -711,7 +711,14 @@ export async function run(args) {
     switch (d.kind) {
       case "name":
         if (typeof d.name === "string") { peerNames.set(from, d.name); mem?.setPeerName(from, d.name); const r = (known[from] ??= { firstSeen: Date.now() }); r.name = d.name; saveKnown(); }
-        if (typeof d.agent === "string") agents.set(from, d.agent.toLowerCase());
+        // Keep a direct link to every other agent regardless of ring
+        // position — matches the browser side (app.ts's own name handler).
+        // Not required for correctness (broadcasts still reach everyone via
+        // relay), but keeps agent-to-agent coordination (lead election,
+        // trust sync) at one hop rather than however many the room's ring
+        // happens to put between two agents.
+        if (typeof d.agent === "string") { agents.set(from, d.agent.toLowerCase()); peer.pinNeighbor(from); }
+        else peer.unpinNeighbor(from);
         introduceTo(from);   // a human just identified → self-introduce (skips agents/dups)
         if (!isAgentPeer(from) && !hasName(from)) setTimeout(() => maybeNamePrompt(from), 3_000);   // joined nameless → prompt
         break;

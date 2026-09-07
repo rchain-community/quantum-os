@@ -6,24 +6,31 @@
 #
 #   bash run-agents.sh [room-cap-or-url] [role ...]
 #
-# Defaults: the public room + facilitator alone. Stable identity per role under
+# Defaults: the public room + facilitator. Stable identity per role under
 # ./.qos-<role>; logs + pids under ./.agents. Stop with ./stop-agents.sh.
 #
-# HOW MANY AGENTS
+# HOW MANY AGENTS, AND WHY THE STAGGER
 #
-# The room is a full mesh (peer.ts / qospeer.mjs) — every peer holds a direct
-# data channel to every other, and a browser sustains ~15 of them comfortably.
-# Every agent spends one of those slots and one connection budget per other
-# peer, so the default is ONE agent: the facilitator, which carries the
-# superset of the role duties (greet, name-prompt, synthesise, chair) and the
-# room's memory via --persist.
+# A peer joining a room of N sends N-1 offers and then a burst of ICE candidates,
+# so the per-connection signaling rate during a join is superlinear in room size.
+# The signaling server caps that rate per connection (SIGNAL_RATE_LIMIT, set to
+# 200/s for the public deployment in render.yaml); over the cap, handshakes stop
+# completing while every peer still appears in the room — from a browser that is
+# indistinguishable from the other peers never having arrived. The roster marks
+# a peer it has no data channel to, so the failure is visible where the peer is.
 #
-# Add roles only when you need them:
-#   bash run-agents.sh "$ROOM" facilitator skeptic
-# `skeptic` is the only role that runs `verify` — flagging a history that
-# passes the room's aggregate predicate but fails QLF's pairwise one — so add
-# it when that matters. `scribe`'s duties are a strict subset of the
-# facilitator's, so it is never worth a separate peer.
+# The stagger keeps a set of agents from arriving as one burst, which is the
+# shape that costs the most rate for the least reason.
+#
+# The defaults are facilitator + skeptic, with the room's memory carried by the
+# first of them rather than run as its own peer.
+#
+# `scribe` is not among them because it needs no peer of its own: its duties are
+# a strict subset of the facilitator's (see agent-roles.mjs), so a facilitator
+# already does everything a scribe does, and carrying --persist it is literally
+# the one keeping the record. `skeptic` is separate because it is the only role
+# that verifies — which predicate a history actually passed — and nothing else
+# does that.
 #
 # The `/rholang` macro agent is NOT started here — the browser expands locally,
 # so the agent is only worth a peer when you want the expansion posted into chat
@@ -35,10 +42,11 @@ cd "$(dirname "$0")"
 
 ROOM="${1:-cap:room:05214747236101414325074505234721}"
 shift || true
-# Default role: facilitator alone — it greets newcomers ("hi"), requests a name,
-# synthesises and chairs, and carries the room's memory. Pass roles explicitly
-# to add more, e.g. `bash run-agents.sh "$ROOM" facilitator skeptic`.
-ROLES=("$@"); [ ${#ROLES[@]} -eq 0 ] && ROLES=(facilitator)
+# Default role: facilitator greets newcomers ("hi") and requests a name itself, so
+# no separate greeter is needed. Pass roles explicitly to override, e.g.
+#   bash run-agents.sh "$ROOM" facilitator scribe
+# — see the ceiling note above before adding several.
+ROLES=("$@"); [ ${#ROLES[@]} -eq 0 ] && ROLES=(facilitator skeptic)
 
 # The room's memory rides with the FIRST role rather than running as its own
 # peer. Same duty qos-daemon.mjs performs alone — which still works standalone,

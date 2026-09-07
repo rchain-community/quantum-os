@@ -128,16 +128,21 @@ const fireLong = () => {
 
 const sentToJoiners = [];      // what addLocalMedia was handed, by track label
 let senders = [];              // what the connections carry, when there are any
+const pinned = [];   // who start() asked for a guaranteed direct connection to
 const peer = {
   peerId: "abc123",
   addLocalMedia(s) { sentToJoiners.push(s.getVideoTracks().map((t) => t.label)); },
   removeLocalMedia() {}, broadcast() {},
   videoSenders() { return senders; },
+  pinNeighbor(id) { pinned.push(id); },
 };
 const said = [];
 const tilesEl = el();
+// This file's "room" never models a real roster (senders/remoteStream stand
+// in for other peers directly), so roomPeers stays empty here — the pin
+// loop it drives is exercised at the unit level in peer.test.mjs instead.
 const calls = mod.createCalls(
-  { peer: () => peer, say: (t) => said.push(t), label: () => "peer", isAgent: () => false, mediaBlocked: () => [] },
+  { peer: () => peer, say: (t) => said.push(t), label: () => "peer", isAgent: () => false, roomPeers: () => [], mediaBlocked: () => [] },
   { bar: el(), tiles: tilesEl, mute: el(), cam: el(), share: el() },
 );
 const tileFor = (key) => tilesEl.children.find((c) => c.dataset.key === key);
@@ -252,27 +257,67 @@ check("including when the browser itself lacks the permission",
       said.some((t) => t.includes("operating system")), said.join(" | "));
 permission = "prompt";
 
-// --- a call adds media on start and removes it on end ----------------------
-// Full mesh: a direct connection to every room peer already exists, so
-// addLocalMedia adds the call's tracks to each and renegotiates; end() takes
-// them back off. No pinning — there is nothing to pin.
+// --- a call reaches everyone in the room, not just direct neighbors ---------
+// Under the bounded-degree overlay (peer.ts) most room peers past a handful
+// aren't a direct connection by default, and a MediaStreamTrack can't be
+// relayed the way a data-channel message can. Starting a call without
+// pinning every room peer first would silently reach only whoever happened
+// to already be a ring/skip neighbor. See issue #111 / CLAUDE.md.
 {
-  const calls2 = [];
-  const mediaPeer = {
-    peerId: "m1",
-    addLocalMedia() { calls2.push("add"); },
-    removeLocalMedia() { calls2.push("remove"); },
-    broadcast() {}, videoSenders() { return []; },
+  const pinnedFresh = [];
+  const addOrder = [];
+  const freshPeer = {
+    peerId: "fresh1",
+    addLocalMedia() { addOrder.push("addLocalMedia"); },
+    removeLocalMedia() {}, broadcast() {}, videoSenders() { return []; },
+    pinNeighbor(id) { addOrder.push("pin"); pinnedFresh.push(id); },
   };
-  const mediaCalls = mod.createCalls(
-    { peer: () => mediaPeer, say: () => {}, label: () => "peer", isAgent: () => false, mediaBlocked: () => [] },
+  const freshCalls = mod.createCalls(
+    {
+      peer: () => freshPeer, say: () => {}, label: () => "peer", isAgent: () => false,
+      roomPeers: () => ["r1", "r2", "r3"], mediaBlocked: () => [],
+    },
     { bar: el(), tiles: el(), mute: el(), cam: el(), share: el() },
   );
-  mediaCalls.toggle();   // start
+  freshCalls.toggle();
   await settle();
-  check("starting a call adds local media to the mesh", calls2[0] === "add", JSON.stringify(calls2));
-  mediaCalls.toggle();   // end
-  check("ending a call removes local media", calls2.includes("remove"), JSON.stringify(calls2));
+  check("starting a call pins every room peer",
+        pinnedFresh.length === 3 && ["r1", "r2", "r3"].every((id) => pinnedFresh.includes(id)),
+        JSON.stringify(pinnedFresh));
+  check("addLocalMedia runs before any pin — it must only ever touch connections "
+        + "that already existed, never one a pin just started negotiating",
+        addOrder[0] === "addLocalMedia", JSON.stringify(addOrder));
+}
+
+// --- ending a call releases the pins it made — except agents ----------------
+// With active pruning off, a pin is otherwise permanent: a call that never
+// unpinned anyone would silently push the room toward full mesh for the rest
+// of the session the first time anyone made a call. But an agent is pinned
+// for a separate, permanent reason (see app.ts's name handler) — end() must
+// not clear that just because a call it was never really "for" wraps up.
+{
+  const unpinnedAtEnd = [];
+  const endPeer = {
+    peerId: "end1",
+    addLocalMedia() {}, removeLocalMedia() {}, broadcast() {}, videoSenders() { return []; },
+    pinNeighbor() {},
+    unpinNeighbor(id) { unpinnedAtEnd.push(id); },
+  };
+  const endCalls = mod.createCalls(
+    {
+      peer: () => endPeer, say: () => {}, label: () => "peer",
+      isAgent: (id) => id === "the-agent",
+      roomPeers: () => ["r1", "r2", "the-agent"], mediaBlocked: () => [],
+    },
+    { bar: el(), tiles: el(), mute: el(), cam: el(), share: el() },
+  );
+  endCalls.toggle();   // start
+  await settle();
+  endCalls.toggle();   // end
+  check("ending a call unpins the ordinary room peers it pinned to start",
+        unpinnedAtEnd.includes("r1") && unpinnedAtEnd.includes("r2"), JSON.stringify(unpinnedAtEnd));
+  check("...but never unpins an agent — that pin is permanent, not call-scoped",
+        !unpinnedAtEnd.includes("the-agent"), JSON.stringify(unpinnedAtEnd));
 }
 
 // --- a call the media can't cross to a peer says so, once ------------------
@@ -285,12 +330,12 @@ permission = "prompt";
   let blocked = ["r1"];
   const rPeer = {
     peerId: "r0", addLocalMedia() {}, removeLocalMedia() {}, broadcast() {},
-    videoSenders() { return []; },
+    videoSenders() { return []; }, pinNeighbor() {}, unpinNeighbor() {},
   };
   const rCalls = mod.createCalls(
     {
       peer: () => rPeer, say: (t) => saidR.push(t), label: (id) => id,
-      isAgent: () => false, mediaBlocked: () => blocked,
+      isAgent: () => false, roomPeers: () => ["r1"], mediaBlocked: () => blocked,
     },
     { bar: el(), tiles: el(), mute: el(), cam: el(), share: el() },
   );
