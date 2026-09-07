@@ -96,6 +96,24 @@ export class QOSPeer {
     return this.peerId < peerId;
   }
 
+  /// Ensure a healthy connection to this peer, rebuilding a stale one. Called
+  /// for every peer on a fresh `peers` list and on every `joined`. A "joined"
+  /// for a peer we already have a connection to means they reconnected (a phone
+  /// waking, a reload) — our side is stale even though the channel may still
+  /// read "open" — so drop it and re-establish per the dial rule.
+  _reestablish(peerId) {
+    if (peerId === this.peerId || this._disconnected) return;
+    const pc = this.connections.get(peerId);
+    const st = pc && (pc.connectionState ?? pc.iceConnectionState);
+    const healthy = this._channelOpen(this.channels.get(peerId))
+      && (st === "connected" || st === "completed");
+    if (healthy) return;
+    if (this._connecting(peerId)) return;   // a fresh attempt is already running
+    if (pc) this._cleanup(peerId);
+    this.retryAt.delete(peerId);
+    if (this._initiates(peerId)) this._initiate(peerId).catch((e) => this.config.onError?.(e));
+  }
+
   /// A dial or answer to this peer is still in progress — don't start another
   /// (a fresh `_newPC` closes the pc mid-negotiation and both sides restart).
   /// A stale attempt (older than ATTEMPT_PATIENCE_MS) no longer counts.
@@ -233,25 +251,21 @@ export class QOSPeer {
     switch (msg.type) {
       case "peers": {
         // onPeerJoined fires for everyone (the app's roster shows all present);
-        // we dial only the peers we're the initiator for and hold no channel to.
+        // _reestablish rebuilds any connection that isn't fully healthy.
         this.roster = new Set(msg.peers);
         for (const peerId of msg.peers) {
           this.config.onPeerJoined?.(peerId);
-          if (peerId === this.peerId) continue;
-          if (this._channelOpen(this.channels.get(peerId))) continue;
-          if (this._connecting(peerId)) continue;
-          if (this._initiates(peerId)) this._initiate(peerId).catch((e) => this.config.onError?.(e));
+          this._reestablish(peerId);
         }
         break;
       }
       case "joined":
         this.roster.add(msg.peerId);
         this.config.onPeerJoined?.(msg.peerId);
-        if (this._initiates(msg.peerId)
-          && !this._channelOpen(this.channels.get(msg.peerId))
-          && !this._connecting(msg.peerId)) {
-          this._initiate(msg.peerId).catch((e) => this.config.onError?.(e));
-        }
+        // A "joined" for a peer we already hold a connection to means they
+        // reconnected (a phone waking, a reload) — our side is stale even if the
+        // channel still reads "open". _reestablish drops it and rebuilds.
+        this._reestablish(msg.peerId);
         break;
       case "left":
         this.roster.delete(msg.peerId);
@@ -285,15 +299,28 @@ export class QOSPeer {
     // full speed through pure-JS DTLS (one zombie peer pegged a core). "disconnected"
     // can also be a recoverable blip, so give it a grace period and re-check the
     // SAME pc is still stuck before dropping it.
+    //
+    // A dead connection to a peer signaling STILL lists is unreachable, not gone
+    // (a phone asleep, a cross-network peer with no path) — tear the pc down so
+    // the sweep redials, back the retry off, but do NOT fire onPeerLeft. The
+    // signaling "left" message is the authoritative departure.
+    const terminal = () => {
+      if (this.roster.has(remoteId)) {
+        this._cleanup(remoteId);
+        this.retryAt.set(remoteId, Date.now() + RETRY_INTERVAL_MS);
+        return;
+      }
+      this._cleanup(remoteId);
+      this.config.onPeerLeft?.(remoteId);
+    };
     if (stateEvt?.subscribe) stateEvt.subscribe((s) => {
-      if (s === "failed") { this._cleanup(remoteId); this.config.onPeerLeft?.(remoteId); }
+      if (s === "failed") { terminal(); }
       else if (s === "disconnected") {
         setTimeout(() => {
           if (this.connections.get(remoteId) !== pc) return;                       // already replaced/cleaned
           const now = pc.connectionState ?? pc.iceConnectionState;
           if (now !== "disconnected") return;                                      // recovered
-          this._cleanup(remoteId);
-          this.config.onPeerLeft?.(remoteId);
+          terminal();
         }, DISCONNECT_GRACE_MS).unref?.();
       }
     });

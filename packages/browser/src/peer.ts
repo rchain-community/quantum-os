@@ -452,27 +452,23 @@ export class QOSPeer {
     switch (msg.type) {
       case "peers": {
         // On signaling reconnect the server re-sends the peers list. onPeerJoined
-        // fires for everyone (the app's roster shows all present); we dial only
-        // the peers we're the initiator for and have no open channel to.
+        // fires for everyone (the app's roster shows all present); reestablish()
+        // rebuilds any connection that isn't fully healthy.
         this.roster = new Set(msg.peers);
         for (const peerId of msg.peers) {
           this.config.onPeerJoined?.(peerId);
-          if (peerId === this.peerId) continue;
-          if (this.channels.get(peerId)?.readyState === "open") continue;
-          if (this.connecting(peerId)) continue;
-          if (this.initiates(peerId)) void this.initiateConnection(peerId);
+          this.reestablish(peerId);
         }
         break;
       }
       case "joined":
         this.roster.add(msg.peerId);
         this.config.onPeerJoined?.(msg.peerId);
-        // The joiner dials us if it's the initiator; we dial it if we are.
-        if (this.initiates(msg.peerId)
-          && this.channels.get(msg.peerId)?.readyState !== "open"
-          && !this.connecting(msg.peerId)) {
-          void this.initiateConnection(msg.peerId);
-        }
+        // A "joined" for a peer we already hold a connection to means they
+        // reconnected (a phone waking, a reload). Our side is stale — a data
+        // channel can still read "open" while it reaches a frozen tab — so
+        // reestablish() drops it and rebuilds per the dial rule.
+        this.reestablish(msg.peerId);
         break;
       case "left":
         this.roster.delete(msg.peerId);
@@ -523,6 +519,31 @@ export class QOSPeer {
       console.log(`[qos-peer] dialling ${peerId.slice(-8)}`);
       void this.initiateConnection(peerId);
     }
+  }
+
+  /**
+   * Make sure we have a healthy connection to this peer, rebuilding if not.
+   *
+   * Called for every peer on a fresh `peers` list (a signaling (re)connect) and
+   * on every `joined`. A "joined" for a peer we already have a connection to
+   * means they reconnected — a phone waking from sleep, a browser reload — and
+   * our side of that connection is now stale: the peer's ICE session is fresh,
+   * but a data channel can still read "open" for a while as it points at a
+   * frozen tab, so nothing would redial and messages to them would vanish.
+   * Drop anything that isn't fully healthy and re-establish per the dial rule.
+   */
+  private reestablish(peerId: string): void {
+    if (peerId === this.peerId || this._disconnected) return;
+    const pc = this.connections.get(peerId);
+    const healthy = pc?.connectionState === "connected"
+      && this.channels.get(peerId)?.readyState === "open";
+    if (healthy) return;
+    if (this.connecting(peerId)) return;   // a fresh attempt is already running
+    if (pc) this.cleanup(peerId);          // drop the stale one
+    this.retryAt.delete(peerId);
+    // Initiator dials now; the other side waits for that offer (sweep's
+    // FALLBACK_EXTRA_MS covers a no-show).
+    if (this.initiates(peerId)) void this.initiateConnection(peerId);
   }
 
   /**
@@ -731,8 +752,19 @@ export class QOSPeer {
     ch.onclose = () => {
       this.channels.delete(peerId);
       console.log(`[qos-peer] data channel closed with ${peerId}`);
-      // A closed data channel is the most reliable "peer is gone" signal for a
-      // clean tab-close — the underlying connection may never reach "failed".
+      // A channel close is NOT the same as "they left". A phone that goes to
+      // sleep freezes its tab and tears the SCTP association down — the peer is
+      // still in the room and will be back when the screen wakes. If signaling
+      // still lists them, keep them: tear down the dead pc so the sweep redials,
+      // back the retry off one cycle, and let the app mark them ⚠ (not gone).
+      // A genuine tab-close drops the signaling socket too, so `left` arrives
+      // within about a second and declares them gone properly. Only a channel
+      // close for a peer signaling has already forgotten is a departure here.
+      if (peerId !== this.peerId && this.roster.has(peerId)) {
+        this.cleanup(peerId);
+        this.retryAt.set(peerId, Date.now() + QOSPeer.RETRY_INTERVAL_MS);
+        return;
+      }
       this.declarePeerGone(peerId);
     };
     ch.onmessage = (event) => {

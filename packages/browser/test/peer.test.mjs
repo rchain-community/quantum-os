@@ -67,7 +67,22 @@ class FakePC {
     this.remoteDescription = null;
     made.push(this);
   }
-  createDataChannel() { return { readyState: "connecting", send() {}, close() {} }; }
+  createDataChannel() {
+    const ch = { readyState: "connecting", send() {}, close() {} };
+    this.channel = ch;
+    return ch;
+  }
+  // Drive a data channel to "open" the way a completed handshake would — the
+  // initiator's own channel, or (answerer) a channel arriving via ondatachannel.
+  openChannel() {
+    this.connectionState = "connected";
+    if (!this.channel && this.ondatachannel) {
+      this.channel = { readyState: "connecting", send() {}, close() {} };
+      this.ondatachannel({ channel: this.channel });
+    }
+    if (this.channel) { this.channel.readyState = "open"; this.channel.onopen?.(); }
+    this.onconnectionstatechange?.();
+  }
   async createOffer() { return { type: "offer", sdp: "a=ice-ufrag:AAAA" }; }
   async createAnswer() { return { type: "answer", sdp: "a=ice-ufrag:BBBB" }; }
   async setLocalDescription() {}
@@ -294,6 +309,52 @@ highRedial.sweep();
 await settle();
 check("a peer that left is not dialled", offersTo("aaaa") === goneAt, `${offersTo("aaaa")} vs ${goneAt}`);
 highRedial.disconnect();
+
+// --- a phone that sleeps: channel dies but the peer is not reported gone ------
+// A phone going to sleep freezes its tab and tears the SCTP association down.
+// The peer is still in the room — declaring them gone (then re-joined on wake)
+// is the "flagged then dropped then back" churn. Keep them, mark ⚠, retry.
+{
+  const woke = [];
+  const wLeft = [];
+  const w = new QOSPeer({
+    signalingUrl: "wss://x", roomId: "cap:room:0246", peerId: "mmm2",
+    onChannelOpen: (id) => woke.push(id),
+    onPeerLeft: (id) => wLeft.push(id),
+  });
+  w.connect(); await tick(); FakeWS.last.onopen?.(); await tick();
+  deliver({ type: "peers", peers: ["aaa2"] });   // mmm2 > aaa2 → aaa2 dials us
+  await settle();
+  deliver({ type: "offer", from: "aaa2", sdp: "a=ice-ufrag:S1" });
+  await settle();
+  const pc1 = made[made.length - 1];
+  pc1.openChannel();                              // handshake completes
+  await settle();
+  check("the channel opened", woke.includes("aaa2"), JSON.stringify(woke));
+
+  // Phone sleeps: the data channel closes while aaa2 is still in the roster.
+  pc1.channel.readyState = "closed";
+  pc1.channel.onclose?.();
+  await settle();
+  check("a channel closing for a peer still in the roster does NOT report them gone",
+        wLeft.length === 0, JSON.stringify(wLeft));
+
+  // Phone wakes: signaling re-broadcasts "joined" for it. We hold a stale pc —
+  // reestablish() must drop it. aaa2 is the initiator, so it will send a fresh
+  // offer; we answer it and the channel reopens.
+  woke.length = 0;
+  deliver({ type: "joined", peerId: "aaa2" });
+  await settle();
+  deliver({ type: "offer", from: "aaa2", sdp: "a=ice-ufrag:S2" });   // fresh ICE session
+  await settle();
+  const pc2 = made[made.length - 1];
+  check("a fresh pc was built for the reconnecting peer", pc2 !== pc1, "reused the stale pc");
+  pc2.openChannel();
+  await settle();
+  check("the channel reopens after the peer wakes", woke.includes("aaa2"), JSON.stringify(woke));
+  check("...and still no spurious 'left'", wLeft.length === 0, JSON.stringify(wLeft));
+  w.disconnect();
+}
 
 // --- broadcast / send carry no routing tags — full mesh, plain -------------
 {
