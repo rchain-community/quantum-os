@@ -58,6 +58,10 @@ export class QOSPeer {
     this.pruneTimers = new Map();         // grace-then-close timers, see _reconcilePrune
     this.seenRelay = new Set();           // flood dedupe, see _handleRelay
     this._relayCounter = 0;
+    // Per-instance nonce: `${peerId}:${counter}` alone is not unique across a
+    // reload/restart (the counter restarts at 0), so a restarted peer's first
+    // messages get deduped away by peers still holding the old ids. See peer.ts.
+    this._relaySession = Math.random().toString(36).slice(2, 10);
     this.lastHeardVia = new Map();        // peerId -> last relay-traffic timestamp, see isReachable
     this._presenceTimer = null;
     this._autoTurn = [];                  // fetched relay, see _loadAutoTurn
@@ -190,7 +194,7 @@ export class QOSPeer {
   }
 
   _nextRelayId() {
-    const id = `${this.peerId}:${this._relayCounter++}`;
+    const id = `${this.peerId}:${this._relaySession}:${this._relayCounter++}`;
     this.seenRelay.add(id);
     if (this.seenRelay.size > SEEN_RELAY_MAX) this.seenRelay.clear();
     return id;

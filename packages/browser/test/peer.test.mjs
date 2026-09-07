@@ -478,6 +478,31 @@ many.disconnect();
   check("the raw kind/text survive tagging unchanged",
         toNb1.kind === "chat" && toNb1.text === "hi", JSON.stringify(toNb1));
 
+  // A peer that reloads restarts its relay counter at 0. Its new ids must NOT
+  // collide with the ids it used before the reload — otherwise a peer whose
+  // page did not reload has them in seenRelay and silently drops the reloaded
+  // peer's first messages (mobile: a tab reloads on every sleep/eviction).
+  {
+    const rd = [];
+    const before = new QOSPeer({ signalingUrl: "wss://x", roomId: "cap:room:0246", peerId: "rl" });
+    const after  = new QOSPeer({ signalingUrl: "wss://x", roomId: "cap:room:0246", peerId: "rl" }); // same peerId, "reloaded"
+    const cap = (n) => { const a = []; return { readyState: "open", sent: a, send: (p) => a.push(JSON.parse(p)) }; };
+    const cb = cap(); before.channels.set("x", cb);
+    const ca = cap(); after.channels.set("x", ca);
+    before.broadcast({ kind: "chat", text: "pre" });
+    after.broadcast({ kind: "chat", text: "post" });
+    check("a reloaded peer's first relay id differs from the pre-reload run's",
+          ca.sent[0]._relayId !== cb.sent[0]._relayId, `${ca.sent[0]._relayId} vs ${cb.sent[0]._relayId}`);
+    const rx = new QOSPeer({ signalingUrl: "wss://x", roomId: "cap:room:0246", peerId: "rx",
+      onMessage: (from, d) => rd.push(d.text) });
+    rx.channels.set("z", { readyState: "open", send() {} });
+    rx.handleRelay("z", { ...cb.sent[0] });   // pre-reload message
+    rx.handleRelay("z", { ...ca.sent[0] });   // post-reload message
+    check("both the pre- and post-reload messages are delivered, not deduped",
+          rd.length === 2, JSON.stringify(rd));
+    before.disconnect(); after.disconnect(); rx.disconnect();
+  }
+
   // Loop the same message back as if nb1 relayed it onward and it reached us
   // again via nb2 — a real ring would do exactly this. Must be dropped, not
   // re-delivered (we already have it) and not re-relayed either.

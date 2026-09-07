@@ -267,6 +267,13 @@ export class QOSPeer {
   private seenRelay = new Set<string>();
   private static readonly SEEN_RELAY_MAX = 5000;
   private relayCounter = 0;
+  // A per-instance nonce mixed into every relay id. `${peerId}:${counter}` is
+  // NOT unique across reloads — `relayCounter` restarts at 0 in a fresh page
+  // context, reusing ids that other peers (whose page did not reload) still
+  // hold in `seenRelay`, so a reloaded peer's first messages are silently
+  // deduped away. A mobile tab reloads constantly (sleep, eviction). The nonce
+  // makes each session's ids disjoint.
+  private readonly relaySession = Math.random().toString(36).slice(2, 10);
 
   // "Can we reach this peer at all" (direct channel OR recent relay
   // traffic), as opposed to hasChannel's "are we directly linked to them" —
@@ -488,12 +495,13 @@ export class QOSPeer {
     }
   }
 
-  /// Unique id for one flood — `${peerId}:${counter}` is globally unique, so
-  /// dedupe never collides across peers. Marked seen immediately, not just
-  /// on receipt: without this, a broadcast that loops all the way around the
-  /// ring back to its own originator would be delivered to onMessage twice.
+  /// Unique id for one flood — `${peerId}:${session}:${counter}`, unique across
+  /// peers AND across reloads of the same peer (see relaySession). Marked seen
+  /// immediately, not just on receipt: without this, a broadcast that loops all
+  /// the way around the ring back to its own originator would be delivered to
+  /// onMessage twice.
   private nextRelayId(): string {
-    const id = `${this.peerId}:${this.relayCounter++}`;
+    const id = `${this.peerId}:${this.relaySession}:${this.relayCounter++}`;
     this.seenRelay.add(id);
     if (this.seenRelay.size > QOSPeer.SEEN_RELAY_MAX) this.seenRelay.clear();
     return id;
