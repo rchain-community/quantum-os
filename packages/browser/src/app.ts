@@ -6244,6 +6244,22 @@ async function connect(): Promise<void> {
     async onMessage(from, data) {
       const prev = activeRoom; setActiveRoom(ctx);
       try {
+      // Hearing from a peer is proof it is present. A peer reached only over
+      // the flood relay (no direct channel — common for an agent that is a
+      // ring neighbor of someone else) never fires onChannelOpen, and if a
+      // flap removed it from the roster nothing re-adds it: onPeerJoined only
+      // fires on a signaling join/list, which does not repeat while signaling
+      // stays up. Result: "the agent replies but is not listed." So a message
+      // from an untracked peer puts it (back) on the roster. renderPeers marks
+      // it ⚠ only if isReachable is also false, so a relay-reachable agent
+      // shows normally.
+      if (from && from !== qpeer?.peerId && !peers.has(from)) {
+        const pend = pendingLeaves.get(from);
+        if (pend !== undefined) { clearTimeout(pend); pendingLeaves.delete(from); }
+        peers.add(from);
+        if (!peerSeenAt.has(from)) peerSeenAt.set(from, Date.now());
+        renderPeers();
+      }
       if (typeof data === "object" && data !== null) {
         const d = data as Record<string, unknown>;
         // The overlay's own liveness beacon (peer.ts's periodic flood, kept
