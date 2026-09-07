@@ -31,6 +31,8 @@ const SEEN_RELAY_MAX = 5000;
 const REACHABLE_WINDOW_MS = 45_000;
 const ATTEMPT_PATIENCE_MS = 45_000;   // how long a dial/answer in flight is left alone before a redial is allowed
 const PRESENCE_FLOOD_MS = 30_000;
+const REAP_MS = 20_000;              // how often _reapOrphans runs
+const REAP_STUCK_MS = 90_000;       // a channel-less pc older than this is reaped even if still in the roster
 
 // The ICE username fragment identifies an ICE session; a peer that reconnects (or
 // reloads its browser) brings a new one. Used to tell a genuine renegotiation
@@ -64,6 +66,7 @@ export class QOSPeer {
     this._relaySession = Math.random().toString(36).slice(2, 10);
     this.lastHeardVia = new Map();        // peerId -> last relay-traffic timestamp, see isReachable
     this._presenceTimer = null;
+    this._reapTimer = null;
     this._autoTurn = [];                  // fetched relay, see _loadAutoTurn
   }
 
@@ -76,6 +79,37 @@ export class QOSPeer {
     if (!this._presenceTimer) {
       this._presenceTimer = setInterval(() => this.broadcast({ kind: "presence" }), PRESENCE_FLOOD_MS);
       this._presenceTimer.unref?.();
+    }
+    // Reap orphaned peer connections. werift's ICE layer has no consent-freshness
+    // timer, so a peer that vanishes ungracefully (a phone losing wifi, no
+    // `leave` sent) can park a pc that never reaches "failed" — its SCTP
+    // association then retransmits its unacked queue at full speed through
+    // pure-JS DTLS, pegging a core over time. The `left` handler cleans up a
+    // graceful departure; this is the backstop for the rest: once the signaling
+    // server has dropped a peer from the roster (its own heartbeat evicts an
+    // ungraceful drop after ~60-90s), any pc we still hold to it is dead weight.
+    if (!this._reapTimer) {
+      this._reapTimer = setInterval(() => this._reapOrphans(), REAP_MS);
+      this._reapTimer.unref?.();
+    }
+  }
+
+  /// Close any pc to a peer the signaling roster no longer lists, and any pc
+  /// stuck without an open channel far past a real handshake. Both are pure
+  /// cost — see the connect() comment.
+  _reapOrphans() {
+    if (this._disconnected || this.ws?.readyState !== WebSocket.OPEN) return;
+    const now = Date.now();
+    // Only trust "not in roster" when we actually hold a roster. Right after a
+    // signaling reconnect it is momentarily empty (the `peers` list has not
+    // arrived), and reaping every connection then would be needless churn.
+    const rosterFresh = this.roster.size > 0;
+    for (const peerId of [...this.connections.keys()]) {
+      if (peerId === this.peerId) continue;
+      if (rosterFresh && !this.roster.has(peerId)) { this._cleanup(peerId); continue; }
+      if (this._channelOpen(this.channels.get(peerId))) continue;
+      const since = this.attemptAt.get(peerId) ?? now;
+      if (now - since > REAP_STUCK_MS) this._cleanup(peerId);
     }
   }
 
@@ -224,6 +258,7 @@ export class QOSPeer {
     this._disconnected = true;
     if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
     if (this._presenceTimer) clearInterval(this._presenceTimer);
+    if (this._reapTimer) clearInterval(this._reapTimer);
     this._signal({ type: "leave", roomId: this.config.roomId, peerId: this.peerId });
     for (const pc of this.connections.values()) { try { pc.close(); } catch {} }
     try { this.ws?.close(); } catch {}
