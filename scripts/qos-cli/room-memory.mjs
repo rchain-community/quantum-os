@@ -253,9 +253,7 @@ function mergeGroup(raw) {
 }
 
 async function ingest(from, d) {
-  // The overlay's own liveness beacon (qospeer.mjs's periodic flood, kept for
-  // isReachable) — every ~30s per present peer, and not room content, so it
-  // doesn't belong in a durable transcript meant to capture what happened.
+  // Legacy liveness beacon from an old-build peer — never room content.
   if (d && typeof d === "object" && d.kind === "presence") return;
   if (verbose) log(` ⇐ ${from.slice(0, 8)}… ${typeof d === "object" ? JSON.stringify(d).slice(0, 200) : d}`);
   transcribe(from, d);
