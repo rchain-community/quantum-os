@@ -429,6 +429,23 @@ ${seats.join(" |\n")} |
 }`;
     },
   },
+
+  // A chain read: it has rholang (so it is not answered locally like `zfa` /
+  // `verify`) but `write: false`, so `$balance(…)` runs as an unsigned
+  // `/rholang eval` — no phlo, no block. The deployer's own address is not
+  // available in an exploratory deploy (`rho:rchain:deployerId` is unbound), so
+  // the caller resolves a literal `me` to its REV address before expansion.
+  balance: {
+    help: "Read a REV balance (rho:rchain:revVault). Arg: a REV address (or `me`).",
+    write: false,
+    argSpec: [["addr", "string"]],
+    expand(args) {
+      return `new revVault(\`rho:rchain:revVault\`), ret in {
+  revVault!("getBalance", ${q(args.addr)}, *ret) |
+  for (@bal <- ret) { return!(bal) }
+}`;
+    },
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -446,7 +463,7 @@ function expandBare(input) {
   if (head === "help") return { kind: "help" };
   if (head === "macros" || head === "list") return { kind: "list" };
   // Bare form: no call sites, and the first word names a macro.
-  if (!body.includes("%") && MACROS[head]) return expandMacro(body);
+  if (!body.includes("%") && !/\$[A-Za-z]/.test(body) && MACROS[head]) return expandMacro(body);
   return expandProgram(body);
 }
 
@@ -492,8 +509,10 @@ function expandMacro(line) {
     throw fail(`${name}: too many args (expected ${spec.length})`);
   }
 
-  if (macro.write) {
-    return { kind: "rholang", macro: name, source: macro.expand(args) };
+  if (typeof macro.expand === "function") {
+    // `write` picks the run path: a write macro is signed + deployed; a read
+    // macro that still needs the chain (balance) runs as an unsigned eval.
+    return { kind: "rholang", macro: name, source: macro.expand(args), mode: macro.write ? "deploy" : "eval" };
   }
   return { kind: "result", macro: name, ...macro.read(args) };
 }
@@ -628,33 +647,44 @@ function expandProgram(src) {
   while (i < text.length) {
     const t = skipTrivia(text, i);
     if (t !== -1) { i = t; continue; }
-    if (text[i] !== "%") { i++; continue; }
-    const m = /^%([A-Za-z][\w-]*)\s*\(/.exec(text.slice(i));
+    // `$` is the room's macro sigil (illegal in rholang, so a missed expansion
+    // is a hard error at rnode). `%` is kept as a deprecated alias — but it is
+    // also rholang's modulo operator, so a `%name(` with no matching macro is
+    // left alone silently, whereas an unknown `$name(` may be a room macro that
+    // a later pass expands, also left alone.
+    if (text[i] !== "%" && text[i] !== "$") { i++; continue; }
+    const sigil = text[i];
+    const m = /^[%$]([A-Za-z][\w-]*)\s*\(/.exec(text.slice(i));
     if (!m) { i++; continue; }
     const name = m[1].toLowerCase();
     const open = i + m[0].length - 1;
     const close = matchBracket(text, open);
     if (close === -1) {
-      errors.push({ line: lineOf(text, i), message: `%${name}: unbalanced ( — call site is not closed` });
+      errors.push({ line: lineOf(text, i), message: `${sigil}${name}: unbalanced ( — call site is not closed` });
       break;
     }
     const macro = MACROS[name];
-    out.push(text.slice(last, i));
     if (!macro) {
-      errors.push({ line: lineOf(text, i), message: `unknown macro %${name} — try /rholang macros` });
-      out.push(text.slice(i, close + 1));                  // leave it as written
-    } else {
-      try {
-        // A read macro has no rholang to substitute, and expansion does not
-        // invent any: report it and leave the site as written.
-        if (!macro.write) throw fail(`%${name} is a read macro — it has no rholang; use it on its own line`);
-        const args = bindArgs(macro, name, splitArgs(text.slice(open + 1, close)));
-        out.push(macro.expand(args));
-        expansions.push({ name, line: lineOf(text, i), write: true });
-      } catch (e) {
-        errors.push({ line: lineOf(text, i), message: e?.message ?? String(e) });
-        out.push(text.slice(i, close + 1));
+      // `%foo(` with no such macro: almost certainly a typo (it is not valid
+      // modulo either), so report it. `$foo(` may be a room macro a later pass
+      // expands — leave it silently. Either way the text is left in place.
+      if (sigil === "%") errors.push({ line: lineOf(text, i), message: `unknown macro %${name} — try /rholang macros` });
+      i = close + 1;
+      continue;
+    }
+    out.push(text.slice(last, i));
+    try {
+      // A read macro with no rholang (zfa / verify) is answered on its own
+      // line, not substituted into a program.
+      if (!macro.write && typeof macro.expand !== "function") {
+        throw fail(`${sigil}${name} is a local read — it has no rholang; use it on its own line`);
       }
+      const args = bindArgs(macro, name, splitArgs(text.slice(open + 1, close)));
+      out.push(macro.expand(args));
+      expansions.push({ name, line: lineOf(text, i), write: !!macro.write });
+    } catch (e) {
+      errors.push({ line: lineOf(text, i), message: e?.message ?? String(e) });
+      out.push(text.slice(i, close + 1));
     }
     last = close + 1;
     i = close + 1;
@@ -738,6 +768,18 @@ function selftest() {
         .includes('"directory": "new x in { evil!(1) }"')],
     ["a list arg keeps its elements whole",
       () => P('%ballot("i", ["ship auth", "pay debt"])').source.includes('"ship auth", "pay debt"')],
+    ["$ is the room macro sigil — a $name( site expands like %",
+      () => P('new x in { $directory("notes") }').source.includes("insertArbitrary!")],
+    ["$ and % expand the same built-in identically",
+      () => P('$transfer(10, "b")').source === P('%transfer(10, "b")').source],
+    ["an unknown $name( is left alone silently (may be a room macro)",
+      () => { const r = P('$mymacro("x")'); return r.errors.length === 0 && r.source === '$mymacro("x")'; }],
+    ["$balance is a chain read: write:false but has rholang",
+      () => { const r = P('$balance("1111Alice")'); return r.expansions.length === 1 && r.expansions[0].write === false && r.source.includes('revVault!("getBalance", "1111Alice"'); }],
+    ["macroMode routes the sigils",
+      () => macroMode("balance") === "eval" && macroMode("transfer") === "deploy" && macroMode("verify") === "read-local" && macroMode("nope") === null],
+    ["bare $balance via /rholang macro runs as eval",
+      () => { const r = expandMacro("balance 1111Alice"); return r.kind === "rholang" && r.mode === "eval"; }],
   ];
   for (const [name, fn] of progCases) {
     try {
@@ -765,5 +807,15 @@ function selftest() {
 }
 
 
-return { MACROS, expandBare, expandProgram, expandMacro, listMacros, HELP, selftest };
+/** How a `$name(…)` line runs: a local read (answered here), an unsigned chain
+ *  read (`/rholang eval`), a signed deploy, or not a built-in at all. */
+function macroMode(name) {
+  const m = MACROS[String(name ?? "").toLowerCase()];
+  if (!m) return null;
+  if (typeof m.expand === "function") return m.write ? "deploy" : "eval";
+  if (typeof m.read === "function") return "read-local";
+  return null;
+}
+
+return { MACROS, macroMode, expandBare, expandProgram, expandMacro, listMacros, HELP, selftest };
 }

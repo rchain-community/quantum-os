@@ -40,7 +40,7 @@ import { createPalette, CMD_HELP, type Palette } from "./palette.js";
 import { createAttachments, renderMedia, type Attachments,
          type MediaAttachment, type MediaKind } from "./attachments.js";
 import { openRholangEditor } from "./rholang-editor.js";
-import { expandBareMacro, expandMacroProgram, lintRholang,
+import { expandBareMacro, expandMacroProgram, lintRholang, macroMode,
          listMacros as listRholangMacros } from "./rholang-pipeline.js";
 import { loadConfig as loadNodeConfig, saveConfig as saveNodeConfig, describeConfig as describeNodeConfig,
          generateKey as generateDeployKey, revAddressOf, nodeStatus, evalTerm, deployTerm,
@@ -2269,8 +2269,10 @@ const RHOLANG_HELP = [
   "                           on its name until read, so nothing is lost by collecting it later.",
   "  /rholang status        — what rnode is: version, shard, height, phlo floor.",
   "  /rholang powerbox      — the names every program gets, and what each one takes.",
-  "  /rholang macros        — the approved capability macro library (%name sites).",
+  "  /rholang macros        — the approved capability macro library ($name sites).",
   "  /rholang macro <n> …   — expand one macro on its own, when it is the whole program.",
+  "  $name(args)            — run a chain macro straight from the room line: $balance(me),",
+  "                           $transfer(10, \"1111…\"), $verify(@x), $( …inline program… ).",
   "",
   "  The locker — your names and your identity record, kept on chain:",
   "  /rholang locker        — where it is · locker <uri> · locker install",
@@ -2280,8 +2282,9 @@ const RHOLANG_HELP = [
   "  /rholang grant <n>     — a write-only capability for that one name",
   "  Each is its own deploy: your identity exists only inside one.",
   "",
-  "  A program's macro call sites expand before it is linted or signed: %name(…)",
-  "  from the library above, $name(…) from what this room defined with /macro.",
+  "  A program's macro call sites expand before it is linted or signed: $name(…)",
+  "  from the library above, or from what this room defined with /macro (%name is a",
+  "  deprecated alias — $ is illegal in rholang, so a missed expansion fails loud).",
   "  /rholang echo shows the result, which is what answers should-I-sign-this.",
   "",
   "  eval and deploy open an editor: syntax-highlighted, linted as you type,",
@@ -2572,11 +2575,11 @@ async function explainRholangAsync(mode: "eval" | "deploy", source: string, cfg:
  */
 function expandRholangMacros(source: string, say: (t: string) => void): string {
   let out = source;
-  if (out.includes("%")) {
-    const p = expandMacroProgram(out);
+  if (out.includes("%") || out.includes("$")) {
+    const p = expandMacroProgram(out);      // built-in library — `$name(` and legacy `%name(`
     for (const err of p.errors) say(`✗ line ${err.line}: ${err.message}`);
     if (p.expansions.length) {
-      const names = [...new Set(p.expansions.map((e) => e.name))].map((n) => "%" + n).join(", ");
+      const names = [...new Set(p.expansions.map((e) => e.name))].map((n) => "$" + n).join(", ");
       say(`  · expanded ${p.expansions.length} built-in site${p.expansions.length === 1 ? "" : "s"}: ${names}`);
     }
     out = p.source;
@@ -2873,11 +2876,89 @@ function runMacroLine(line: string): string[] {
   return out;
 }
 
-/** Route one line of input: `+name` is a macro, anything else a slash command. */
+/** Route one line of input: `+name` runs a command macro, `$name(…)` runs a
+ *  chain macro, anything else is a slash command. */
 function runInput(text: string): string[] {
   const t = text.trim();
   if (t.startsWith("+")) return runMacroLine(t);
+  if (t.startsWith("$")) return runDollarLine(t);
   return handleCommand(t.startsWith("/") ? t : "/" + t);
+}
+
+/**
+ * A `$name(…)` line runs a chain macro. `$` is the room's macro sigil (illegal
+ * in rholang, so a missed expansion is a hard error at rnode, never silent).
+ *
+ *   $verify(@x)                 — a local read, answered here
+ *   $balance(me)               — a chain read, unsigned `/rholang eval`
+ *   $transfer(10, "1111…")     — a write, `/rholang deploy` (signs, opens the editor)
+ *   $( new x in { $anchor(@d, "^v", "note") } )   — a full inline program
+ *
+ * Built-in macros are `rholang-macros.js`; a `$name` the library doesn't know
+ * falls through to this room's `/macro`-defined ones.
+ */
+function runDollarLine(line: string): string[] {
+  const out: string[] = [];
+  const say = (t: string) => { addMessage("", t, "system"); out.push(t); };
+
+  let body = line.trim();
+  const wrapped = /^\$\s*\(([\s\S]*)\)\s*$/.exec(body);
+  if (wrapped) body = wrapped[1].trim();
+
+  // A single `$name(args)` call — the common case.
+  const single = wrapped ? null : /^\$([A-Za-z][\w-]*)\s*\(([\s\S]*)\)\s*$/.exec(body);
+  if (single) {
+    const name = single[1].toLowerCase();
+    let argStr = single[2].trim();
+    const mode = macroMode(name);
+
+    if (mode === null && !macroStore.get(name)) {
+      say(`✗ no $${name} — \`/rholang macros\` lists the built-ins, \`/macro list\` this room's`);
+      return out;
+    }
+
+    // A local read (verify / zfa): answer it here, no node.
+    if (mode === "read-local") {
+      const bareArgs = argStr.replace(/^["']|["']$/g, "").replace(/["']?\s*,\s*["']?/g, " ");
+      try {
+        const x = expandBareMacro(`/rholang macro ${name} ${bareArgs}`);
+        if (x.kind === "result") { say(x.text); return out; }
+      } catch (e) { say(`✗ ${(e as Error)?.message ?? e}`); return out; }
+    }
+
+    // `$balance(me)` — `rho:rchain:deployerId` is unbound in an exploratory
+    // deploy, so resolve `me` to this browser's own REV address first.
+    if (name === "balance" && /^["']?me["']?$/i.test(argStr)) {
+      const key = loadNodeConfig().key;
+      if (!key) { say("✗ $balance(me): no deploy key yet — `/rholang key generate`, or pass a REV address"); return out; }
+      try { argStr = JSON.stringify(revAddressOf(key)); }
+      catch { say("✗ $balance(me): the stored key is not a valid secp256k1 key"); return out; }
+      body = `$balance(${argStr})`;
+    }
+
+    if (mode === "eval")   { runRholangProgram("eval", body); return out; }
+    if (mode === "deploy") { runRholangProgram("deploy", body); return out; }
+    // a room `$macro` (rholang fragment) — sign it, like any deploy
+    if (macroStore.get(name)) { runRholangProgram("deploy", body); return out; }
+  }
+
+  // A `$( … )` inline program, or a line with several sites: expand once to see
+  // whether any site is a write, then run — eval if every site is a read.
+  let writes = false, sites = 0;
+  try {
+    const p = expandMacroProgram(body);
+    for (const err of p.errors) { say(`✗ line ${err.line}: ${err.message}`); }
+    if (p.errors.length) return out;
+    for (const e of p.expansions) { sites++; if (e.write) writes = true; }
+    const u = expandCallSites(p.source, macroLookup);
+    for (const err of u.errors) { say(`✗ line ${err.line}: ${err.message}`); }
+    if (u.errors.length) return out;
+    for (const _ of u.expansions) { sites++; writes = true; }  // room fragments: treat as a write (confirmed)
+  } catch (e) { say(`✗ ${(e as Error)?.message ?? e}`); return out; }
+  if (sites === 0) { say(`✗ no macro call site in \`${line.trim()}\``); return out; }
+
+  runRholangProgram(writes ? "deploy" : "eval", body);
+  return out;
 }
 
 /**
@@ -6004,7 +6085,7 @@ function handleCommand(raw: string): string[] {
 
         case "macros": {
           for (const l of listRholangMacros().split("\n")) sys(l);
-          sys("  use one in a program: /rholang eval  with %name(…) call sites in it");
+          sys("  use one in a program: /rholang eval  with $name(…) call sites in it");
           sys("  or on its own:        /rholang macro <name> <args…>");
           break;
         }
@@ -6018,8 +6099,8 @@ function handleCommand(raw: string): string[] {
             const x = expandBareMacro(`/rholang macro ${rest}`);
             if (x.kind === "help") { for (const l of RHOLANG_HELP) sys(l); break; }
             if (x.kind === "list") { for (const l of listRholangMacros().split("\n")) sys(l); break; }
-            if (x.kind === "result") { sys(x.text); break; }   // a read macro: answered locally
-            runRholangProgram("deploy", x.source);
+            if (x.kind === "result") { sys(x.text); break; }   // a local read: answered here
+            runRholangProgram(x.kind === "rholang" && x.mode === "eval" ? "eval" : "deploy", x.source);
           } catch (e) { sys(`✗ ${(e as Error)?.message ?? e}`); }
           break;
         }
