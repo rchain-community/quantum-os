@@ -297,11 +297,17 @@ export const MACROS = engine.MACROS;
 export const listMacros = engine.listMacros;
 export const HELP = engine.HELP;
 
+/** How a `$name(…)` line runs: a local read, an unsigned chain read (`eval`),
+ *  a signed `deploy`, or `null` for "not a built-in". */
+export function macroMode(name: string): "read-local" | "eval" | "deploy" | null {
+  return engine.macroMode(name) as "read-local" | "eval" | "deploy" | null;
+}
+
 export type MacroExpansion =
   | { kind: "help" }
   | { kind: "list" }
   | { kind: "result"; macro: string; text: string }
-  | { kind: "rholang"; macro: string; source: string };
+  | { kind: "rholang"; macro: string; source: string; mode?: "eval" | "deploy" };
 
 export interface MacroProgram {
   kind: "program";
