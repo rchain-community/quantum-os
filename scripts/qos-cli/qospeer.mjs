@@ -122,7 +122,7 @@ export class QOSPeer {
   /// passed an explicit iceServers (tests, an override) — this only fills in
   /// the default. Best-effort: any failure just leaves iceServers as-is.
   async _loadAutoTurn() {
-    if (this.config.iceServers) return;
+    if (this.config.iceServers || this.config.noAutoTurn) return;
     try {
       const base = this.config.signalingUrl.replace(/^ws/, "http");
       const ctrl = new AbortController();

@@ -66,6 +66,10 @@ Options:
                      subscription, no API credits — must be installed + logged in).
   --about <url>      Link to the room's about page, shown in intro/help
                      (default: the QuantumOS MyRoom page).
+  --turn             Fetch a TURN relay (GET /turn). Off by default — the agent
+                     is data-only and reaches peers over the flood relay, so a
+                     relay only adds ICE-candidate traffic through signaling.
+                     Turn on only if this agent must span a NAT boundary itself.
   --ai-model <m>     Model. api default: claude-haiku-4-5-20251001;
                      claude-code default: the CLI's configured model.
   --verbose          Log every inbound message + suppressed nudges.
@@ -96,6 +100,7 @@ export function parseArgs(argv) {
     else if (x === "--ai-backend") a.aiBackend = argv[++i];
     else if (x === "--ai-model") a.aiModel = argv[++i];
     else if (x === "--about") a.about = argv[++i];
+    else if (x === "--turn") a.turn = true;
     else if (x === "--verbose") a.verbose = true;
     else if (x === "--help" || x === "-h") a.help = true;
   }
@@ -622,6 +627,12 @@ export async function run(args) {
 
   const peer = new QOSPeer({
     signalingUrl: args.signal, roomId, peerId: identity.peerId,
+    // The agent never needs TURN for itself — it is data-only (it rejects call
+    // media) and its data reaches any peer over the flood relay. Fetching a
+    // relay only adds relay ICE candidates that get trickled through the
+    // (metered) signaling server on every handshake. Opt in with --turn if this
+    // agent must hold a direct link across a NAT boundary for the relay to work.
+    noAutoTurn: !args.turn,
     onSignalingOpen: () => console.log(`${TAG} signaling connected; joined room`),
     onSignalingClose: (code, reason) => console.warn(
       `${TAG} signaling dropped` + (code ? ` (${code}${reason ? " " + reason : ""})` : "")),

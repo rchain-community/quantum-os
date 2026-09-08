@@ -1103,17 +1103,36 @@ function autoTurnEnabled(): boolean {
  * hanging `connect()` — a room with no relay configured must still connect
  * peers who don't need one, which is most peers most of the time.
  */
+/** The signaling server re-mints the TURN credential hourly against a 24h
+ *  Cloudflare TTL, so a value cached for ~45 min is always still valid. Caching
+ *  it means a reconnect (a flaky link can produce many) does not re-hit `/turn`
+ *  every time — the endpoint is cheap but on a metered signaling host every
+ *  request counts. */
+const TURN_CACHE_KEY = "qos-turn-cache";
+const TURN_CACHE_MS = 45 * 60 * 1000;
+
 async function fetchAutoTurn(signalingUrl: string): Promise<RTCIceServer[]> {
   if (!autoTurnEnabled()) return [];
   let base: string;
   try { base = new URL(signalingUrl.replace(/^ws/, "http")).origin; } catch { return []; }
+  try {
+    const raw = localStorage.getItem(TURN_CACHE_KEY);
+    if (raw) {
+      const c = JSON.parse(raw) as { origin: string; at: number; iceServers: RTCIceServer[] };
+      if (c.origin === base && Date.now() - c.at < TURN_CACHE_MS && Array.isArray(c.iceServers)) {
+        return c.iceServers;
+      }
+    }
+  } catch { /* fall through to a fetch */ }
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 4000);
   try {
     const res = await fetch(`${base}/turn`, { signal: ctrl.signal });
     if (!res.ok) return [];
     const data = (await res.json()) as { iceServers?: RTCIceServer[] };
-    return Array.isArray(data.iceServers) ? data.iceServers : [];
+    const iceServers = Array.isArray(data.iceServers) ? data.iceServers : [];
+    try { localStorage.setItem(TURN_CACHE_KEY, JSON.stringify({ origin: base, at: Date.now(), iceServers })); } catch { /* ignore */ }
+    return iceServers;
   } catch { return []; }
   finally { clearTimeout(timer); }
 }
