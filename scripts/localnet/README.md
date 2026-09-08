@@ -1,16 +1,24 @@
 # A local node to develop `/rholang` against
 
 ```bash
-bash run-node.sh --fresh     # first time: build genesis from bonds.txt + wallet.txt
-bash run-node.sh             # after that
+bash run-node.sh --fresh     # first time only: build a new chain from bonds.txt + wallet.txt
+bash run-node.sh             # every other time — reuses the existing chain
 ```
+
+**`--fresh` builds a new genesis. Only pass it when you mean to.** Swapping
+`bin/rnode` is usually a *data-compatibility test* — you want the new binary to
+read the chain the old one wrote, so you start it **without** `--fresh` and
+watch for read errors / stalled block production. `--fresh` moves the old data
+dir to a timestamped `.bak-` (keeping the last 3) rather than deleting it, so a
+genesis you didn't intend is recoverable — but the running chain still resets.
 
 The node binary is `bin/rnode` at the repo root, committed so that a checkout of
 quantum-os alone brings a chain up — no rchain-rust checkout, no PATH symlink.
-To try a candidate build against the same genesis before it replaces `bin/rnode`:
+To try a candidate build against a copy of the current chain first:
 
 ```bash
-RNODE=~/rnode bash run-node.sh --fresh
+cp -r ~/.rnode-local ~/.rnode-local.candidate
+RNODE=~/rnode QOS_RNODE_DATA=~/.rnode-local.candidate bash run-node.sh   # no --fresh
 ```
 
 `run-node.sh` prints which binary it is running, and refuses to start if the path

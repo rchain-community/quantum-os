@@ -45,9 +45,21 @@ if [ ! -x "$RNODE" ]; then
 fi
 echo "rnode: $RNODE"
 
+# --fresh rebuilds genesis. Only pass it when you actually want a new chain —
+# swapping bin/rnode is usually a DATA-COMPATIBILITY test (start the new binary
+# against the existing chain and see if it reads it), which --fresh defeats.
+# So --fresh does not delete: it MOVES the old data dir aside to a timestamped
+# .bak, keeping the last few, so a genesis you didn't mean is recoverable.
 if [ "${1:-}" = "--fresh" ]; then
-  echo "wiping $DATA_DIR"
-  rm -rf "$DATA_DIR"
+  if [ -d "$DATA_DIR" ]; then
+    bak="$DATA_DIR.bak-$(date +%Y%m%d-%H%M%S)"
+    echo "--fresh: moving $DATA_DIR -> $bak (not deleting)"
+    mv "$DATA_DIR" "$bak"
+    # keep the 3 most recent backups, prune the rest
+    ls -dt "$DATA_DIR".bak-* 2>/dev/null | tail -n +4 | xargs -r rm -rf
+  else
+    echo "--fresh: no existing $DATA_DIR to move aside"
+  fi
 fi
 mkdir -p "$DATA_DIR/genesis"
 cp bonds.txt "$DATA_DIR/genesis/bonds.txt"
