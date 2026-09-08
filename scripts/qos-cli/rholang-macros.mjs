@@ -9,7 +9,7 @@
 import { achievesZfa, isPauliClosed, parseTwists, validateCapability } from "./zfa.mjs";
 import { createMacroEngine } from "../../packages/browser/src/rholang-macros.js";
 
-export const { MACROS, expandBare, expandProgram, expandMacro, listMacros, HELP, selftest } =
+export const { MACROS, macroMode, expandBare, expandProgram, expandMacro, listMacros, HELP, selftest } =
   createMacroEngine({ achievesZfa, isPauliClosed, parseTwists, validateCapability });
 
 // Run selftest when invoked directly with --selftest.
