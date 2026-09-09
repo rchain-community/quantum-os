@@ -94,7 +94,7 @@ Bridges a room to an RChain chain: a room's state is ephemeral, a deploy is not.
 | `$grant` | the minted capability (raw reply) — `as cap { … }` |
 | `$transfer` | **`(result, error)`** — `result` is `("transfer ok", amount, to)` on success and `Nil` on failure; `error` is the failure string or `Nil`. `$transfer(50, a) as (result, error) { match error { Nil => use!(result)  _ => stdout!(("failed", error)) } }`. (The raw revVault reply is just `Nil`/a string; the macro normalises it to this two-slot shape for both capture *and* its default reporting.) |
 
-A non-`capture` macro rejects `as`; an unbalanced pattern or block, or `as` with nothing, is a reported error.
+A non-`capture` macro rejects `as`; an unbalanced pattern, or `as` with nothing, is a reported error. An **unclosed** `as <pattern> { …` is treated as a *continuation* — a multi-line block still being typed — so the editor's live linter waits rather than flagging it (`expandProgram` returns it in `incomplete`, not `errors`); running it anyway reports "block not closed — add the closing `}`".
 
 **`$me`** is a client-side token — resolved to this browser's own REV address (a quoted rholang string) in `expandRholangMacros`, before the program reaches rnode. Write it bare, anywhere a program is built (a `$`-line, the editor, a larger program): `$balance($me)`, `$transfer(10, $me)`. It is not a macro call site (no parens) and only exists where the deploy key is known — `rho:rchain:deployerId` is unbound in an exploratory deploy, so it cannot be resolved on the node. (Bare `me` still works in a `$balance(me)` chat line for convenience.)
 

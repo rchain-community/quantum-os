@@ -669,14 +669,17 @@ const lineOf = (src, idx) => src.slice(0, idx).split("\n").length;
 
 /**
  * Expand every `%macro(…)` call site in a rholang program.
- * Returns { kind:"program", source, expansions:[{name,line}], errors:[{line,message}] }.
+ * Returns { kind:"program", source, expansions, errors, incomplete }.
  * Errors do not abort: every call site is attempted so one message reports them all.
+ * `incomplete` holds a `$macro(…) as <pat> { …` whose block is not yet closed —
+ * a program still being typed, not a malformed one, so a live linter can wait.
  */
 function expandProgram(src) {
   const text = String(src ?? "");
   const out = [];
   const expansions = [];
   const errors = [];
+  const incomplete = [];
   let i = 0, last = 0;
   while (i < text.length) {
     const t = skipTrivia(text, i);
@@ -732,7 +735,13 @@ function expandProgram(src) {
       while (p < text.length && /\s/.test(text[p])) p++;
       if (text[p] !== "{") { errors.push({ line: lineOf(text, i), message: `${sigil}${name}: expected { after \`as ${pattern}\`` }); break; }
       const braceClose = matchBracket(text, p);
-      if (braceClose === -1) { errors.push({ line: lineOf(text, i), message: `${sigil}${name}: unbalanced { after \`as ${pattern}\`` }); break; }
+      if (braceClose === -1) {
+        // An unclosed `{` right after `as <pattern>` is a program still being
+        // typed across lines, not a broken one — report it as a continuation so
+        // a live linter waits rather than flagging it. Leave the site as typed.
+        incomplete.push({ line: lineOf(text, i), message: `${sigil}${name}: \`as ${pattern} { …\` — block not closed` });
+        break;
+      }
       capture = { pattern, block: text.slice(p + 1, braceClose).trim() };
       end = braceClose + 1;
     }
@@ -762,7 +771,7 @@ function expandProgram(src) {
     i = end;
   }
   out.push(text.slice(last));
-  return { kind: "program", source: out.join(""), expansions, errors };
+  return { kind: "program", source: out.join(""), expansions, errors, incomplete };
 }
 
 /** One-line summary of every macro (for `/rholang macros`). */
@@ -874,8 +883,10 @@ function selftest() {
     ["capture: nested braces in the block are balanced",
       () => { const r = P('$balance("a") as bal { match bal { 0 => stdout!("empty") _ => stdout!(bal) } }');
         return r.errors.length === 0 && r.source.includes('match bal { 0 => stdout!("empty")'); }],
-    ["capture: unbalanced block brace is an error, not a throw",
-      () => P('$balance("a") as bal { stdout!(bal)').errors.length === 1],
+    ["capture: an unclosed block is a continuation, not an error",
+      () => { const r = P('$balance("a") as bal { stdout!(bal)');
+        return r.errors.length === 0 && r.incomplete.length === 1
+          && r.source === '$balance("a") as bal { stdout!(bal)'; }],
     ["capture: a `(result, error)` tuple pattern destructures the reply",
       () => { const r = P('$grant("^v><") as (cap, err) { stdout!((cap, err)) }');
         return r.errors.length === 0 && r.source.includes("for (@(cap, err) <- ret) {"); }],
