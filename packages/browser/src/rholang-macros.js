@@ -662,17 +662,60 @@ function bindArgs(macro, name, terms) {
 const lineOf = (src, idx) => src.slice(0, idx).split("\n").length;
 
 /**
+ * Parse a capture clause's arms — `as <pat> { … } <pat> { … } …` — starting at
+ * `p` (just past `as`). Returns `{ arms: [{pattern, block}], end }`, or
+ * `{ error }` / `{ incomplete, pattern }` for a bad or half-typed one. Stops as
+ * soon as what follows is not `<pattern> {` — so an arm list can be followed by
+ * the rest of the program (`| more`, `)`, …). A `<pattern>` is a name, a `_`, a
+ * literal, or a balanced `(…)` / `[…]`.
+ */
+function parseCaptureArms(text, p) {
+  const arms = [];
+  const skipWs = () => { while (p < text.length && /\s/.test(text[p])) p++; };
+  for (;;) {
+    skipWs();
+    let pattern, q = p;
+    if (text[q] === "(" || text[q] === "[") {
+      const pc = matchBracket(text, q);
+      if (pc === -1) {
+        if (arms.length === 0) return { error: `unbalanced ${text[q]} in the \`as\` pattern` };
+        break;
+      }
+      pattern = text.slice(q, pc + 1); q = pc + 1;
+    } else {
+      const m = /^(Nil|true|false|-?\d+(?:\.\d+)?|"(?:[^"\\]|\\.)*"|[A-Za-z_][\w']*)/.exec(text.slice(q));
+      if (!m) break;                       // not a pattern → arms are done
+      pattern = m[0]; q += m[0].length;
+    }
+    let r = q;
+    while (r < text.length && /\s/.test(text[r])) r++;
+    if (text[r] !== "{") {                  // a pattern with no block → not an arm
+      if (arms.length === 0) return { error: `\`as\` needs \`<pattern> { … }\`` };
+      break;
+    }
+    const bc = matchBracket(text, r);
+    if (bc === -1) return { incomplete: true, pattern };
+    arms.push({ pattern, block: text.slice(r + 1, bc).trim() });
+    p = bc + 1;
+  }
+  if (arms.length === 0) return { error: `\`as\` needs \`<pattern> { … }\`` };
+  return { arms, end: p };
+}
+
+/**
  * The `for (@… <- <chan>) { … }` a capture clause becomes. `capture` is
- * `{ pattern, block }` (bind-and-run), `{ arms }` (a `match` over the reply),
+ * `{ arms: [{pattern, block}] }` (one arm ⟹ a plain bind; several ⟹ a `match`),
  * or null. A capture macro's `expand(args, capture)` calls this with the channel
  * carrying the value the block should see (`ret`, or `__outcome` for $transfer).
  */
 function captureSink(capture, chan) {
   if (!capture) return null;
-  if (capture.arms != null) {
-    return `for (@__reply <- ${chan}) {\n    match __reply {\n${capture.arms}\n    }\n  }`;
+  const arms = capture.arms;
+  if (arms.length === 1) {
+    return `for (@${arms[0].pattern} <- ${chan}) {\n    ${arms[0].block}\n  }`;
   }
-  return `for (@${capture.pattern} <- ${chan}) {\n    ${capture.block}\n  }`;
+  const body = arms.map((a) => `${a.pattern} => {\n      ${a.block}\n    }`).join("\n    ");
+  return `for (@__reply <- ${chan}) {\n    match __reply {\n    ${body}\n    }\n  }`;
 }
 
 /**
@@ -717,58 +760,29 @@ function expandProgram(src) {
       i = close + 1;
       continue;
     }
-    // Optional capture clause. Two forms, both only for macros that opt in
-    // (`capture: true`):
-    //   `$macro(args) as <pattern> { …block… }` — the reply is bound by
-    //     <pattern> (a name, or a balanced `(a, b)` / `[a, …rest]`) and the
-    //     block runs.
-    //   `$macro(args) as { <pat> => …  <pat> => … }` — the reply is `match`ed:
-    //     the brace holds rholang match arms, run against the raw reply.
+    // Optional capture clause (macros that opt in — `capture: true`):
+    //   `$macro(args) as <pattern> { …block… }`  — bind the reply and run.
+    //   `$macro(args) as <pat> { … } <pat> { … } …`  — one arm per pattern; two
+    //     or more become a `match` over the reply, each `<pat>` a match pattern.
+    // `<pattern>` is a name, `_`, a literal, or a balanced `(a, b)` / `[a, …rest]`.
     let end = close + 1;
     let capture = null;
     const asKw = /^\s+as\s+/.exec(text.slice(end));
     if (asKw) {
-      let p = end + asKw[0].length;
-      if (text[p] === "{") {
-        // `as { … }` — a match over the reply. The brace holds `pat => proc` arms.
-        const armClose = matchBracket(text, p);
-        if (armClose === -1) {
-          incomplete.push({ line: lineOf(text, i), message: `${sigil}${name}: \`as { …\` — match arms not closed` });
-          break;
-        }
-        const arms = text.slice(p + 1, armClose).trim();
-        if (!/=>/.test(arms)) {
-          errors.push({ line: lineOf(text, i), message: `${sigil}${name}: \`as { … }\` needs \`pattern => …\` arms — or write \`as <name> { … }\`` });
-          break;
-        }
-        capture = { arms };
-        end = armClose + 1;
-      } else {
-        let pattern;
-        if (text[p] === "(" || text[p] === "[") {
-          const pc = matchBracket(text, p);
-          if (pc === -1) { errors.push({ line: lineOf(text, i), message: `${sigil}${name}: unbalanced ${text[p]} in the \`as\` pattern` }); break; }
-          pattern = text.slice(p, pc + 1);
-          p = pc + 1;
-        } else {
-          const idM = /^[A-Za-z_][\w']*/.exec(text.slice(p));
-          if (!idM) { errors.push({ line: lineOf(text, i), message: `${sigil}${name}: \`as\` needs a name, a (…) / […] pattern, or \`{ pat => … }\` match arms` }); break; }
-          pattern = idM[0];
-          p += idM[0].length;
-        }
-        while (p < text.length && /\s/.test(text[p])) p++;
-        if (text[p] !== "{") { errors.push({ line: lineOf(text, i), message: `${sigil}${name}: expected { after \`as ${pattern}\`` }); break; }
-        const braceClose = matchBracket(text, p);
-        if (braceClose === -1) {
-          // An unclosed `{` right after `as <pattern>` is a program still being
-          // typed across lines, not a broken one — report it as a continuation so
-          // a live linter waits rather than flagging it. Leave the site as typed.
-          incomplete.push({ line: lineOf(text, i), message: `${sigil}${name}: \`as ${pattern} { …\` — block not closed` });
-          break;
-        }
-        capture = { pattern, block: text.slice(p + 1, braceClose).trim() };
-        end = braceClose + 1;
+      if (!macro.capture) {
+        errors.push({ line: lineOf(text, i), message: `${sigil}${name} does not support \`as … { … }\` — it reports to return` });
+        break;
       }
+      const parsed = parseCaptureArms(text, end + asKw[0].length);
+      if (parsed.incomplete) {
+        // A half-typed arm block — a program still being typed, not a broken one.
+        // Report it as a continuation so a live linter waits. Leave it as typed.
+        incomplete.push({ line: lineOf(text, i), message: `${sigil}${name}: \`as ${parsed.pattern} { …\` — block not closed` });
+        break;
+      }
+      if (parsed.error) { errors.push({ line: lineOf(text, i), message: `${sigil}${name}: ${parsed.error}` }); break; }
+      capture = { arms: parsed.arms };
+      end = parsed.end;
     }
 
     out.push(text.slice(last, i));
@@ -778,13 +792,10 @@ function expandProgram(src) {
       if (!macro.write && typeof macro.expand !== "function") {
         throw fail(`${sigil}${name} is a local read — it has no rholang; use it on its own line`);
       }
-      if (capture && !macro.capture) {
-        throw fail(`${sigil}${name} does not support \`as … { … }\` — it reports to return`);
-      }
       const args = bindArgs(macro, name, splitArgs(text.slice(open + 1, close)));
-      // `capture` is `{ pattern, block }`, `{ arms }`, or null — the macro turns
-      // it into a `for` via `captureSink`, over whichever channel carries the
-      // value (usually `ret`; `$transfer` normalises through `__outcome` first).
+      // `capture` is `{ arms:[{pattern, block}] }` or null — the macro turns it
+      // into a `for` via `captureSink`, over whichever channel carries the value
+      // (usually `ret`; `$transfer` normalises through `__outcome` first).
       out.push(macro.expand(args, capture));
       expansions.push({ name, line: lineOf(text, i), write: !!macro.write });
     } catch (e) {
@@ -917,26 +928,35 @@ function selftest() {
     ["capture: a `[a, ...rest]` list pattern is accepted",
       () => { const r = P('$grant("^v><") as [head, ...tail] { stdout!(head) }');
         return r.errors.length === 0 && r.source.includes("for (@[head, ...tail] <- ret) {"); }],
-    ["capture: `as { … }` with no `=>` arms is a reported error",
+    ["capture: `as` with no pattern/block is a reported error",
       () => { const r = P('$balance("a") as { Nil }');
-        return r.errors.length === 1 && /pattern => /.test(r.errors[0].message); }],
+        return r.errors.length === 1 && /<pattern> \{/.test(r.errors[0].message); }],
     ["capture: unbalanced pattern paren is a reported error",
       () => P('$grant("^v><") as (cap, err { Nil }').errors.length === 1],
-    ["capture: `as { pat => … }` becomes a match over the reply",
-      () => { const r = P('$transfer(10, "a") as {\n  (ok, Nil) => return!(("paid", ok))\n  (Nil, err) => return!(("failed", err))\n}');
+    ["capture: `as <pat> { } <pat> { }` — two arms become a match over the reply",
+      () => { const r = P('$transfer(10, "a") as (ok, Nil) { return!(("paid", ok)) } (Nil, err) { return!(("failed", err)) }');
         return r.errors.length === 0
           && r.source.includes("for (@__reply <- __outcome) {")
           && r.source.includes("match __reply {")
-          && r.source.includes("(ok, Nil) => return!((\"paid\", ok))"); }],
-    ["capture: `as { … }` match arms work on $balance too (over ret)",
-      () => { const r = P('$balance("a") as { 0 => stdout!("empty")  n => stdout!(("bal", n)) }');
+          && r.source.includes("(ok, Nil) => {")
+          && r.source.includes("(Nil, err) => {"); }],
+    ["capture: multi-arm works on $balance too, over ret",
+      () => { const r = P('$balance("a") as 0 { stdout!("empty") } n { stdout!(("bal", n)) }');
         return r.errors.length === 0 && r.source.includes("for (@__reply <- ret) {")
-          && r.source.includes('match __reply {'); }],
-    ["capture: an unclosed `as { …` match block is a continuation",
-      () => { const r = P('$transfer(1, "a") as {\n  (ok, Nil) => return!(ok)');
+          && r.source.includes("match __reply {") && r.source.includes("0 => {"); }],
+    ["capture: a single arm is a plain bind, not a match",
+      () => { const r = P('$transfer(10, "a") as (result, error) { stdout!((result, error)) }');
+        return r.errors.length === 0
+          && r.source.includes("for (@(result, error) <- __outcome) {")
+          && !r.source.includes("match __reply"); }],
+    ["capture: arms stop at the end of the arm list — trailing `| more` is left alone",
+      () => { const r = P('$balance("a") as bal { stdout!(bal) } | Nil');
+        return r.errors.length === 0 && r.source.trimEnd().endsWith("| Nil"); }],
+    ["capture: an unclosed later arm block is a continuation",
+      () => { const r = P('$transfer(1, "a") as (ok, Nil) { return!(ok) } (Nil, err) {');
         return r.errors.length === 0 && r.incomplete.length === 1; }],
-    ["capture: a macro without `capture` rejects `as { … }` too",
-      () => { const r = P('$directory("x") as { _ => Nil }');
+    ["capture: a macro without `capture` rejects a multi-arm `as` too",
+      () => { const r = P('$directory("x") as a { Nil } b { Nil }');
         return r.errors.length === 1 && /does not support `as/.test(r.errors[0].message); }],
   ];
   for (const [name, fn] of progCases) {
