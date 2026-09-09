@@ -133,50 +133,62 @@ const lineOf = (src, idx) => src.slice(0, idx).split("\n").length;
 // ---------------------------------------------------------------------------
 
 /**
- * Parse `$name($a, $b)  // doc` followed by a body.
+ * Parse a definition: `name text`, or `name(a, b) text`.
  *
- * The parameter list is optional — `$stdout` with no parens is a value macro,
- * which is how MacRhoLang carried `$Ballot` and `$lookup`. A comment following
- * the name is kept: documentation a macro carries with it is what `show` and an
- * LLM composing a program both have to work from beyond the code.
+ *   /macro define greet(who) Hi $who, welcome!
+ *   /macro define standup(topic)
+ *   /poll new $topic | yes, no, later
+ *
+ * The name is bare — a leading `$` or `+` is tolerated but not required. The
+ * parameter list is optional (a value macro has none — `$Ballot`, `$lookup` in
+ * MacRhoLang), its names bare. The body is everything after the signature: on
+ * the same line, or on the lines below it. `$param` sites in the body are still
+ * written `$name` — that is what the expander substitutes.
+ *
+ * A `// comment` immediately after the signature is the macro's doc, kept for
+ * `show` and for an LLM composing a program. (An inline body that must itself
+ * start with `//` is the one case that needs the body on the next line.)
  *
  * @param {string} text
  * @returns {{name:string, params:string[], body:string, doc:string, kind:"command"|"rholang"}}
  */
 export function parseDefinition(text) {
   const src = String(text ?? "");
-  const m = /^\s*\$([A-Za-z][A-Za-z0-9_-]*)/.exec(src);
-  if (!m) fail("a definition starts with $name — e.g. /macro define $standup($topic) …");
+  const m = /^\s*[$+]?([A-Za-z][A-Za-z0-9_-]*)/.exec(src);
+  if (!m) fail("a definition is: /macro define name[(args)] body — e.g. /macro define standup(topic) /poll new $topic | yes, no");
   const name = m[1].toLowerCase();
   let i = m[0].length;
 
   /** @type {string[]} */
   let params = [];
-  // Whitespace between the name and `(` would make `$greet (x)` a parameter
-  // list, but `$greet (x)` reads as a value macro whose body starts `(x)`.
-  // Only an immediately adjacent `(` opens a parameter list.
+  // Only an immediately adjacent `(` opens a parameter list — `greet (x)` reads
+  // as a value macro whose body starts `(x)`.
   if (src[i] === "(") {
     const close = matchBracket(src, i);
-    if (close === -1) fail(`$${name}: unbalanced ( in the parameter list`);
+    if (close === -1) fail(`${name}: unbalanced ( in the parameter list`);
     params = splitArgs(src.slice(i + 1, close)).map((p) => {
-      const pm = /^\$([A-Za-z][A-Za-z0-9_-]*)$/.exec(p.trim());
-      if (!pm) fail(`$${name}: parameter "${p.trim()}" must be written $name`);
+      const pm = /^[$]?([A-Za-z][A-Za-z0-9_-]*)$/.exec(p.trim());
+      if (!pm) fail(`${name}: parameter "${p.trim()}" must be a plain name`);
       return pm[1];
     });
     const dup = params.find((p, n) => params.indexOf(p) !== n);
-    if (dup) fail(`$${name}: parameter $${dup} is named twice`);
+    if (dup) fail(`${name}: parameter ${dup} is named twice`);
     i = close + 1;
   }
 
-  // A comment on the rest of the definition line is the macro's documentation.
-  const restOfLine = src.slice(i, src.indexOf("\n", i) === -1 ? src.length : src.indexOf("\n", i));
+  // The rest of the signature line: an optional `// doc`, otherwise the body has
+  // already started (the inline form).
+  const nl = src.indexOf("\n", i);
+  const restOfLine = src.slice(i, nl === -1 ? src.length : nl);
   let doc = "";
-  const dm = /^\s*\/\/(.*)$/.exec(restOfLine);
+  const dm = /^[^\S\n]*\/\/(.*)$/.exec(restOfLine);
   if (dm) { doc = dm[1].trim(); i += restOfLine.length; }
 
-  const body = src.slice(i).replace(/^[^\S\n]*\n/, "").replace(/\s+$/, "");
-  if (!body.trim()) fail(`$${name}: the definition has no body`);
-  if (body.length > MAX_BODY) fail(`$${name}: body is too long (${body.length} chars, max ${MAX_BODY})`);
+  // Body: everything after — trim a leading run of spaces and at most one
+  // newline, so both `name(x) body` and `name(x)\nbody` land the same.
+  const body = src.slice(i).replace(/^[^\S\n]*\n?/, "").replace(/\s+$/, "");
+  if (!body.trim()) fail(`${name}: the definition has no body`);
+  if (body.length > MAX_BODY) fail(`${name}: body is too long (${body.length} chars, max ${MAX_BODY})`);
   return { name, params, body, doc, kind: bodyKind(body) };
 }
 
@@ -450,7 +462,7 @@ export function expandCommand(def, args, lookup, depth = 0) {
 
 /** The definition as it would be typed back in — what `/macro show` prints. */
 export function formatDefinition(def) {
-  const head = `$${def.name}` + (def.params.length ? `(${def.params.map((p) => "$" + p).join(", ")})` : "");
+  const head = def.name + (def.params.length ? `(${def.params.join(", ")})` : "");
   return head + (def.doc ? `  // ${def.doc}` : "") + "\n" + def.body;
 }
 
@@ -495,21 +507,31 @@ export function selftest() {
   };
 
   // --- definitions ---
-  const standup = def(`$standup($topic)  // opens a standup poll\n/poll new $topic | yes, no, later\n/gov say standup on $topic is open`);
-  ok("parses name, params and doc", standup.name === "standup" && standup.params[0] === "topic" && standup.doc === "opens a standup poll");
+  const standup = def(`standup(topic)  // opens a standup poll\n/poll new $topic | yes, no, later\n/gov say standup on $topic is open`);
+  ok("parses bare name, params and doc", standup.name === "standup" && standup.params[0] === "topic" && standup.doc === "opens a standup poll");
   ok("command body is recognised as commands", standup.kind === "command");
 
-  const print = def(`$print($expression)\nnew stdout(\`rho:io:stdout\`) in { stdout!($expression) }`);
-  ok("rholang body is recognised as rholang", print.kind === "rholang");
+  const inline = def("greet(who) Hi $who, welcome!");
+  ok("inline body on the signature line", inline.name === "greet" && inline.params[0] === "who" && inline.body === "Hi $who, welcome!" && inline.kind === "rholang");
 
-  const ballot = def("$ballotid\n`rho:id:3qfh1fy7jwfcai7ceyorux4a18hzcn83n9xb6dramjf5gs7cw8fynf`");
+  const cmdInline = def("hi(who) +greet $who");
+  ok("inline command body", cmdInline.kind === "command" && cmdInline.body === "+greet $who");
+
+  const noParen = def("motd Nothing to report today");
+  ok("no parameter list at all", noParen.name === "motd" && noParen.params.length === 0 && noParen.body === "Nothing to report today");
+
+  const print = def(`$print($expression)\nnew stdout(\`rho:io:stdout\`) in { stdout!($expression) }`);
+  ok("a leading $ and $params are still tolerated", print.name === "print" && print.params[0] === "expression" && print.kind === "rholang");
+
+  const ballot = def("ballotid\n`rho:id:3qfh1fy7jwfcai7ceyorux4a18hzcn83n9xb6dramjf5gs7cw8fynf`");
   ok("value macro takes no parameters", ballot.params.length === 0 && ballot.kind === "rholang");
 
   const threw = (fn) => { try { fn(); return ""; } catch (e) { return e.message; } };
-  ok("a body is required", /no body/.test(threw(() => parseDefinition("$empty($a)"))));
-  ok("parameters must carry $", /must be written \$name/.test(threw(() => parseDefinition("$x(a)\n/id"))));
-  ok("duplicate parameters are refused", /named twice/.test(threw(() => parseDefinition("$x($a, $a)\n/id"))));
-  ok("a definition starts with $", /starts with \$name/.test(threw(() => parseDefinition("standup()\n/id"))));
+  ok("a body is required", /no body/.test(threw(() => parseDefinition("empty(a)"))));
+  ok("a bare doc with no body is refused", /no body/.test(threw(() => parseDefinition("empty(a)  // just a doc"))));
+  ok("a parameter must be a plain name", /must be a plain name/.test(threw(() => parseDefinition("x(1a)  /id"))));
+  ok("duplicate parameters are refused", /named twice/.test(threw(() => parseDefinition("x(a, a)  /id"))));
+  ok("a definition needs a name", /a definition is:/.test(threw(() => parseDefinition("(topic) /id"))));
 
   // --- invocation + binding ---
   const inv = parseInvocation('+standup "Q4 budget"');

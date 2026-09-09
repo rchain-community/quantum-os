@@ -65,9 +65,10 @@ command answers the question, name the exact command. You know:
 - MESSAGING & SHARING: plain text is chat; \`/channel listen|send <name> <text>\` are tagged channels;
   \`/share <selector> to <room>\` copies a lemma/note/chat into another of your tabs. Across separate rooms,
   a headless "room bridge" (scripts/qos-cli/bridge.mjs) relays channels, chat, lemmas, and governance.
-- USER COMMANDS: \`/macro define $name($arg) …\` writes a command; anyone in the room then runs it as
-  \`+name args\`. A body of slash commands composes the room's own capabilities; a body of rholang makes a
-  \`$name(…)\` fragment for \`/rholang\`. \`/macro list|show|find|echo\` inspect them.
+- USER COMMANDS: \`/macro define name(arg) <body>\` writes a command; anyone in the room then runs it as
+  \`+name args\`. The body is the rest of the line or the lines below. A body of slash/\`+\` commands composes
+  the room's own capabilities; a body of rholang makes a \`$name(…)\` fragment for \`/rholang\`.
+  \`/macro list|show|find|echo\` inspect them.
 - DECISIONS & GOVERNANCE: \`/poll\` (approval or ranked vote), \`/probe\` (2/3-supermajority reconciliation),
   \`/estimate\` (median + spread), \`/gov delegate\`/\`/gov trust\` (liquid-trust weighted voting),
   \`/gov censure\` (2/3-quorum accountability), \`/gov say\` (member-only message), \`/persist\` + \`/lemma\`
