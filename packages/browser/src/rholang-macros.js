@@ -152,12 +152,13 @@ const MACROS = {
   grant: {
     help: "Mint a ZFA-balanced proof as a capability (rho:qucalc:grant).",
     write: true,
+    capture: true,   // $grant("^v><") as cap { … } — the cap is bound, not returned
     argSpec: [["twists", "twists"]],
-    expand(args) {
+    expand(args, sink) {
       const list = args.twists.join(", ");
       return `new grant(\`rho:qucalc:grant\`), ret in {
   grant!([${list}], *ret) |
-  for (@cap <- ret) { return!(cap) }
+  ${sink ?? "for (@__r <- ret) { return!(__r) }"}
 }`;
     },
   },
@@ -417,21 +418,24 @@ ${seats.join(" |\n")} |
   transfer: {
     help: "Transfer REV to an address (rho:rchain:revVault). Returns Nil on success.",
     write: true,
+    capture: true,   // $transfer(10, a) as r { … } — r is the raw reply (Nil / error string)
     argSpec: [["amount", "int"], ["to", "string"]],
-    expand(args) {
+    expand(args, sink) {
       // The revVault on the shipped bin/rnode takes the deployerId process
       // directly (not a from-address resolved via rho:rev:address), then the
       // to-address string, the amount, and a return channel — verified live.
-      // A success replies Nil; a failure replies an error string. Report which
-      // so `/rholang read` shows more than a bare Nil.
-      return `new revVault(\`rho:rchain:revVault\`), deployerId(\`rho:rchain:deployerId\`), ret in {
-  revVault!("transfer", *deployerId, ${q(args.to)}, ${args.amount}, *ret) |
-  for (@r <- ret) {
+      // Default sink: a success replies Nil, a failure an error string; report
+      // which so `/rholang read` shows more than a bare Nil. `as r { … }`
+      // hands the raw reply straight to the block instead.
+      const s = sink ?? `for (@r <- ret) {
     match r {
       Nil => return!(("transfer ok", ${args.amount}, ${q(args.to)}))
       _   => return!(("transfer FAILED", r))
     }
-  }
+  }`;
+      return `new revVault(\`rho:rchain:revVault\`), deployerId(\`rho:rchain:deployerId\`), ret in {
+  revVault!("transfer", *deployerId, ${q(args.to)}, ${args.amount}, *ret) |
+  ${s}
 }`;
     },
   },
@@ -444,11 +448,12 @@ ${seats.join(" |\n")} |
   balance: {
     help: "Read a REV balance (rho:rchain:revVault). Arg: a REV address, or $me.",
     write: false,
+    capture: true,   // $balance($me) as bal { … } — bal is the int, block runs
     argSpec: [["addr", "string"]],
-    expand(args) {
+    expand(args, sink) {
       return `new revVault(\`rho:rchain:revVault\`), ret in {
   revVault!("getBalance", ${q(args.addr)}, *ret) |
-  for (@bal <- ret) { return!(bal) }
+  ${sink ?? "for (@__r <- ret) { return!(__r) }"}
 }`;
     },
   },
@@ -678,6 +683,24 @@ function expandProgram(src) {
       i = close + 1;
       continue;
     }
+    // Optional capture clause: `$macro(args) as name { …block… }` — the result
+    // the macro would report is instead bound to `name` and the block runs.
+    // Only macros that opt in (`capture: true`) accept it; the rest report to
+    // `return` (eval / the deploy record) as before.
+    let end = close + 1;
+    let capture = null;
+    const asM = /^\s+as\s+([A-Za-z_][\w']*)\s*\{/.exec(text.slice(end));
+    if (asM) {
+      const braceOpen = end + asM[0].length - 1;
+      const braceClose = matchBracket(text, braceOpen);
+      if (braceClose === -1) {
+        errors.push({ line: lineOf(text, i), message: `${sigil}${name}: unbalanced { after \`as ${asM[1]}\`` });
+        break;
+      }
+      capture = { name: asM[1], block: text.slice(braceOpen + 1, braceClose).trim() };
+      end = braceClose + 1;
+    }
+
     out.push(text.slice(last, i));
     try {
       // A read macro with no rholang (zfa / verify) is answered on its own
@@ -685,15 +708,19 @@ function expandProgram(src) {
       if (!macro.write && typeof macro.expand !== "function") {
         throw fail(`${sigil}${name} is a local read — it has no rholang; use it on its own line`);
       }
+      if (capture && !macro.capture) {
+        throw fail(`${sigil}${name} does not support \`as ${capture.name} { … }\` — it reports to return`);
+      }
       const args = bindArgs(macro, name, splitArgs(text.slice(open + 1, close)));
-      out.push(macro.expand(args));
+      const sink = capture ? `for (@${capture.name} <- ret) {\n    ${capture.block}\n  }` : undefined;
+      out.push(macro.expand(args, sink));
       expansions.push({ name, line: lineOf(text, i), write: !!macro.write });
     } catch (e) {
       errors.push({ line: lineOf(text, i), message: e?.message ?? String(e) });
-      out.push(text.slice(i, close + 1));
+      out.push(text.slice(i, end));
     }
-    last = close + 1;
-    i = close + 1;
+    last = end;
+    i = end;
   }
   out.push(text.slice(last));
   return { kind: "program", source: out.join(""), expansions, errors };
@@ -786,6 +813,24 @@ function selftest() {
       () => macroMode("balance") === "eval" && macroMode("transfer") === "deploy" && macroMode("verify") === "read-local" && macroMode("nope") === null],
     ["bare $balance via /rholang macro runs as eval",
       () => { const r = expandMacro("balance 1111Alice"); return r.kind === "rholang" && r.mode === "eval"; }],
+    ["capture: $balance(a) as bal { block } binds bal, drops the return",
+      () => { const r = P('$balance("a") as bal {\n  stdout!(("bal", bal))\n}');
+        return r.errors.length === 0 && r.expansions.length === 1
+          && r.source.includes("for (@bal <- ret) {") && r.source.includes('stdout!(("bal", bal))')
+          && !r.source.includes("return!"); }],
+    ["capture: default (no `as`) still reports to return",
+      () => P('$balance("a")').source.includes("return!")],
+    ["capture: $transfer(10, a) as r { … } hands r the raw reply",
+      () => { const r = P('$transfer(10, "a") as r { stdout!(r) }');
+        return /for \(@r <- ret\) \{\s*stdout!\(r\)\s*\}/.test(r.source) && !r.source.includes("transfer ok"); }],
+    ["capture: a macro without `capture` rejects `as`",
+      () => { const r = P('$directory("x") as d { Nil }');
+        return r.errors.length === 1 && /does not support `as/.test(r.errors[0].message); }],
+    ["capture: nested braces in the block are balanced",
+      () => { const r = P('$balance("a") as bal { match bal { 0 => stdout!("empty") _ => stdout!(bal) } }');
+        return r.errors.length === 0 && r.source.includes('match bal { 0 => stdout!("empty")'); }],
+    ["capture: unbalanced block brace is an error, not a throw",
+      () => P('$balance("a") as bal { stdout!(bal)').errors.length === 1],
   ];
   for (const [name, fn] of progCases) {
     try {
