@@ -2348,6 +2348,11 @@ function editRholang(mode: "eval" | "deploy", seed: string, echoOnly = false, ex
       // as typed reports a spurious error on every macro line. Expand (silently)
       // and wrap first; surface an expansion error as the lint error.
       lint: async (raw: string) => {
+        // A `$macro(…) as <pat> { …` whose block is still being typed is a
+        // continuation, not a broken program — reject so the editor clears the
+        // status line (its `.catch` does) rather than flashing an error.
+        const peek = expandMacroProgram(resolveClientTokens(raw, () => {}));
+        if (peek.incomplete?.length) throw new Error(peek.incomplete[0].message);
         const notes: string[] = [];
         let program: string;
         try {
@@ -2617,6 +2622,7 @@ function expandRholangMacros(source: string, say: (t: string) => void): string {
   if (out.includes("%") || out.includes("$")) {
     const p = expandMacroProgram(out);      // built-in library — `$name(` and legacy `%name(`
     for (const err of p.errors) say(`✗ line ${err.line}: ${err.message}`);
+    for (const inc of p.incomplete ?? []) say(`✗ line ${inc.line}: ${inc.message} (add the closing \`}\`)`);
     if (p.expansions.length) {
       const names = [...new Set(p.expansions.map((e) => e.name))].map((n) => "$" + n).join(", ");
       say(`  · expanded ${p.expansions.length} built-in site${p.expansions.length === 1 ? "" : "s"}: ${names}`);
@@ -2989,7 +2995,8 @@ function runDollarLine(line: string): string[] {
   try {
     const p = expandMacroProgram(resolveClientTokens(body, () => {}));
     for (const err of p.errors) { say(`✗ line ${err.line}: ${err.message}`); }
-    if (p.errors.length) return out;
+    for (const inc of p.incomplete ?? []) { say(`✗ line ${inc.line}: ${inc.message} (add the closing \`}\`)`); }
+    if (p.errors.length || (p.incomplete?.length ?? 0)) return out;
     for (const e of p.expansions) { sites++; if (e.write) writes = true; }
     const u = expandCallSites(p.source, macroLookup);
     for (const err of u.errors) { say(`✗ line ${err.line}: ${err.message}`); }
