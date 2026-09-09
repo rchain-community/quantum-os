@@ -422,10 +422,16 @@ ${seats.join(" |\n")} |
       // The revVault on the shipped bin/rnode takes the deployerId process
       // directly (not a from-address resolved via rho:rev:address), then the
       // to-address string, the amount, and a return channel — verified live.
-      // A success replies Nil; a failure replies an error string.
+      // A success replies Nil; a failure replies an error string. Report which
+      // so `/rholang read` shows more than a bare Nil.
       return `new revVault(\`rho:rchain:revVault\`), deployerId(\`rho:rchain:deployerId\`), ret in {
   revVault!("transfer", *deployerId, ${q(args.to)}, ${args.amount}, *ret) |
-  for (@r <- ret) { return!(r) }
+  for (@r <- ret) {
+    match r {
+      Nil => return!(("transfer ok", ${args.amount}, ${q(args.to)}))
+      _   => return!(("transfer FAILED", r))
+    }
+  }
 }`;
     },
   },
