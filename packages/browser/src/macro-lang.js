@@ -13,17 +13,19 @@
 //
 //   node packages/browser/src/macro-lang.js --selftest
 //
-// Two kinds of macro fall out of the body, and the distinction is not invented
-// here — it is which of the two halves the body is written in:
+// Three kinds of macro fall out of the body, and the distinction is not
+// invented here — it is what the body is written in (`bodyKind`):
 //
 //   command   the body's first line starts with `/` or `+`, so the body is a
 //             sequence of QuantumOS commands. Invoked as `+name args`. This is
 //             the EIES half — a command that composes the room's own
 //             capabilities: /lemma, /poll, /note, /gov, /rholang.
-//   rholang   the body is rholang. It has no meaning as a command, so it is
-//             invoked as a `$name(…)` call site inside another program, the
-//             way MacRhoLang's `$print($expression)` was. This is the @RHO-bot
-//             half.
+//   rholang   the body has rholang syntax (a send, a backtick powerbox name, a
+//             `for`/`match`/`new … in {`). Invoked as a `$name(…)` call site
+//             inside another program, the way MacRhoLang's `$print($expression)`
+//             was. This is the @RHO-bot half.
+//   text      neither — just text to substitute. `$name` yields its body, for
+//             use in another macro, in a `/rholang` program, or on its own.
 //
 // The `$` sigil is what makes a scanner safe without a rholang grammar: `$` is
 // lexically illegal in rholang (the node's lexer says `Illegal character $`),
@@ -38,7 +40,7 @@
  * @property {string[]} params      parameter names, without the `$`
  * @property {string}   body        raw body text, `$param` sites unsubstituted
  * @property {string}   doc         the comment that followed the name, if any
- * @property {"command"|"rholang"} kind
+ * @property {"command"|"rholang"|"text"} kind
  * @property {string}   author      peerId of the definer
  * @property {string}   authorLabel display name at definition time
  * @property {number}   at          definition timestamp (ms)
@@ -150,7 +152,7 @@ const lineOf = (src, idx) => src.slice(0, idx).split("\n").length;
  * start with `//` is the one case that needs the body on the next line.)
  *
  * @param {string} text
- * @returns {{name:string, params:string[], body:string, doc:string, kind:"command"|"rholang"}}
+ * @returns {{name:string, params:string[], body:string, doc:string, kind:"command"|"rholang"|"text"}}
  */
 export function parseDefinition(text) {
   const src = String(text ?? "");
@@ -192,10 +194,25 @@ export function parseDefinition(text) {
   return { name, params, body, doc, kind: bodyKind(body) };
 }
 
-/** Which half of the language a body is written in — see the header. */
+/**
+ * Which kind of body this is:
+ *   command — first non-blank line starts `/` or `+`: a sequence of QuantumOS
+ *             commands, invoked as `+name`.
+ *   rholang — has rholang syntax (a send `!`, a backtick powerbox name, `for`,
+ *             `match`, `new … in`, `=>`, `|`): a fragment for a `$name(…)` site
+ *             inside `/rholang`.
+ *   text    — neither: just text to substitute (`$name` → its body). Useful in
+ *             another macro's body, in a `/rholang` program, or shown on its own.
+ */
 export function bodyKind(body) {
-  const first = String(body ?? "").split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
-  return first.startsWith("/") || first.startsWith("+") ? "command" : "rholang";
+  const s = String(body ?? "");
+  const first = s.split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+  if (first.startsWith("/") || first.startsWith("+")) return "command";
+  // A send `x!(…)`, a backtick powerbox name, a `for`/`match`/`contract`,
+  // `new … in {`, a receive `<-` or a match arm `=>` — any one says rholang.
+  // A bare `!` (an exclamation in text) does not.
+  if (/`|!\s*\(|<-|=>|\bfor\s*\(|\bcontract\b|\bmatch\b[\s\S]*\{|\bnew\b[\s\S]*\bin\b[\s\S]*\{/.test(s)) return "rholang";
+  return "text";
 }
 
 // ---------------------------------------------------------------------------
@@ -380,9 +397,10 @@ export function expandCallSites(src, lookup, depth = 0, lexical = "rholang") {
       try {
         // A nested macro is expanded under its own body's rules, not its
         // caller's: a rholang fragment called from a command body is still
-        // rholang, and a command body called from one is still command text.
-        const inner1 = def.kind === "command" ? "text" : "rholang";
-        const bound = substitute(def.body, bindArgs(def, args, def.kind === "command"), inner1).text;
+        // rholang; a command or text body is read with the text lexer, and its
+        // arguments come in unquoted (a command-line word), not as rholang terms.
+        const inner1 = def.kind === "rholang" ? "rholang" : "text";
+        const bound = substitute(def.body, bindArgs(def, args, def.kind !== "rholang"), inner1).text;
         const inner = expandCallSites(bound, lookup, depth + 1, inner1);
         for (const e of inner.errors) errors.push({ line, message: `in $${name}: ${e.message}` });
         expansions.push({ name, line });
@@ -512,7 +530,7 @@ export function selftest() {
   ok("command body is recognised as commands", standup.kind === "command");
 
   const inline = def("greet(who) Hi $who, welcome!");
-  ok("inline body on the signature line", inline.name === "greet" && inline.params[0] === "who" && inline.body === "Hi $who, welcome!" && inline.kind === "rholang");
+  ok("inline body on the signature line", inline.name === "greet" && inline.params[0] === "who" && inline.body === "Hi $who, welcome!");
 
   const cmdInline = def("hi(who) +greet $who");
   ok("inline command body", cmdInline.kind === "command" && cmdInline.body === "+greet $who");
@@ -525,6 +543,16 @@ export function selftest() {
 
   const ballot = def("ballotid\n`rho:id:3qfh1fy7jwfcai7ceyorux4a18hzcn83n9xb6dramjf5gs7cw8fynf`");
   ok("value macro takes no parameters", ballot.params.length === 0 && ballot.kind === "rholang");
+
+  // --- bodyKind: command / rholang / text ---
+  ok("bodyKind: `/` first line is a command", bodyKind("/poll new x") === "command");
+  ok("bodyKind: `+` first line is a command", bodyKind("+greet Alice") === "command");
+  ok("bodyKind: a send is rholang", bodyKind("stdout!(42)") === "rholang");
+  ok("bodyKind: a backtick powerbox name is rholang", bodyKind("@`rho:id:abc`!(1)") === "rholang");
+  ok("bodyKind: `for (` is rholang", bodyKind("for (@x <- c) { Nil }") === "rholang");
+  ok("bodyKind: plain words are text", bodyKind("xxxxx") === "text");
+  ok("bodyKind: a sentence with `!` is still text", bodyKind("Hi $who, welcome!") === "text");
+  ok("bodyKind: a REV address is text", bodyKind("11112VYAt8rUGNRRZX3eJdgag") === "text");
 
   const threw = (fn) => { try { fn(); return ""; } catch (e) { return e.message; } };
   ok("a body is required", /no body/.test(threw(() => parseDefinition("empty(a)"))));

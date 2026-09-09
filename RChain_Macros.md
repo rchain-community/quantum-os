@@ -87,11 +87,14 @@ of passing it by position.
 A `+1` in chat is agreement, not a call — only an identifier-shaped name is read
 as an invocation.
 
-### Two halves, decided by the body
+### Three kinds, decided by the body
 
-A body of slash commands makes a **`+command`**. A body of rholang makes a
-**fragment**, which has no meaning as a command and is called as a `$name(…)`
-site inside another program, the way MacRhoLang's `$print($expression)` was:
+A body of slash/`+` commands makes a **`+command`**. A body with rholang syntax
+(a send, a backtick powerbox name, `for`/`match`/`new … in {`) makes a
+**fragment**, called as a `$name(…)` site inside another program, the way
+MacRhoLang's `$print($expression)` was. A body that is neither — plain text — is
+a **text macro**: `$name` yields its body, for use in another macro, a `/rholang`
+program, or on its own. `bodyKind` decides; nothing is declared.
 
 ```
 /macro define print(expression)  // stdout one term
