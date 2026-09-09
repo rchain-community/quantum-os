@@ -2459,6 +2459,34 @@ function forgetLibraryEntry(entry: LibraryEntry): void {
 }
 
 /**
+ * The wrapper forwards `return` with a single binder (`for (@__value <- return)`),
+ * so a `return!(…)` at the program's top level must send exactly one value.
+ * Returns the offending arity (0, or ≥2) of the first bad `return!` — or null if
+ * every `return!(…)` sends one value (nested parens / strings respected). A
+ * `return!` inside another `for` binding could still legitimately be polyadic,
+ * but at the top level it is almost always the mistake it looks like.
+ */
+function returnArityIssue(source: string): number | null {
+  for (const m of source.matchAll(/(?<![A-Za-z0-9_])return\s*!\s*\(/g)) {
+    const open = m.index! + m[0].length - 1;
+    let depth = 0, commas = 0, i = open, inStr: string | null = null, nonEmpty = false;
+    for (; i < source.length; i++) {
+      const c = source[i];
+      if (inStr) { if (c === "\\") i++; else if (c === inStr) inStr = null; continue; }
+      if (c === '"' || c === "`") { inStr = c; nonEmpty = true; continue; }
+      if (c === "(" || c === "[" || c === "{") { depth++; continue; }
+      if (c === ")" || c === "]" || c === "}") { depth--; if (depth === 0) break; continue; }
+      if (c === "," && depth === 1) commas++;
+      if (depth === 1 && !/\s/.test(c)) nonEmpty = true;
+    }
+    if (i >= source.length) continue;            // unbalanced — leave it to the linter
+    const arity = nonEmpty ? commas + 1 : 0;
+    if (arity !== 1) return arity;
+  }
+  return null;
+}
+
+/**
  * Say what a program will do, before it does it.
  *
  * Not a summary of the rholang — nothing here reads the program's meaning, and
@@ -2525,6 +2553,16 @@ async function explainRholangAsync(mode: "eval" | "deploy", source: string, cfg:
   // result and think the node is broken.
   if (!/(\breturn\s*!|\*return\b)/.test(source)) {
     say("⚠ nothing is sent to `return`, so nothing comes back — the run will look empty");
+  } else {
+    // The wrapper receives it with one binder — `for (@__value <- return)` — so
+    // `return!(a, b)` (polyadic) or `return!()` never matches and the run still
+    // looks empty. Send one value: `return!((a, b))`.
+    const bad = returnArityIssue(source);
+    if (bad !== null) {
+      say(bad === 0
+        ? "⚠ `return!()` sends nothing — the wrapper reads `return` with one binder, so this won't report. Send one value: `return!(x)`"
+        : `⚠ \`return!(…)\` sends ${bad} values — the wrapper reads \`return\` with one binder, so this won't report. Wrap them in one tuple: \`return!((…))\``);
+    }
   }
 
   addMessage("", `📖 what this ${mode === "deploy" ? "deploy" : "evaluation"} will do`);
@@ -2664,6 +2702,16 @@ function runRholangProgram(mode: "eval" | "deploy", source: string): void {
   // rholang's `*` dereference on any line holding two of them. What is echoed
   // has to be what you can paste back and run.
   say("```\n" + source + "\n```");
+
+  // The wrapper receives `return` with one binder, so `return!(a, b)` /
+  // `return!()` reduces to nothing and the run looks empty. Warn, don't block —
+  // it is legal rholang, just not what this pipeline can report.
+  const arity = returnArityIssue(source);
+  if (arity !== null) {
+    say(arity === 0
+      ? "⚠ `return!()` sends nothing — send one value (`return!(x)`) or the result will be empty"
+      : `⚠ \`return!(…)\` sends ${arity} values — wrap them in one tuple (\`return!((…))\`) or the result will be empty`);
+  }
 
   const cfg = loadNodeConfig();
   // An https page cannot fetch plain http — except to loopback, which browsers
