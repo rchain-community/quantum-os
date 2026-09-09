@@ -345,6 +345,79 @@ export async function readResult(cfg: NodeConfig): Promise<string[]> {
 }
 
 /**
+ * If `body` is, in its entirety, a single top-level `new <decls> in { <inner> }`
+ * — a hand-written program, or a `$macro` expansion, which always is — return
+ * its parts so `wrapProgram` can MERGE rather than NEST. Otherwise null.
+ *
+ * Respects rholang string / backtick / comment syntax so `new` or `in` inside a
+ * literal doesn't fool it; requires the closing `}` to be the last thing in the
+ * body (trailing `| x!(1)` after the block ⟹ not a clean single wrap ⟹ null).
+ */
+export function splitTopNew(body: string): { decls: string; inner: string } | null {
+  const s = body.trim();
+  // leading comments before `new`
+  let i = 0;
+  const skipWsComments = () => {
+    for (;;) {
+      while (i < s.length && /\s/.test(s[i])) i++;
+      if (s.startsWith("//", i)) { const e = s.indexOf("\n", i); i = e < 0 ? s.length : e; continue; }
+      if (s.startsWith("/*", i)) { const e = s.indexOf("*/", i + 2); if (e < 0) return; i = e + 2; continue; }
+      return;
+    }
+  };
+  skipWsComments();
+  if (!/^new\s/.test(s.slice(i))) return null;
+  i += 3;
+  const declStart = i;
+  // scan decls to the top-level `in` that precedes the opening `{`
+  let depth = 0, inStr: false | '"' | "`" = false, declEnd = -1;
+  for (; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) { if (c === inStr) inStr = false; else if (c === "\\") i++; continue; }
+    if (c === '"' || c === "`") { inStr = c; continue; }
+    if (c === "/" && s[i + 1] === "/") { const e = s.indexOf("\n", i); i = e < 0 ? s.length - 1 : e; continue; }
+    if (c === "/" && s[i + 1] === "*") { const e = s.indexOf("*/", i + 2); if (e < 0) return null; i = e + 1; continue; }
+    if (c === "(" || c === "[" || c === "{") depth++;
+    else if (c === ")" || c === "]" || c === "}") depth--;
+    else if (depth === 0 && s.startsWith("in", i) && !/[A-Za-z0-9_']/.test(s[i - 1] ?? "") && !/[A-Za-z0-9_']/.test(s[i + 2] ?? "")) {
+      declEnd = i; i += 2; break;
+    }
+  }
+  if (declEnd < 0) return null;
+  skipWsComments();
+  if (s[i] !== "{") return null;
+  const open = i;
+  // matching `}` for `open`
+  depth = 1; inStr = false; i = open + 1;
+  for (; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) { if (c === inStr) inStr = false; else if (c === "\\") i++; continue; }
+    if (c === '"' || c === "`") { inStr = c; continue; }
+    if (c === "/" && s[i + 1] === "/") { const e = s.indexOf("\n", i); i = e < 0 ? s.length - 1 : e; continue; }
+    if (c === "/" && s[i + 1] === "*") { const e = s.indexOf("*/", i + 2); if (e < 0) return null; i = e + 1; continue; }
+    if (c === "{" || c === "(" || c === "[") depth++;
+    else if (c === "}" || c === ")" || c === "]") { depth--; if (depth === 0) break; }
+  }
+  if (depth !== 0) return null;
+  const close = i;
+  i = close + 1;
+  skipWsComments();
+  if (i < s.length) return null;                       // trailing code — not a clean single wrap
+  const decls = s.slice(declStart, declEnd).trim();
+  if (!/[A-Za-z_]/.test(decls)) return null;
+  return { decls, inner: s.slice(open + 1, close) };
+}
+
+/** The bound names in a `new` decls list. A decl is `name` or `name(`urn`)` —
+ *  no internal commas — so a plain split is safe. */
+function declNames(decls: string): string[] {
+  return decls
+    .split(",")
+    .map((d) => /^\s*([A-Za-z_][A-Za-z0-9_']*)/.exec(d)?.[1])
+    .filter((n): n is string => !!n);
+}
+
+/**
  * Wrap a program body.
  *
  * eval reads its values straight off `return`, so `return` is left alone.
@@ -357,20 +430,34 @@ export async function readResult(cfg: NodeConfig): Promise<string[]> {
  *
  * The nonce has to advance on every write to that slot, which is why it is
  * passed in rather than invented here: the caller keeps the counter.
+ *
+ * When the body is already a single `new … in { … }` (a program, or a `$macro`
+ * expansion — see splitTopNew), the wrapper's declarations are MERGED into that
+ * one `new` instead of nesting a second layer — deduped by binding name, so the
+ * body's own `stdout` / `deployerId` / etc. wins and we do not double-bind.
  */
 export function wrapProgram(body: string, mode: "eval" | "deploy", nonce?: number): string {
-  const decls = ["return", ...POWERBOX.filter((e) => mode === "deploy" || !e.deployOnly).map((e) => `${e.name}(\`${e.urn}\`)`)];
+  const ours = ["return", ...POWERBOX.filter((e) => mode === "deploy" || !e.deployOnly).map((e) => `${e.name}(\`${e.urn}\`)`)];
   if (nonce !== undefined) {
-    decls.push("__insertSigned(`rho:registry:insertSigned:secp256k1`)",
-               "__deployerId(`rho:rchain:deployerId`)", "__ack");
+    ours.push("__insertSigned(`rho:registry:insertSigned:secp256k1`)",
+              "__deployerId(`rho:rchain:deployerId`)", "__ack");
   }
-  const indented = body.split("\n").map((l) => (l.trim() ? "  " + l : l)).join("\n");
   const forwarder = nonce === undefined ? "" :
     `\n  |\n  for (@__value <- return) {` +
     `\n    __insertSigned!((${Number(nonce)}, __value), *__deployerId, *__ack) |` +
     `\n    stdout!(__value)` +
     `\n  }`;
-  return `new ${decls.join(", ")} in {\n${indented}${forwarder}\n}`;
+
+  const split = splitTopNew(body);
+  if (split) {
+    const taken = new Set(declNames(split.decls));
+    const merged = [...ours.filter((d) => !taken.has(declNames(d)[0])), split.decls].filter(Boolean).join(", ");
+    const inner = split.inner.replace(/^\n/, "").replace(/\n$/, "");
+    return `new ${merged} in {\n${inner}${forwarder}\n}`;
+  }
+
+  const indented = body.split("\n").map((l) => (l.trim() ? "  " + l : l)).join("\n");
+  return `new ${ours.join(", ")} in {\n${indented}${forwarder}\n}`;
 }
 
 // ---------------------------------------------------------------------------
