@@ -32,12 +32,9 @@ Interact2.
 
 ### `$` — the sigil
 
-Macro names and parameter names both take `$`:
-
-```
-$macroname(name="joe", age=5)
-$arg
-```
+A macro is **called** with `$` — `$macroname(name="joe", age=5)` at a rholang
+call site, `$arg` for a parameter inside a body. (The `/macro define` line
+itself is bare: `define macroname(name, age) …` — see below.)
 
 `$` is **lexically illegal in rholang**, which is what makes a scanner safe
 without a grammar. rnode's own lexer rejects it:
@@ -55,13 +52,22 @@ something rholang already means. `%` is its modulo operator: `7 % 3` is `1`.
 ### `/` is what the app ships, `+` is what a person wrote
 
 A definition is made with a built-in verb, so `/macro define` keeps the slash.
-What it produces is invoked with `+`:
+What it produces is invoked with `+`. The grammar is `name body`, or
+`name(arg, …) body` — the name and parameters are bare, and the body is the rest
+of the line or the lines below it (an optional `// note` between the two is the
+macro's doc):
 
 ```
-/macro define $standup($topic)  // opens a standup poll
+/macro define standup(topic)  // opens a standup poll
 /poll new $topic | yes, no, later
 /gov say standup on "$topic" is open
 /channel send team standup: $topic
+```
+
+A one-liner needs no newline:
+
+```
+/macro define greet(who) Hi $who, welcome to the room!
 ```
 
 ```
@@ -85,7 +91,7 @@ A body of slash commands makes a **`+command`**. A body of rholang makes a
 site inside another program, the way MacRhoLang's `$print($expression)` was:
 
 ```
-/macro define $print($expression)  // stdout one term
+/macro define print(expression)  // stdout one term
 new stdout(`rho:io:stdout`) in { stdout!($expression) }
 ```
 
@@ -121,7 +127,7 @@ Textual substitution, which is what makes `match` binding work rather than
 something separate from it:
 
 ```
-/macro define $hanoi($height)  // towers of hanoi - use EXPLORE
+/macro define hanoi(height)  // towers of hanoi - use EXPLORE
 /rholang eval
 match [$height] {
   [height] => {
@@ -250,7 +256,7 @@ A `$name` bound to a capability is a macro with no parameters, and the body is
 the capability:
 
 ```
-/macro define $ballot   // the colab ballot contract
+/macro define ballot   // the colab ballot contract
 `rho:id:3qfh1fy7jwfcai7ceyorux4a18hzcn83n9xb6dramjf5gs7cw8fynf`
 ```
 
@@ -366,7 +372,7 @@ already has the three properties an introduction needs:
 | identity | every envelope is dyncap-signed and anchor-pinned; a fork is flagged |
 | standing | `/gov trust` levels, admin-rooted, with ⅔-quorum censure that slashes vouchers |
 
-So sharing a capability is `/macro define $ballot` with the uri as its body,
+So sharing a capability is `/macro define ballot` with the uri as its body,
 broadcast to the room like any other definition. Whoever is in the room has it;
 whoever is not, does not.
 
