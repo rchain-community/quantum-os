@@ -438,11 +438,11 @@ ${seats.join(" |\n")} |
 
   // A chain read: it has rholang (so it is not answered locally like `zfa` /
   // `verify`) but `write: false`, so `$balance(…)` runs as an unsigned
-  // `/rholang eval` — no phlo, no block. The deployer's own address is not
-  // available in an exploratory deploy (`rho:rchain:deployerId` is unbound), so
-  // the caller resolves a literal `me` to its REV address before expansion.
+  // `/rholang eval` — no phlo, no block. Your own address is `$me`, a
+  // client-side token the caller resolves before expansion (the node cannot:
+  // `rho:rchain:deployerId` is unbound in an exploratory deploy).
   balance: {
-    help: "Read a REV balance (rho:rchain:revVault). Arg: a REV address (or `me`).",
+    help: "Read a REV balance (rho:rchain:revVault). Arg: a REV address, or $me.",
     write: false,
     argSpec: [["addr", "string"]],
     expand(args) {
