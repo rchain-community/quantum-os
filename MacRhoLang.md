@@ -2,12 +2,17 @@
 
 MacRhoLang is the little language you use to **write your own commands** in a
 [QuantumOS](README.md) room, and to **talk to a chain** without hand‑writing
-much rholang. It has two halves that look the same and are learned the same way:
+much rholang. What you write is decided by its **body** — nothing to declare:
 
-| you write | you run it as | needs a chain? |
-|---|---|---|
-| a body of `/` and `+` commands | `+name args` — a room command | no |
-| a body of rholang | `$name(…)` — inside a `/rholang` program | yes (an rnode) |
+| body | kind | you use it as | needs a chain? |
+|---|---|---|---|
+| starts with `/` or `+` | **command** | `+name args` — a room command | no |
+| has rholang syntax (a `!` send, a `` `powerbox` `` name, `for`/`match`/`new … in {`) | **rholang** | `$name(…)` inside a `/rholang` program | yes (an rnode) |
+| anything else — plain words | **text** | `$name` — yields its body; nothing runs | no |
+
+Most of this guide is the first kind. A **text** macro is the simplest thing of
+all: `/macro define sig — Jim W., RChain` and then `$sig` is that text wherever
+you put it. A **rholang** macro is Part 4.
 
 **You do not need to know rholang to use the first half.** This guide starts
 there, and when rholang shows up it is explained line by line as it appears.
@@ -86,6 +91,7 @@ defined. That is how a room grows a vocabulary.
 | `/macro find <text>` | search names, docs and bodies |
 | `/macro echo <name> [args]` | show what it expands to — **runs nothing** |
 | `/macro remove <name>` | remove it |
+| `/macro edit <name>[(args)]` | open the editor to write / rewrite the body |
 
 Definitions are **room state**: signed with your identity, sent to everyone,
 replayed to whoever joins later. **First writer wins the name** — only its
@@ -284,8 +290,8 @@ than showing it as your result.
 
 ## Part 6 — the `$` line, and `/rhoqu`
 
-A room line that **starts with `$`** runs a chain macro directly, the way `+`
-runs a command and `/` runs a built‑in:
+A room line that **starts with `$`** runs a *built‑in* chain macro directly, the
+way `+` runs a command and `/` runs a built‑in:
 
 ```
 $verify(@somelemma)                        ← answered in the browser
@@ -293,6 +299,11 @@ $balance($me)                              ← an unsigned read
 $transfer(10, "1111…")                     ← opens the deploy path
 $( new r in { $print("hi") | r!(1) } )     ← a whole inline program
 ```
+
+A `$name` that is **one of your own macros** is *shown*, not run — you see what
+it expands to, plus how to run it (`/rholang eval …` / `/rholang deploy …`) if
+it is rholang. So a stray `$x` never signs a deploy, and a text macro just
+prints its text.
 
 **[`/rhoqu`](RhoQuDemo.md)** is a higher‑level surface — `process`, `new`, `|`,
 `if`, `on channel`, `for` — that transpiles to `/command` strings. Use it when a
@@ -303,12 +314,16 @@ protocol is easier to describe as concurrent processes than as a command list.
 ## Cheat sheet
 
 ```
-/macro define name body                    a +command (or a $fragment if the body is rholang)
-/macro define name(a, b) body              …with parameters, referred to as $a $b in the body
-/macro define name(a)  // what it does     …with a doc note; body follows on the next lines
+/macro define name body                    body starting / or +  → a +command
+/macro define name(a, b) body              body of rholang       → a $name(…) fragment
+/macro define name text                    anything else         → a $name text macro
+/macro define name(a)  // what it does     doc note; body follows on the next lines
+/macro edit name[(args)]                   write the body in the editor
+
 +name args                                 run a command someone defined   ("two words" groups; k=v names)
-$name(args)                                run a chain macro               ($me = your REV address)
-$name(args) as pat { … } pat { … }         capture the reply: one arm binds, several match
+$name  ·  $name(args)                      show what your macro expands to (does not run)
+$builtin(args)                             run a built-in chain macro      ($me = your REV address)
+$builtin(args) as pat { … } pat { … }      capture the reply: one arm binds, several match
 
 /macro list · show <n> · find <re> · echo <n> [args] · remove <n>
 /rholang eval | deploy | echo | explain | read

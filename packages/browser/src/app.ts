@@ -686,7 +686,7 @@ interface MacroDef {
   params: string[];                    // parameter names, without the `$`
   body: string;                        // `$param` sites unsubstituted
   doc: string;                         // the comment that followed the name
-  kind: "command" | "rholang";
+  kind: "command" | "rholang" | "text";
   author: string;                      // peerId of the definer
   authorLabel: string;
   at: number;
@@ -2850,15 +2850,12 @@ function macroFromWire(d: Record<string, unknown>, from: string): MacroDef | nul
   if (!body.trim() || body.length > MAX_BODY) return null;
   const params = Array.isArray(d.params) ? d.params.map(String) : [];
   if (params.some((x) => !MACRO_NAME_RE.test(x))) return null;
-  const wireKind = d.macroKind === "command" || d.macroKind === "rholang" ? d.macroKind : bodyKind(body);
-  // The body decides the kind. A sender claiming `rholang` for a body of slash
-  // commands (or the reverse) would have every peer disagree about what the
-  // same definition is, so the claim is checked rather than taken.
-  const kind = bodyKind(body) === wireKind ? wireKind : bodyKind(body);
+  // The body decides the kind — never the sender's claim — so every peer
+  // derives the same one for the same definition.
   return {
     name, params, body,
     doc: String(d.doc ?? "").slice(0, 200),
-    kind,
+    kind: bodyKind(body),
     author: from,
     authorLabel: String(d.authorLabel ?? peerLabel(from)),
     at: typeof d.at === "number" ? d.at : Date.now(),
@@ -2868,7 +2865,7 @@ function macroFromWire(d: Record<string, unknown>, from: string): MacroDef | nul
   };
 }
 
-/** How a macro is called: `+name <arg>` for a command, `$name($arg)` for rholang. */
+/** How a macro is called: `+name <arg>` for a command, `$name($arg)` for rholang / text. */
 function macroCallForm(def: MacroDef): string {
   return def.kind === "command"
     ? `+${def.name}${def.params.map((x) => ` <${x}>`).join("")}`
@@ -2932,7 +2929,8 @@ function defineMacro(text: string, say: (t: string) => void): void {
     macroKind: def.kind, authorLabel: def.authorLabel, at: def.at,
   });
   say(`${existing ? "redefined" : "defined"} ${macroCallForm(def)}${def.doc ? `  — ${def.doc}` : ""}`);
-  if (def.kind === "rholang") say(`  rholang: use it as a $${def.name}(…) site inside /rholang eval or deploy`);
+  if (def.kind === "rholang") say(`  rholang fragment — use it as a $${def.name}(…) site inside /rholang eval or deploy`);
+  else if (def.kind === "text") say(`  text macro — $${def.name}${def.params.length ? "(…)" : ""} substitutes its body; nothing runs`);
 }
 
 /** Retract a macro — for everyone if it is mine, from my view otherwise. */
@@ -2972,8 +2970,10 @@ function runMacroLine(line: string): string[] {
     say(`no +${call.name} command in this room — /macro list, or /macro define ${call.name}(…) <body> to write it`);
     return out;
   }
-  if (def.kind === "rholang") {
-    say(`· $${def.name} is rholang, not a command — use it as $${def.name}(…) inside /rholang eval`);
+  if (def.kind !== "command") {
+    say(def.kind === "text"
+      ? `· $${def.name} is a text macro, not a command — use it as $${def.name}${def.params.length ? "(…)" : ""} (it substitutes its body)`
+      : `· $${def.name} is rholang, not a command — use it as $${def.name}(…) inside /rholang eval`);
     return out;
   }
   if (macroDepth >= MACRO_RUN_DEPTH) {
@@ -3021,6 +3021,26 @@ function runInput(text: string): string[] {
  * Built-in macros are `rholang-macros.js`; a `$name` the library doesn't know
  * falls through to this room's `/macro`-defined ones.
  */
+/**
+ * Expand a room `$macro` call and show the result — without running it. A room
+ * macro's intent is unknown (it can be plain substitution text or a rholang
+ * fragment), so a `$name` line reports what it expands to and how to run it,
+ * rather than silently deploying.
+ */
+function showRoomMacro(call: string, say: (t: string) => void, out: string[]): string[] {
+  const x = expandCallSites(call, macroLookup);
+  for (const err of x.errors) say(`✗ ${err.message}`);
+  if (x.errors.length) return out;
+  say("```\n" + x.source.trim() + "\n```");
+  const def = macroLookup(call.replace(/^\$/, "").split("(")[0]);
+  if (def?.kind === "rholang") {
+    say(`  run it:  /rholang eval ${call}   ·   /rholang deploy ${call}`);
+  } else {
+    say(`  (${call.split("(")[0]} is a text macro — use it inside a command, a /rholang program, or paste it)`);
+  }
+  return out;
+}
+
 function runDollarLine(line: string): string[] {
   const out: string[] = [];
   const say = (t: string) => { addMessage("", t, "system"); out.push(t); };
@@ -3062,8 +3082,16 @@ function runDollarLine(line: string): string[] {
 
     if (mode === "eval")   { runRholangProgram("eval", body); return out; }
     if (mode === "deploy") { runRholangProgram("deploy", body); return out; }
-    // a room `$macro` (rholang fragment) — sign it, like any deploy
-    if (macroStore.get(name)) { runRholangProgram("deploy", body); return out; }
+    // A room `$macro` — expand and show it. It may be plain text or a rholang
+    // fragment; either way, *running* it is a separate, explicit step so a
+    // stray `$x` in chat never signs a deploy.
+    if (macroStore.get(name)) { return showRoomMacro(`$${name}(${single[2]})`, say, out); }
+  }
+
+  // A bare `$name` (no parens) that names a room macro — same: expand and show.
+  const bare = /^\$([A-Za-z][\w-]*)\s*$/.exec(line.trim());
+  if (bare && !macroMode(bare[1].toLowerCase()) && macroStore.get(bare[1].toLowerCase())) {
+    return showRoomMacro(`$${bare[1].toLowerCase()}`, say, out);
   }
 
   // A `$( … )` inline program, or a line with several sites (or an `as … { }`
@@ -3575,22 +3603,39 @@ function handleCommand(raw: string): string[] {
           sys("    /macro define greet(who) Hi $who, welcome!");
           sys("    /macro define standup(topic)  // opens a standup poll");
           sys("    /poll new $topic | yes, no, later");
-          sys("  a body of slash/`+` commands makes a +name command; a body of rholang makes a $name(…) fragment");
-          sys("  signature only (no body) opens the editor to write it: /macro define $name(x)");
+          sys("  a body of slash/`+` commands → a +name command; rholang → a $name(…) fragment; plain text → $name substitutes it");
+          sys("  /macro edit name(x)  — write the body in the editor instead");
           break;
         }
-        // Signature but no body → open the rholang editor seeded with it, so the
-        // body can be written (and live-linted) there. The editor recognises a
-        // `define …` buffer and registers it on Ctrl+Enter.
+        // Signature but no body. `name(x)` on its own is ambiguous — a
+        // forgotten body, or "open the editor to write it". Say both, and
+        // catch the common slip where the parens were meant to *be* the body.
         try {
           parseDefinition(rest);
         } catch (e) {
           if (/no body/.test((e as Error)?.message ?? "")) {
-            editRholang("eval", `define ${rest.trimEnd()}\n`);
+            const pm = /^\s*[$+]?([A-Za-z][\w-]*)\s*\(([^)]*)\)\s*$/.exec(rest);
+            if (pm && pm[2].trim() && !/[,=]/.test(pm[2])) {
+              sys(`· ${pm[1]}: "(${pm[2].trim()})" reads as a parameter list, not a body.`);
+              sys(`  did you mean:  /macro define ${pm[1]} ${pm[2].trim()}   (body = ${pm[2].trim()})`);
+              sys(`  or, to give ${pm[1]} a parameter and write the body in the editor:  /macro edit ${rest.trim()}`);
+              break;
+            }
+            sys(`· that is a signature with no body. Put the body after it, or on the next line — or /macro edit ${rest.trim()} to write it in the editor.`);
             break;
           }
         }
         defineMacro(rest, sys);
+        break;
+      }
+
+      if (sub === "edit") {
+        // Open the rholang editor to write (or rewrite) a macro body. The
+        // editor registers a `define …` buffer on Ctrl+Enter.
+        const spec = parts.slice(2).join(" ").trim();
+        if (!spec) { sys("usage: /macro edit <name>[(args)]   — opens the editor to write the body"); break; }
+        const existing = macroStore.get(spec.toLowerCase().replace(/^[$+]/, "").replace(/\(.*$/, ""));
+        editRholang("eval", existing ? `define ${formatDefinition(existing)}` : `define ${spec}\n`);
         break;
       }
 
@@ -3645,14 +3690,16 @@ function handleCommand(raw: string): string[] {
 
       // Bare /macro, or /macro list.
       if (macroStore.size === 0) {
-        sys("no commands defined in this room yet");
+        sys("no macros defined in this room yet");
         sys("  /macro define name(arg) <body>  — write one; it is shared with the room");
+        sys("  /macro edit name(arg)           — …or write the body in the editor");
         sys("  /macro help                     — the whole verb list");
         break;
       }
-      sys(`commands in this room (${macroStore.size}):`);
+      sys(`macros in this room (${macroStore.size}):`);
       for (const d of [...macroStore.values()].sort((a, b) => a.name.localeCompare(b.name))) {
-        sys(`  ${macroCallForm(d)}${d.doc ? `  — ${d.doc}` : ""}  (by ${d.authorLabel})`);
+        const tag = d.kind === "command" ? "" : d.kind === "text" ? "  [text]" : "  [rholang]";
+        sys(`  ${macroCallForm(d)}${tag}${d.doc ? `  — ${d.doc}` : ""}  (by ${d.authorLabel})`);
       }
       break;
     }
@@ -9417,7 +9464,8 @@ function renderMacros(): void {
       msgInput.value = def.kind === "command" ? `+${def.name} ` : `/macro show ${def.name}`;
       msgInput.focus();
     });
-    li.title = `${def.doc || (def.kind === "command" ? "a command" : "a rholang fragment")}\n(by ${def.authorLabel})\n\n${def.body}`;
+    const kindWord = def.kind === "command" ? "a command" : def.kind === "text" ? "a text macro" : "a rholang fragment";
+    li.title = `${def.doc || kindWord}\n(by ${def.authorLabel})\n\n${def.body}`;
     li.appendChild(label);
     appendRemoveBtn(li, def.author === myPeerId() ? "retract this command" : "hide from your view", () => forgetMacro(def.name));
     macroListEl.appendChild(li);
