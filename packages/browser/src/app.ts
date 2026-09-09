@@ -44,9 +44,9 @@ import { expandBareMacro, expandMacroProgram, lintRholang, macroMode,
          listMacros as listRholangMacros } from "./rholang-pipeline.js";
 import { loadConfig as loadNodeConfig, saveConfig as saveNodeConfig, describeConfig as describeNodeConfig,
          generateKey as generateDeployKey, revAddressOf, nodeStatus, evalTerm, deployTerm,
-         readResults, readName, deployFate, wrapProgram, powerboxNames, powerboxSpec,
+         readResultsFresh, readName, deployFate, wrapProgram, powerboxNames, powerboxSpec,
          registryUriOf, powerboxUsed, DEFAULT_CONFIG as DEFAULT_NODE_CONFIG,
-         readResult, syncResultNonce, type NodeConfig } from "./rholang.js";
+         readResult, readResultRecord, syncResultNonce, type NodeConfig } from "./rholang.js";
 import { qucalcSearch, qucalcSolve,
          type SearchDone as QucalcSearchDone } from "./qucalc-search.js";
 
@@ -2726,9 +2726,10 @@ function runRholangProgram(mode: "eval" | "deploy", source: string): void {
         // measured: readable immediately, at +90s and at +210s — so there is no
         // window to miss and nothing is lost by not watching.
         lastDeploySig = r.sig ?? "";
+        lastDeployNonce = r.resultNonce ?? null;
         say("  it will answer at your record once a block carries it — /rholang read");
-        const values = await readResults(cfg, 6);
-        if (values.length) { for (const v of values) say("  → " + v); }
+        const fresh = await readResultsFresh(cfg, r.resultNonce, 6);
+        if (fresh != null) { say("  → " + fresh); }
         else {
           // An empty name means one of two things that look identical from here:
           // still waiting on consensus, or landed in a block and errored (a failed
@@ -2764,6 +2765,8 @@ function runRholangProgram(mode: "eval" | "deploy", source: string): void {
 
 /** The last deploy's signature, so `/rholang read` can tell "still waiting" from "errored". */
 let lastDeploySig = "";
+/** The nonce that deploy wrote to, so `/rholang read` can tell a fresh answer from a stale one. */
+let lastDeployNonce: number | null = null;
 
 // ---------------------------------------------------------------------------
 // Macro runtime — defining, retracting and running a `+command`
@@ -6066,9 +6069,9 @@ function handleCommand(raw: string): string[] {
             void (async () => {
               const r = await deployTerm(cfg, installProgram());
               addMessage("", (r.ok ? "✓ " : "✗ ") + r.message, "system");
-              if (!r.ok) return;
-              const values = await readResults(cfg, 40);
-              const uri = values.find((v) => v.startsWith("rho:id:"));
+              if (!r.ok || r.resultNonce === undefined) return;
+              const fresh = await readResultsFresh(cfg, r.resultNonce, 40);
+              const uri = fresh && fresh.startsWith("rho:id:") ? fresh : undefined;
               if (!uri) { addMessage("", "  deployed, but no uri came back yet — /rholang read, then /rholang locker <uri>", "system"); return; }
               saveNodeConfig({ ...loadNodeConfig(), locker: uri });
               addMessage("", `✓ locker at ${uri}`, "system");
@@ -6172,15 +6175,39 @@ function handleCommand(raw: string): string[] {
           const target = rest.trim().replace(/^@/, "").replace(/^"|"$/g, "");
           void (async () => {
             try {
-              const values = target ? await readName(cfg, target) : await readResult(cfg);
-              const where = target ? `@"${target}"` : "your record";
-              if (values.length) { for (const v of values) addMessage("", "  → " + v, "system"); return; }
+              if (target) {
+                const values = await readName(cfg, target);
+                if (values.length) { for (const v of values) addMessage("", "  → " + v, "system"); return; }
+                addMessage("", `  nothing at @"${target}" yet — no block carries that deploy so far, which can take minutes`, "system");
+                return;
+              }
+              // No target: the deployer's own record. It carries its nonce, so a
+              // value from an earlier deploy can be told apart from this one's.
+              const rec = await readResultRecord(cfg);
+              // What nonce the record should be at if the last deploy reported:
+              // the tracked one, else the local counter's last write.
+              const expected = lastDeployNonce ?? ((cfg.resultNonce ?? 1) - 1);
+              if (rec.value != null) {
+                addMessage("", "  → " + rec.value, "system");
+                if (rec.nonce != null && rec.nonce < expected) {
+                  addMessage("", `  ⚠ that is from an earlier deploy — the record is at nonce ${rec.nonce}, your last deploy wrote ${expected}`, "system");
+                  const fate = lastDeploySig ? await deployFate(cfg, lastDeploySig).catch(() => null) : null;
+                  if (fate?.errored) {
+                    addMessage("", `  ✗ your last deploy ran in block ${fate.blockNumber} and errored (cost ${fate.cost ?? "?"}) — it sent nothing to \`return\``, "system");
+                    if (fate.systemDeployError) addMessage("", `     ${fate.systemDeployError}`, "system");
+                  } else if (fate) {
+                    addMessage("", `  it ran in block ${fate.blockNumber} without sending to \`return\` — check the program actually \`return!\`s`, "system");
+                  } else {
+                    addMessage("", `  its block may not be in yet (can take minutes) — /rholang read again later`, "system");
+                  }
+                }
+                return;
+              }
               // Empty is ambiguous — waiting, or errored and never coming. Ask the block.
-              const fate = (!target && lastDeploySig)
-                ? await deployFate(cfg, lastDeploySig).catch(() => null) : null;
+              const fate = lastDeploySig ? await deployFate(cfg, lastDeploySig).catch(() => null) : null;
               if (fate?.errored) addMessage("", `  ✗ that deploy ran in block ${fate.blockNumber} and errored (cost ${fate.cost ?? "?"}) — it sent nothing to return`, "system");
-              else if (fate) addMessage("", `  nothing at ${where} — it ran in block ${fate.blockNumber} without sending to return`, "system");
-              else addMessage("", `  nothing at ${where} yet — no block carries that deploy so far, which can take minutes`, "system");
+              else if (fate) addMessage("", `  nothing at your record — it ran in block ${fate.blockNumber} without sending to return`, "system");
+              else addMessage("", `  nothing at your record yet — no block carries that deploy so far, which can take minutes`, "system");
             } catch (e) {
               addMessage("", "✗ " + ((e as Error)?.message ?? e), "system");
             }

@@ -345,6 +345,29 @@ export async function readResult(cfg: NodeConfig): Promise<string[]> {
 }
 
 /**
+ * The record with its nonce, so a reader can tell a fresh answer from a stale
+ * one. The slot holds `(uri, (nonce, value))`; this returns `{ nonce, value }`
+ * (value as rnode renders it). `nonce` is null when there is no record yet.
+ */
+export async function readResultRecord(cfg: NodeConfig): Promise<{ nonce: number | null; value: string | null }> {
+  if (!cfg.key) return { nonce: null, value: null };
+  const uri = registryUriOf(cfg.key);
+  const r = await evalTerm(cfg, `new lookup(\`rho:registry:lookup\`), stored in {
+  lookup!(\`${uri}\`, *stored) |
+  for (@record <- stored) {
+    match record { (_, (n, value)) => { return!((n, value)) }  _ => { Nil } }
+  }
+}`).catch(() => null);
+  const raw = r?.values?.[0];
+  if (raw == null) return { nonce: null, value: null };
+  // rnode renders the pair as `(<int>, <value>)`; the value can itself hold
+  // commas and parens, so take the first int and the rest up to the last `)`.
+  const mm = /^\(\s*(\d+)\s*,\s*([\s\S]*)\)\s*$/.exec(String(raw).trim());
+  if (!mm) return { nonce: null, value: String(raw) };
+  return { nonce: Number(mm[1]), value: mm[2].trim() };
+}
+
+/**
  * If `body` is, in its entirety, a single top-level `new <decls> in { <inner> }`
  * — a hand-written program, or a `$macro` expansion, which always is — return
  * its parts so `wrapProgram` can MERGE rather than NEST. Otherwise null.
@@ -685,6 +708,21 @@ export async function readResults(cfg: NodeConfig, attempts = 12): Promise<strin
     if (v.length) return v;
   }
   return [];
+}
+
+/**
+ * Poll the record until it reports at `minNonce` or later — a value this deploy
+ * wrote, not one left on the slot by an earlier deploy that this one's program
+ * never overwrote (because it errored, or sent nothing to `return`). Returns the
+ * rendered value, or null if nothing fresh arrived within the window.
+ */
+export async function readResultsFresh(cfg: NodeConfig, minNonce: number, attempts = 12): Promise<string | null> {
+  for (let i = 0; i < attempts; i++) {
+    await new Promise((r) => setTimeout(r, 1500));
+    const rec = await readResultRecord(cfg).catch(() => ({ nonce: null, value: null }));
+    if (rec.value != null && (rec.nonce == null || rec.nonce >= minNonce)) return rec.value;
+  }
+  return null;
 }
 
 /**
