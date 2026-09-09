@@ -2573,28 +2573,29 @@ async function explainRholangAsync(mode: "eval" | "deploy", source: string, cfg:
  * rholang's modulo operator and will not be, which is why the report matters
  * more for that half.
  */
-function expandRholangMacros(source: string, say: (t: string) => void): string {
-  let out = source;
-  // `$me` — a client-side token, resolved to this browser's own REV address (a
-  // quoted rholang string) before the program reaches rnode. Write it bare:
-  // `$balance($me)`, `$transfer(10, $me)`. It is not a macro call site (no
-  // parens), so the scanners below leave it alone; it only exists here, where
-  // the deploy key is known. `me` (no `$`) still works in a `$balance(me)` chat
-  // line for convenience.
-  if (/\$me\b/.test(out)) {
-    const key = loadNodeConfig().key;
-    if (!key) {
-      say("✗ $me needs a deploy key — /rholang key generate, or /rholang key <hex>");
-    } else {
-      try {
-        const addr = revAddressOf(key);
-        out = out.replace(/\$me\b/g, JSON.stringify(addr));
-        say(`  · $me → ${addr}`);
-      } catch {
-        say("✗ $me: the stored key is not a valid secp256k1 key");
-      }
-    }
+/**
+ * `$me` — a client-side token, resolved to this browser's own REV address (a
+ * quoted rholang string) before the program reaches rnode. Write it bare:
+ * `$balance($me)`, `$transfer(10, $me)`. Not a macro call site (no parens); it
+ * only exists here, where the deploy key is known. Run before any macro pass
+ * (in `expandRholangMacros` and in `runDollarLine`'s eval/deploy peek).
+ */
+function resolveClientTokens(source: string, say: (t: string) => void): string {
+  if (!/\$me\b/.test(source)) return source;
+  const key = loadNodeConfig().key;
+  if (!key) { say("✗ $me needs a deploy key — /rholang key generate, or /rholang key <hex>"); return source; }
+  try {
+    const addr = revAddressOf(key);
+    say(`  · $me → ${addr}`);
+    return source.replace(/\$me\b/g, JSON.stringify(addr));
+  } catch {
+    say("✗ $me: the stored key is not a valid secp256k1 key");
+    return source;
   }
+}
+
+function expandRholangMacros(source: string, say: (t: string) => void): string {
+  let out = resolveClientTokens(source, say);
   if (out.includes("%") || out.includes("$")) {
     const p = expandMacroProgram(out);      // built-in library — `$name(` and legacy `%name(`
     for (const err of p.errors) say(`✗ line ${err.line}: ${err.message}`);
@@ -2962,11 +2963,13 @@ function runDollarLine(line: string): string[] {
     if (macroStore.get(name)) { runRholangProgram("deploy", body); return out; }
   }
 
-  // A `$( … )` inline program, or a line with several sites: expand once to see
-  // whether any site is a write, then run — eval if every site is a read.
+  // A `$( … )` inline program, or a line with several sites (or an `as … { }`
+  // capture): expand once to see whether any site is a write, then run — eval
+  // if every site is a read. Resolve `$me` first (silently — the real run
+  // reports it) so the scanner does not read it as an unknown room macro.
   let writes = false, sites = 0;
   try {
-    const p = expandMacroProgram(body);
+    const p = expandMacroProgram(resolveClientTokens(body, () => {}));
     for (const err of p.errors) { say(`✗ line ${err.line}: ${err.message}`); }
     if (p.errors.length) return out;
     for (const e of p.expansions) { sites++; if (e.write) writes = true; }
