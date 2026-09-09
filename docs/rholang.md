@@ -86,26 +86,24 @@ Bridges a room to an RChain chain: a room's state is ephemeral, a deploy is not.
 
 **`$macro(…) as <pattern> { …block… }` — capture.** A macro that opts in (`capture: true` — `$balance`, `$transfer`, `$grant`) binds its result by `<pattern>` and runs a supplied block instead of reporting to `return`: `$balance($me) as bal { stdout!(("balance", bal)) }` expands to `… *ret) | for (@bal <- ret) { stdout!(("balance", bal)) }`. Without `as`, the macro's own reporting runs (a value on `return` for eval / the deploy record). With `as`, the block runs instead — the composition primitive: `$transfer(10, a) as (_, err) { $balance($me) as b { return!(("done", err, b)) } }`.
 
-`<pattern>` is a name **or** a balanced `(a, b)` / `[a, …rest]` — anything a rholang `for (@<pattern> <- ret)` accepts. **Match the shape the macro replies** — a `for` with a pattern only fires when the reply matches it, and each capture macro's `help` states its shape:
+`<pattern>` is a name, `_`, a literal (`Nil` / a number / a string), **or** a balanced `(a, b)` / `[a, …rest]` — anything a rholang `for (@<pattern> <- …)` accepts. A single arm is a plain bind — the `for`'s own pattern does the matching, so it only fires when the reply matches. **Match the shape the macro replies** (each capture macro's `help` states it):
 
 | macro | reply the block sees |
 |---|---|
 | `$balance` | the balance, an integer — `as bal { … }` |
 | `$grant` | the minted capability (raw reply) — `as cap { … }` |
-| `$transfer` | **`(result, error)`** — `result` is `("transfer ok", amount, to)` on success and `Nil` on failure; `error` is the failure string or `Nil`. `$transfer(50, a) as (result, error) { match error { Nil => use!(result)  _ => stdout!(("failed", error)) } }`. (The raw revVault reply is just `Nil`/a string; the macro normalises it to this two-slot shape for both capture *and* its default reporting.) |
+| `$transfer` | **`(result, error)`** — `result` is `("transfer ok", amount, to)` on success and `Nil` on failure; `error` is the failure string or `Nil`. (The raw revVault reply is just `Nil`/a string; the macro normalises it to this two-slot shape for both capture *and* its default reporting.) |
 
-**`as { <pat> => …  <pat> => … }` — match the reply.** Drop the binding and put rholang `match` arms straight in the brace; they run against the raw reply:
+**`as <pat> { … } <pat> { … } …` — one arm per pattern.** Repeat `<pattern> { block }`; two or more arms become a `match` over the reply, each `<pattern>` a match pattern:
 
 ```
-$transfer(50, a) as {
-  (ok,  Nil) => return!(("paid", ok))
-  (Nil, err) => return!(("failed", err))
-}
+$transfer(50, a) as (ok, Nil) { return!(("paid", ok)) }
+                   (Nil, err) { return!(("failed", err)) }
 ```
 
-expands to `… | for (@__reply <- __outcome) { match __reply { (ok, Nil) => … (Nil, err) => … } }` (over `ret` for `$balance` / `$grant`). It is the same `match` you would write by hand inside `as (result, error) { … }`, without naming the tuple first. The brace must hold `pattern => proc` arms (a `=>` is required — `as { Nil }` is an error).
+expands to `… | for (@__reply <- __outcome) { match __reply { (ok, Nil) => { … } (Nil, err) => { … } } }` (over `ret` for `$balance` / `$grant`). Arm collection stops as soon as what follows is not `<pattern> {`, so the rest of the program (`| more`, a closing `)`) is left alone.
 
-A non-`capture` macro rejects `as`; an unbalanced pattern, `as` with nothing, or `as { … }` without `=>` arms, is a reported error. An **unclosed** `as <pattern> { …` (or `as { …`) is treated as a *continuation* — a multi-line block still being typed — so the editor's live linter waits rather than flagging it (`expandProgram` returns it in `incomplete`, not `errors`); running it anyway reports "block not closed — add the closing `}`".
+A non-`capture` macro rejects `as`; an unbalanced pattern, or `as` with no `<pattern> { … }`, is a reported error. An **unclosed** arm block (`as <pat> { …`) is treated as a *continuation* — a multi-line block still being typed — so the editor's live linter waits rather than flagging it (`expandProgram` returns it in `incomplete`, not `errors`); running it anyway reports "block not closed — add the closing `}`".
 
 **`$me`** is a client-side token — resolved to this browser's own REV address (a quoted rholang string) in `expandRholangMacros`, before the program reaches rnode. Write it bare, anywhere a program is built (a `$`-line, the editor, a larger program): `$balance($me)`, `$transfer(10, $me)`. It is not a macro call site (no parens) and only exists where the deploy key is known — `rho:rchain:deployerId` is unbound in an exploratory deploy, so it cannot be resolved on the node. (Bare `me` still works in a `$balance(me)` chat line for convenience.)
 
