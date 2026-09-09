@@ -683,21 +683,34 @@ function expandProgram(src) {
       i = close + 1;
       continue;
     }
-    // Optional capture clause: `$macro(args) as name { …block… }` — the result
-    // the macro would report is instead bound to `name` and the block runs.
-    // Only macros that opt in (`capture: true`) accept it; the rest report to
-    // `return` (eval / the deploy record) as before.
+    // Optional capture clause: `$macro(args) as <pattern> { …block… }` — the
+    // result the macro would report is instead bound by <pattern> and the block
+    // runs. <pattern> is a name or a balanced `(a, b)` / `[a, …rest]` — anything
+    // a rholang `for (@<pattern> <- ret)` accepts — so a reply shaped
+    // `(result, error)`, as many contracts return, destructures directly.
+    // Only macros that opt in (`capture: true`) accept it.
     let end = close + 1;
     let capture = null;
-    const asM = /^\s+as\s+([A-Za-z_][\w']*)\s*\{/.exec(text.slice(end));
-    if (asM) {
-      const braceOpen = end + asM[0].length - 1;
-      const braceClose = matchBracket(text, braceOpen);
-      if (braceClose === -1) {
-        errors.push({ line: lineOf(text, i), message: `${sigil}${name}: unbalanced { after \`as ${asM[1]}\`` });
-        break;
+    const asKw = /^\s+as\s+/.exec(text.slice(end));
+    if (asKw) {
+      let p = end + asKw[0].length;
+      let pattern;
+      if (text[p] === "(" || text[p] === "[") {
+        const pc = matchBracket(text, p);
+        if (pc === -1) { errors.push({ line: lineOf(text, i), message: `${sigil}${name}: unbalanced ${text[p]} in the \`as\` pattern` }); break; }
+        pattern = text.slice(p, pc + 1);
+        p = pc + 1;
+      } else {
+        const idM = /^[A-Za-z_][\w']*/.exec(text.slice(p));
+        if (!idM) { errors.push({ line: lineOf(text, i), message: `${sigil}${name}: \`as\` needs a name or a (…) / […] pattern` }); break; }
+        pattern = idM[0];
+        p += idM[0].length;
       }
-      capture = { name: asM[1], block: text.slice(braceOpen + 1, braceClose).trim() };
+      while (p < text.length && /\s/.test(text[p])) p++;
+      if (text[p] !== "{") { errors.push({ line: lineOf(text, i), message: `${sigil}${name}: expected { after \`as ${pattern}\`` }); break; }
+      const braceClose = matchBracket(text, p);
+      if (braceClose === -1) { errors.push({ line: lineOf(text, i), message: `${sigil}${name}: unbalanced { after \`as ${pattern}\`` }); break; }
+      capture = { pattern, block: text.slice(p + 1, braceClose).trim() };
       end = braceClose + 1;
     }
 
@@ -709,10 +722,10 @@ function expandProgram(src) {
         throw fail(`${sigil}${name} is a local read — it has no rholang; use it on its own line`);
       }
       if (capture && !macro.capture) {
-        throw fail(`${sigil}${name} does not support \`as ${capture.name} { … }\` — it reports to return`);
+        throw fail(`${sigil}${name} does not support \`as … { … }\` — it reports to return`);
       }
       const args = bindArgs(macro, name, splitArgs(text.slice(open + 1, close)));
-      const sink = capture ? `for (@${capture.name} <- ret) {\n    ${capture.block}\n  }` : undefined;
+      const sink = capture ? `for (@${capture.pattern} <- ret) {\n    ${capture.block}\n  }` : undefined;
       out.push(macro.expand(args, sink));
       expansions.push({ name, line: lineOf(text, i), write: !!macro.write });
     } catch (e) {
@@ -831,6 +844,17 @@ function selftest() {
         return r.errors.length === 0 && r.source.includes('match bal { 0 => stdout!("empty")'); }],
     ["capture: unbalanced block brace is an error, not a throw",
       () => P('$balance("a") as bal { stdout!(bal)').errors.length === 1],
+    ["capture: a `(result, error)` tuple pattern destructures the reply",
+      () => { const r = P('$grant("^v><") as (cap, err) { stdout!((cap, err)) }');
+        return r.errors.length === 0 && r.source.includes("for (@(cap, err) <- ret) {"); }],
+    ["capture: a `[a, ...rest]` list pattern is accepted",
+      () => { const r = P('$grant("^v><") as [head, ...tail] { stdout!(head) }');
+        return r.errors.length === 0 && r.source.includes("for (@[head, ...tail] <- ret) {"); }],
+    ["capture: `as` with no name/pattern is a reported error",
+      () => { const r = P('$balance("a") as { Nil }');
+        return r.errors.length === 1 && /needs a name or a/.test(r.errors[0].message); }],
+    ["capture: unbalanced pattern paren is a reported error",
+      () => P('$grant("^v><") as (cap, err { Nil }').errors.length === 1],
   ];
   for (const [name, fn] of progCases) {
     try {
