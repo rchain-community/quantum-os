@@ -139,8 +139,8 @@ export const CMD_HELP: Record<string, string[]> = {
   ],
   macro: [
     "Write a command. `/` is what the app ships; `+` is what somebody here wrote.",
-    "/macro define $name($arg, …)  // what it does   — then the body on the lines below (Shift+Enter for a new line).",
-    "A body of slash commands makes a +command:  /macro define $standup($topic) ⏎ /poll new $topic | yes, no ⏎ /gov say standup on $topic",
+    "/macro define name body   —  or   /macro define name(arg, …) body   — body is the rest of the line, or the lines below (Shift+Enter). An optional `// note` after the signature is its doc.",
+    "A body of slash/`+` commands makes a +command:  /macro define standup(topic) ⏎ /poll new $topic | yes, no ⏎ /gov say standup on $topic",
     "Then anyone in the room runs it: +standup \"Q4 budget\"  (quotes group an argument; topic=… names one).",
     "A body of rholang makes a fragment instead — call it as $name(…) inside /rholang eval or deploy, where its arguments stay rholang terms.",
     "A line beginning with / or + starts a new command; anything else continues the one before it, so a multi-line rholang program can be the argument to /rholang eval.",

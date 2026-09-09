@@ -2348,6 +2348,14 @@ function editRholang(mode: "eval" | "deploy", seed: string, echoOnly = false, ex
       // as typed reports a spurious error on every macro line. Expand (silently)
       // and wrap first; surface an expansion error as the lint error.
       lint: async (raw: string) => {
+        // The editor also accepts a macro definition — `define name(x) <body>`
+        // (or `/macro define …`) — so a fragment written here can be saved as a
+        // `$name(…)` without leaving for the chat box. Lint it as a definition.
+        const def = matchDefineBuffer(raw);
+        if (def !== null) {
+          try { parseDefinition(def); return { ok: true, errors: [] }; }
+          catch (e) { return { ok: false, errors: [(e as Error)?.message ?? String(e)] }; }
+        }
         // A `$macro(…) as <pat> { …` whose block is still being typed is a
         // continuation, not a broken program — reject so the editor clears the
         // status line (its `.catch` does) rather than flashing an error.
@@ -2375,6 +2383,14 @@ function editRholang(mode: "eval" | "deploy", seed: string, echoOnly = false, ex
     // The editor says which button ended it, so the verb that opened it is only
     // a default: a program written to be evaluated can be deployed on the spot.
     const { source, mode: chosen, action } = written;
+    // A macro definition typed into the editor registers rather than runs — the
+    // body is exactly the rholang you would otherwise deploy, now reusable as a
+    // `$name(…)` site.
+    const definition = matchDefineBuffer(source);
+    if (definition !== null) {
+      defineMacro(definition, (t) => addMessage("", t, "system"));
+      return;
+    }
     // The button explains without asking the room; `/rholang explain` asks. The
     // difference is who decided to publish the program, and it should stay the
     // person rather than the button.
@@ -2874,6 +2890,18 @@ function isMyMacro(def: MacroDef): boolean {
  * the same author check the lemma retract and the note series use. That is
  * EIES's rule too: the owner of the file could edit it, and nobody else could.
  */
+/**
+ * A `/rholang` editor buffer that is actually a macro definition — `define
+ * name(x) …` or `/macro define name(x) …`. Returns the definition text (what
+ * `defineMacro` / `parseDefinition` want), or null if it is an ordinary program.
+ */
+function matchDefineBuffer(source: string): string | null {
+  // `define` then something name-shaped — so a rholang program is not mistaken
+  // for one (a bare `define` is not a rholang keyword anyway).
+  const m = /^\s*(?:\/macro\s+)?define\s+([$+]?[A-Za-z][\s\S]*)$/.exec(source ?? "");
+  return m ? m[1].trim() : null;
+}
+
 function defineMacro(text: string, say: (t: string) => void): void {
   let parsed;
   try { parsed = parseDefinition(text); }
@@ -2881,7 +2909,7 @@ function defineMacro(text: string, say: (t: string) => void): void {
 
   const existing = macroStore.get(parsed.name);
   if (existing && !isMyMacro(existing)) {
-    say(`· $${parsed.name} is defined by ${existing.authorLabel} — pick another name, or /forget macro ${parsed.name} to hide theirs`);
+    say(`· ${parsed.name} is defined by ${existing.authorLabel} — pick another name, or /forget macro ${parsed.name} to hide theirs`);
     return;
   }
   // Defining a name I previously retracted is me changing my mind about it.
@@ -2941,7 +2969,7 @@ function runMacroLine(line: string): string[] {
 
   const def = macroStore.get(call.name);
   if (!def) {
-    say(`no +${call.name} command in this room — /macro list, or /macro define $${call.name}(…) to write it`);
+    say(`no +${call.name} command in this room — /macro list, or /macro define ${call.name}(…) <body> to write it`);
     return out;
   }
   if (def.kind === "rholang") {
@@ -3542,13 +3570,25 @@ function handleCommand(raw: string): string[] {
 
       if (sub === "define" || sub === "def") {
         if (!rest.trim()) {
-          sys("usage: /macro define $name($arg, …)  // what it does");
-          sys("  then the body on the following lines (Shift+Enter for a new line):");
-          sys("    /macro define $standup($topic)  // opens a standup poll");
+          sys("usage: /macro define name body   —  or   /macro define name(arg, …) body");
+          sys("  the body is the rest of the line, or the lines below (Shift+Enter for a new line):");
+          sys("    /macro define greet(who) Hi $who, welcome!");
+          sys("    /macro define standup(topic)  // opens a standup poll");
           sys("    /poll new $topic | yes, no, later");
-          sys("    /gov say standup on $topic is open");
-          sys("  a body of rholang instead makes a $name(…) fragment for /rholang");
+          sys("  a body of slash/`+` commands makes a +name command; a body of rholang makes a $name(…) fragment");
+          sys("  signature only (no body) opens the editor to write it: /macro define $name(x)");
           break;
+        }
+        // Signature but no body → open the rholang editor seeded with it, so the
+        // body can be written (and live-linted) there. The editor recognises a
+        // `define …` buffer and registers it on Ctrl+Enter.
+        try {
+          parseDefinition(rest);
+        } catch (e) {
+          if (/no body/.test((e as Error)?.message ?? "")) {
+            editRholang("eval", `define ${rest.trimEnd()}\n`);
+            break;
+          }
         }
         defineMacro(rest, sys);
         break;
@@ -3606,8 +3646,8 @@ function handleCommand(raw: string): string[] {
       // Bare /macro, or /macro list.
       if (macroStore.size === 0) {
         sys("no commands defined in this room yet");
-        sys("  /macro define $name($arg) …  — write one; it is shared with the room");
-        sys("  /macro help                  — the whole verb list");
+        sys("  /macro define name(arg) <body>  — write one; it is shared with the room");
+        sys("  /macro help                     — the whole verb list");
         break;
       }
       sys(`commands in this room (${macroStore.size}):`);
