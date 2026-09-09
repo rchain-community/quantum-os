@@ -314,6 +314,8 @@ export interface MacroProgram {
   source: string;
   expansions: { name: string; line: number; write: boolean }[];
   errors: { line: number; message: string }[];
+  /** A `$macro(…) as <pat> { …` whose block is not yet closed — still being typed, not malformed. */
+  incomplete: { line: number; message: string }[];
 }
 
 /** Expand a bare single macro — the whole program is one macro. */
