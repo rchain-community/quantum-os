@@ -93,10 +93,12 @@ defined. That is how a room grows a vocabulary.
 | `/macro remove <name>` | remove it |
 | `/macro edit <name>[(args)]` | open the editor to write / rewrite the body |
 
-Definitions are **room state**: signed with your identity, sent to everyone,
-replayed to whoever joins later. **First writer wins the name** — only its
-author can change or remove it for everyone; anyone else `/macro remove` only
-hides it from their own view.
+Your macros are **kept in this browser** — not per room — so one you write (or
+pick up from a peer) follows you into every room you join. They are also signed
+with your identity and **contributed to each room**: everyone there can use
+them, and they persist for whoever picks them up. **First writer wins the
+name** — only its author can change or remove it for everyone; anyone else's
+`/macro remove` only hides it from their own view.
 
 ---
 

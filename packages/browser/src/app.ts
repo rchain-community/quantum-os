@@ -295,8 +295,8 @@ interface RoomContext {
   pollCards: Map<string, HTMLElement>;
   // Governance: groupId -> Group (liquid-democracy groups; persisted).
   groupStore: Map<string, Group>;
-  // Macros: name -> definition (Interact2 `+commands`; persisted, synced).
-  macroStore: Map<string, MacroDef>;
+  // (Macros are NOT per-room — they are a per-browser store, `macroStore` below,
+  //  contributed to every room the user joins. See `saveMacros`.)
   // Retraction tombstones: "<kind>:<id>" of removed gossiped items (poll/lemma)
   // so a peer's later sync-* can't heal them back. Persisted per room.
   retracted: Set<string>;
@@ -348,7 +348,6 @@ function createRoom(roomId: string): RoomContext {
     pollStore: new Map(),
     pollCards: new Map(),
     groupStore: new Map(),
-    macroStore: new Map(),
     retracted: new Set(),
     chatLog: loadChat(roomId),
     signalingUrl: DEFAULT_SIGNAL,
@@ -421,7 +420,24 @@ let rhoquHandlers: RhoQuOnHandler[] = [];
 let pollStore: Map<string, Poll> = new Map();
 let pollCards: Map<string, HTMLElement> = new Map();
 let groupStore: Map<string, Group> = new Map();
-let macroStore: Map<string, MacroDef> = new Map();
+// Macros are a per-BROWSER store, not per-room: a `+command` or `$name` you
+// define (or pick up from a peer) follows you into every room. Loaded once at
+// startup, contributed to each room via the join `sync-macros`.
+const macroStore: Map<string, MacroDef> = new Map();
+// Macro removal tombstones, also per-browser, so a `sync-macros` in another
+// room can't heal back one you retracted.
+const macroTombstones: Set<string> = new Set();
+function isMacroTombstoned(name: string): boolean { return macroTombstones.has(String(name).toLowerCase()); }
+function tombstoneMacro(name: string): void {
+  macroTombstones.add(String(name).toLowerCase());
+  try { localStorage.setItem("qos-macro-tombstones", JSON.stringify([...macroTombstones])); } catch { /* full/blocked */ }
+}
+function loadMacroTombstones(): void {
+  try {
+    const raw = localStorage.getItem("qos-macro-tombstones");
+    if (raw) for (const n of JSON.parse(raw) as string[]) macroTombstones.add(String(n).toLowerCase());
+  } catch { /* corrupt */ }
+}
 // groupId that /gov subcommands act on. Persisted per tab so it survives a
 // reload (set via setFocusedGroup).
 let focusedGroup: string | null = (() => { try { return sessionStorage.getItem("qos-focused-group"); } catch { return null; } })();
@@ -468,7 +484,7 @@ function setActiveRoom(ctx: RoomContext): void {
   pollStore          = ctx.pollStore;
   pollCards          = ctx.pollCards;
   groupStore         = ctx.groupStore;
-  macroStore         = ctx.macroStore;
+  // macroStore is per-browser, not aliased per room
   retracted          = ctx.retracted;
 }
 
@@ -696,22 +712,47 @@ interface MacroDef {
   anchor?: string;
 }
 
+const MACROS_KEY = "qos-macros";                 // per browser, not per room
+
 function saveMacros(): void {
-  localStorage.setItem(`qos-macros-${activeRoom.roomId}`,
-    JSON.stringify(Object.fromEntries(macroStore.entries())));
+  try {
+    localStorage.setItem(MACROS_KEY, JSON.stringify(Object.fromEntries(macroStore.entries())));
+  } catch { /* storage full / blocked */ }
 }
 
 function loadMacros(): void {
-  const raw = localStorage.getItem(`qos-macros-${activeRoom.roomId}`);
-  if (!raw) return;
+  loadMacroTombstones();
   try {
-    const data = JSON.parse(raw) as Record<string, MacroDef>;
-    for (const [name, def] of Object.entries(data)) macroStore.set(name, def);
-    renderMacros();
-  } catch { /* ignore corrupt data */ }
+    const raw = localStorage.getItem(MACROS_KEY);
+    if (raw) {
+      const data = JSON.parse(raw) as Record<string, MacroDef>;
+      for (const [name, def] of Object.entries(data)) macroStore.set(name, def);
+    }
+    // One-time migration: earlier builds keyed macros per room. Fold every
+    // `qos-macros-<roomId>` into the single store (newest `at` wins) and drop
+    // the old keys.
+    const legacy: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith("qos-macros-")) legacy.push(k);
+    }
+    for (const k of legacy) {
+      try {
+        const data = JSON.parse(localStorage.getItem(k) || "{}") as Record<string, MacroDef>;
+        for (const [name, def] of Object.entries(data)) {
+          const cur = macroStore.get(name);
+          if (!cur || (def.at ?? 0) > (cur.at ?? 0)) macroStore.set(name, def);
+        }
+      } catch { /* skip */ }
+      localStorage.removeItem(k);
+    }
+    if (legacy.length) saveMacros();
+  } catch { /* corrupt */ }
+  for (const n of [...macroStore.keys()]) if (isMacroTombstoned(n)) macroStore.delete(n);
+  renderMacros();
 }
 
-/** The lookup `macro-lang` expands against — the room's macros, by name. */
+/** The lookup `macro-lang` expands against — this browser's macros, by name. */
 const macroLookup = (name: string): MacroDef | undefined => macroStore.get(String(name).toLowerCase());
 
 function loadPolls(): void {
@@ -1503,7 +1544,6 @@ function loadRoomState(ctx: RoomContext): void {
   loadNotes();
   loadPolls();
   loadGroups();
-  loadMacros();
   loadRetracted();
   if (previousActive) setActiveRoom(previousActive);
 }
@@ -2910,8 +2950,9 @@ function defineMacro(text: string, say: (t: string) => void): void {
     return;
   }
   // Defining a name I previously retracted is me changing my mind about it.
-  retracted.delete(tombKey("macro", parsed.name));
-  saveRetracted();
+  if (macroTombstones.delete(parsed.name)) {
+    try { localStorage.setItem("qos-macro-tombstones", JSON.stringify([...macroTombstones])); } catch { /* */ }
+  }
 
   const def: MacroDef = {
     ...parsed,
@@ -2939,7 +2980,7 @@ function forgetMacro(name: string): void {
   const def = macroStore.get(key);
   if (!def) { addMessage("", `no macro $${key}`, "system"); return; }
   const mine = isMyMacro(def);
-  markRetracted("macro", key);
+  tombstoneMacro(key);
   macroStore.delete(key);
   saveMacros();
   renderMacros();
@@ -3690,13 +3731,13 @@ function handleCommand(raw: string): string[] {
 
       // Bare /macro, or /macro list.
       if (macroStore.size === 0) {
-        sys("no macros defined in this room yet");
-        sys("  /macro define name(arg) <body>  — write one; it is shared with the room");
+        sys("no macros yet");
+        sys("  /macro define name(arg) <body>  — write one; kept in this browser, shared with every room you join");
         sys("  /macro edit name(arg)           — …or write the body in the editor");
         sys("  /macro help                     — the whole verb list");
         break;
       }
-      sys(`macros in this room (${macroStore.size}):`);
+      sys(`your macros (${macroStore.size}) — kept in this browser, contributed to every room:`);
       for (const d of [...macroStore.values()].sort((a, b) => a.name.localeCompare(b.name))) {
         const tag = d.kind === "command" ? "" : d.kind === "text" ? "  [text]" : "  [rholang]";
         sys(`  ${macroCallForm(d)}${tag}${d.doc ? `  — ${d.doc}` : ""}  (by ${d.authorLabel})`);
@@ -7380,7 +7421,7 @@ async function connect(): Promise<void> {
             // Author only, by anchor — same check as a lemma retract.
             const senderAnchor = dyncapChains.get(from)?.anchor;
             if (!def || !def.anchor || !senderAnchor || def.anchor !== senderAnchor) return;
-            markRetracted("macro", id.toLowerCase());
+            tombstoneMacro(id.toLowerCase());
             macroStore.delete(id.toLowerCase());
             saveMacros();
             renderMacros();
@@ -7403,7 +7444,7 @@ async function connect(): Promise<void> {
           if (status.startsWith("  · refused")) return;
           const def = macroFromWire(d, from);
           if (!def) return;
-          if (isRetracted("macro", def.name)) return;             // I removed it; don't heal it back
+          if (isMacroTombstoned(def.name)) return;             // I removed it; don't heal it back
           const existing = macroStore.get(def.name);
           // First writer wins the name, and only that author may replace the
           // definition. Without the anchor check any peer could redefine
@@ -7430,7 +7471,7 @@ async function connect(): Promise<void> {
             if (!raw || typeof raw !== "object") continue;
             const def = macroFromWire(raw as Record<string, unknown>, from);
             if (!def) continue;
-            if (isRetracted("macro", def.name)) continue;
+            if (isMacroTombstoned(def.name)) continue;
             const existing = macroStore.get(def.name);
             // A forwarded definition carries its original author's chain step,
             // so a later edit still only lands under the same anchor.
@@ -9579,6 +9620,7 @@ async function init(): Promise<void> {
   loadNotes();
   loadPolls();
   loadGroups();
+  loadMacros();
   loadRetracted();
 
   // Restore any rooms the user had joined in previous sessions (besides the
