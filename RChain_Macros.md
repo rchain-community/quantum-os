@@ -5,6 +5,9 @@
 > `%` capability library that ships with the app and expands inside a
 > `/rholang` program. Tracked in
 > [#65](https://github.com/rchain-community/quantum-os/issues/65).
+>
+> **This is the design & history.** For a hands‑on guide that assumes no rholang,
+> see **[MacRhoLang.md](MacRhoLang.md)**.
 
 ## Where this comes from
 
