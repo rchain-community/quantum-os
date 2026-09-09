@@ -7684,6 +7684,13 @@ function send(): void {
     runMacroLine(text);
     return;
   }
+  // `$name(…)` runs a chain macro (see runDollarLine); `$( … )` is an inline
+  // program. `$1`, `$5 agreed`, a bare `$` — all chat.
+  if (/^\$[A-Za-z][A-Za-z0-9_-]*/.test(text) || /^\$\s*\(/.test(text)) {
+    addMessage("", text, "self");
+    runDollarLine(text);
+    return;
+  }
   if (text.startsWith("/")) {
     const parts = text.slice(1).trim().split(/\s+/);
     const cmd = parts[0].toLowerCase();
