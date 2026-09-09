@@ -21,14 +21,17 @@ produce is invoked `+name args`. `++text` escapes a literal `+` line to chat, an
 only an identifier-shaped name is read as an invocation — so `+1` is agreement,
 not a call.
 
-**Two halves, decided by the body.** `bodyKind()` reads the first non-blank
-line: starting with `/` or `+` makes a **command** macro (invokable as `+name`);
-anything else makes a **rholang** fragment, invokable only as a `$name(…)` call
-site inside `/rholang eval|deploy|echo`. Nothing declares the kind — and
-`macroFromWire` re-derives it from the body rather than believing the sender, so
-peers cannot disagree about what one definition is. A `+command` reaches the
-chain by having `/rholang eval` in its body, so the two halves compose with no
-third mechanism.
+**Three kinds, decided by the body** (`bodyKind()`): first non-blank line starts
+`/` or `+` → **command** (invokable `+name`); the body has rholang syntax (a `!`
+send, a `` `powerbox` `` name, `for`/`match`/`contract`/`new … in {`, `<-`,
+`=>`) → **rholang** fragment (a `$name(…)` call site inside `/rholang
+eval|deploy|echo`); anything else → **text** (substitution only — `$name` yields
+its body). Nothing declares the kind, and `macroFromWire` re-derives it from the
+body rather than believing the sender, so peers cannot disagree. A bare `$name`
+line for a room macro is **shown, not run** (`showRoomMacro`) — a stray `$x`
+never signs a deploy; `/rholang eval $name(…)` / `deploy` run it explicitly. A
+`+command` reaches the chain by having `/rholang eval` in its body.
+`/macro edit <name>[(args)]` opens the editor on the definition.
 
 **The two halves have different lexical rules, and this is the subtle part.**
 `substitute` and `expandCallSites` take `lexical: "rholang" | "text"`:
