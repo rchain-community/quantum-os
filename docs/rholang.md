@@ -84,9 +84,17 @@ Bridges a room to an RChain chain: a room's state is ephemeral, a deploy is not.
 
 **`$name(…)` as a room line.** Typed as its own line (routed by `runInput` alongside `+`), `$name(…)` runs the macro directly: `$verify(@x)` is answered in-browser; `$balance($me)` runs an unsigned `/rholang eval`; `$transfer(10, "1111…")` / `$anchor(…)` open the deploy path; `$( new x in { $anchor(…) } )` is a full inline program (deploy unless every site is a read). `macroMode(name)` in `rholang-macros.js` decides — `read-local` / `eval` / `deploy` / `null`.
 
-**`$macro(…) as <pattern> { …block… }` — capture.** A macro that opts in (`capture: true` — `$balance`, `$transfer`, `$grant`) binds its result by `<pattern>` and runs a supplied block instead of reporting to `return`: `$balance($me) as bal { stdout!(("balance", bal)) }` expands to `… *ret) | for (@bal <- ret) { stdout!(("balance", bal)) }`. Without `as`, the macro reports as before (`$transfer`'s friendly "transfer ok" / a value on `return` for eval / the deploy record). With `as`, you get the **raw** channel reply and full control — the composition primitive: `$transfer(10, a) as r { $balance($me) as b { return!(("done", r, b)) } }`.
+**`$macro(…) as <pattern> { …block… }` — capture.** A macro that opts in (`capture: true` — `$balance`, `$transfer`, `$grant`) binds its result by `<pattern>` and runs a supplied block instead of reporting to `return`: `$balance($me) as bal { stdout!(("balance", bal)) }` expands to `… *ret) | for (@bal <- ret) { stdout!(("balance", bal)) }`. Without `as`, the macro's own reporting runs (a value on `return` for eval / the deploy record). With `as`, the block runs instead — the composition primitive: `$transfer(10, a) as (_, err) { $balance($me) as b { return!(("done", err, b)) } }`.
 
-`<pattern>` is a name **or** a balanced `(a, b)` / `[a, …rest]` — anything a rholang `for (@<pattern> <- ret)` accepts — so a reply shaped `(result, error)`, as many contracts return, destructures directly: `$someContract(…) as (result, error) { match error { Nil => use!(result)  _ => stdout!(("failed", error)) } }`. A `for` with a pattern fires only when the reply matches it, so match the shape the macro actually replies (each capture macro's `help` says which). A non-`capture` macro rejects `as`; an unbalanced pattern or block, or `as` with nothing, is a reported error.
+`<pattern>` is a name **or** a balanced `(a, b)` / `[a, …rest]` — anything a rholang `for (@<pattern> <- ret)` accepts. **Match the shape the macro replies** — a `for` with a pattern only fires when the reply matches it, and each capture macro's `help` states its shape:
+
+| macro | reply the block sees |
+|---|---|
+| `$balance` | the balance, an integer — `as bal { … }` |
+| `$grant` | the minted capability (raw reply) — `as cap { … }` |
+| `$transfer` | **`(result, error)`** — `result` is `("transfer ok", amount, to)` on success and `Nil` on failure; `error` is the failure string or `Nil`. `$transfer(50, a) as (result, error) { match error { Nil => use!(result)  _ => stdout!(("failed", error)) } }`. (The raw revVault reply is just `Nil`/a string; the macro normalises it to this two-slot shape for both capture *and* its default reporting.) |
+
+A non-`capture` macro rejects `as`; an unbalanced pattern or block, or `as` with nothing, is a reported error.
 
 **`$me`** is a client-side token — resolved to this browser's own REV address (a quoted rholang string) in `expandRholangMacros`, before the program reaches rnode. Write it bare, anywhere a program is built (a `$`-line, the editor, a larger program): `$balance($me)`, `$transfer(10, $me)`. It is not a macro call site (no parens) and only exists where the deploy key is known — `rho:rchain:deployerId` is unbound in an exploratory deploy, so it cannot be resolved on the node. (Bare `me` still works in a `$balance(me)` chat line for convenience.)
 
