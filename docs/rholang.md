@@ -63,15 +63,22 @@ as written. `$` being lexically illegal in rholang is what makes that safe: an
 unexpanded site is a hard error at rnode, never something that quietly means
 the wrong thing. (`%` is rholang's modulo operator, so it carries no such guarantee.)
 
-**Storage is the room, not the chain.** `macroStore` is per-`RoomContext`,
-persisted `qos-macros-<room>`, broadcast as a dyncap-signed `macro-define`,
-replayed to joiners via `sync-macros`, and tombstoned through the existing
-`retract` machinery (kind `"macro"`). **First writer wins a name and only that
-author may redefine or retract it, matched by dyncap `anchor`** — `MacroDef`
-stores the anchor rather than a chain step, because a reload mints a new peerId
-and would otherwise cost you your own commands. That is the room ("group") tier
-of EIES's personal → group → system hierarchy; the on-chain dictionary (public /
-federated tier, behind a capability) is designed and not built.
+**Storage is your browser, not the room and not the chain.** `macroStore` is a
+module-level `const` — **not** in `RoomContext` — persisted `qos-macros` (one
+key, not per room; a one-time migration folds any legacy `qos-macros-<room>`),
+loaded once at startup. A macro you write or pick up follows you into every room
+you join. It is still a dyncap-signed `macro-define` broadcast, replayed to a
+room's joiners via `sync-macros`, so peers get it and it persists for them too.
+Removal tombstones are per-browser as well (`macroTombstones` /
+`qos-macro-tombstones`, `isMacroTombstoned` / `tombstoneMacro`), so a
+`sync-macros` in a *different* room cannot heal back one you retracted — the
+generic `retract` machinery (kind `"macro"`) still carries the wire envelope.
+**First writer wins a name and only that author may redefine or retract it,
+matched by dyncap `anchor`** — `MacroDef` stores the anchor rather than a chain
+step, because a reload mints a new peerId and would otherwise cost you your own
+commands. This is the *personal* tier of EIES's personal → group → system
+hierarchy; the on-chain dictionary (public / federated tier, behind a
+capability) is designed and not built.
 
 Recursion is bounded twice: `MAX_DEPTH` inside expansion, and `MACRO_RUN_DEPTH`
 in `runMacroLine` for a body that invokes another body at runtime. `runInput()`

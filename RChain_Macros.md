@@ -192,19 +192,21 @@ rather than something that quietly means the wrong thing.
 
 ## Where definitions live
 
-A definition is **room state**: signed with the author's dyncap, broadcast to
-the room, replayed to whoever joins next, and tombstoned when retracted — the
-same shape as a lemma, and the same code path. It needs no node, no key and no
-chain, so a room can write and share commands the moment two peers are in it.
+A definition lives **in your browser** (`qos-macros`, one key — not per room), so
+a macro you write or pick up follows you into every room you join. It is also
+signed with the author's dyncap and **contributed to each room** — broadcast on
+change, replayed to whoever joins next via `sync-macros`, tombstoned per browser
+when retracted. It needs no node, no key and no chain, so a room can write and
+share commands the moment two peers are in it.
 
 That maps EIES's hierarchy onto what this system already has:
 
 | tier | what it is | built |
 |---|---|---|
 | local | macro files in a directory on your machine | no |
-| personal | a definition in your browser | yes |
+| personal | a definition in your browser, kept across every room | yes |
 | fork | a library in your fork of quantum-os, shared by pull request | the `%` library is this |
-| group | a definition shared with the room | yes |
+| group | a personal definition contributed into a room (peers pick it up) | yes |
 | chain | a name in a locker, reached by capability | no |
 
 ### A fork is a library, and a pull request is how it is shared
