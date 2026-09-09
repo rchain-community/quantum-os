@@ -99,6 +99,7 @@ governance to each other, so a lemma proven in one room becomes a lemma in the o
 | formal weighted vote | `/gov issue` · `/gov vote` | [Governance](Governance.md) |
 | record a decision | `/lemma` · `/persist` | [Group Decisions](Group_Decisions.md) |
 | cooperate across rooms | `/room` · `/share` · `bridge.mjs` | [Room Bridges](Room_Bridges.md) |
+| write your own command | `/macro define name(a) …` then `+name` | [MacRhoLang](MacRhoLang.md) |
 | see the room | `/render` | — |
 
 ## See it in action

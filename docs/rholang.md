@@ -2,7 +2,8 @@
 
 Detail split out of [CLAUDE.md](../CLAUDE.md). Covers the Interact2 `$`/`+` macro
 language, the `%` capability-macro registry, and the `/rholang` chain client.
-Reference docs: [RChain_Macros.md](../RChain_Macros.md).
+Reference docs: [RChain_Macros.md](../RChain_Macros.md) (design & history),
+[MacRhoLang.md](../MacRhoLang.md) (the user's guide — no rholang assumed).
 
 ---
 
