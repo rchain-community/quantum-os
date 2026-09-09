@@ -2343,7 +2343,25 @@ function editRholang(mode: "eval" | "deploy", seed: string, echoOnly = false, ex
           return "not answering";
         }
       },
-      lint: lintRholang,
+      // Lint what would actually be sent, not the raw buffer: `$macro(…)` and a
+      // `… as (a, b) { … }` capture clause are not rholang, so linting the text
+      // as typed reports a spurious error on every macro line. Expand (silently)
+      // and wrap first; surface an expansion error as the lint error.
+      lint: async (raw: string) => {
+        const notes: string[] = [];
+        let program: string;
+        try {
+          const expanded = expandRholangMacros(raw, (t) => { if (t.startsWith("✗")) notes.push(t.replace(/^✗\s*/, "")); });
+          if (notes.length) return { ok: false, errors: notes };
+          const cfg2 = loadNodeConfig();
+          program = mode === "deploy"
+            ? wrapProgram(expanded, "deploy", cfg2.resultNonce ?? 1)
+            : wrapProgram(expanded, "eval");
+        } catch (e) {
+          return { ok: false, errors: [(e as Error)?.message ?? String(e)] };
+        }
+        return lintRholang(program);
+      },
       // Per device, not per room: a program is written against an rnode, and the
       // same one is usually run from whichever room you happen to be in.
       draftKey: "qos-rholang-draft",

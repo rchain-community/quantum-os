@@ -152,13 +152,16 @@ const MACROS = {
   grant: {
     help: "Mint a ZFA-balanced proof as a capability (rho:qucalc:grant).",
     write: true,
-    capture: true,   // $grant("^v><") as cap { … } — the cap is bound, not returned
+    capture: true,   // $grant("^v><") as cap { … } — cap is the raw reply (the minted capability)
     argSpec: [["twists", "twists"]],
-    expand(args, sink) {
+    expand(args, capture) {
       const list = args.twists.join(", ");
+      const sink = capture
+        ? `for (@${capture.pattern} <- ret) {\n    ${capture.block}\n  }`
+        : "for (@__r <- ret) { return!(__r) }";
       return `new grant(\`rho:qucalc:grant\`), ret in {
   grant!([${list}], *ret) |
-  ${sink ?? "for (@__r <- ret) { return!(__r) }"}
+  ${sink}
 }`;
     },
   },
@@ -416,26 +419,43 @@ ${seats.join(" |\n")} |
   },
 
   transfer: {
-    help: "Transfer REV to an address (rho:rchain:revVault). Returns Nil on success.",
+    help: "Transfer REV to an address (rho:rchain:revVault). Captured shape: (result, error) — result is (\"transfer ok\", amount, to) on success and Nil on failure; error is the failure string or Nil.",
     write: true,
-    capture: true,   // $transfer(10, a) as r { … } — r is the raw reply (Nil / error string)
+    capture: true,   // $transfer(10, a) as (result, error) { … }
     argSpec: [["amount", "int"], ["to", "string"]],
-    expand(args, sink) {
+    expand(args, capture) {
       // The revVault on the shipped bin/rnode takes the deployerId process
       // directly (not a from-address resolved via rho:rev:address), then the
       // to-address string, the amount, and a return channel — verified live.
-      // Default sink: a success replies Nil, a failure an error string; report
-      // which so `/rholang read` shows more than a bare Nil. `as r { … }`
-      // hands the raw reply straight to the block instead.
-      const s = sink ?? `for (@r <- ret) {
+      // The raw reply is just Nil (success) or an error string (failure) — an
+      // awkward thing to compose with — so both the default reporting and a
+      // capture see a normalised `(result, error)` tuple instead: the standard
+      // two-slot shape, so `as (result, error) { … }` or `as (ok, _) { … }`
+      // both read naturally.
+      const call = `revVault!("transfer", *deployerId, ${q(args.to)}, ${args.amount}, *ret)`;
+      const ok = `("transfer ok", ${args.amount}, ${q(args.to)})`;
+      if (!capture) {
+        return `new revVault(\`rho:rchain:revVault\`), deployerId(\`rho:rchain:deployerId\`), ret in {
+  ${call} |
+  for (@r <- ret) {
     match r {
-      Nil => return!(("transfer ok", ${args.amount}, ${q(args.to)}))
-      _   => return!(("transfer FAILED", r))
+      Nil => return!((${ok}, Nil))
+      _   => return!((Nil, r))
     }
-  }`;
-      return `new revVault(\`rho:rchain:revVault\`), deployerId(\`rho:rchain:deployerId\`), ret in {
-  revVault!("transfer", *deployerId, ${q(args.to)}, ${args.amount}, *ret) |
-  ${s}
+  }
+}`;
+      }
+      return `new revVault(\`rho:rchain:revVault\`), deployerId(\`rho:rchain:deployerId\`), ret, __outcome in {
+  ${call} |
+  for (@r <- ret) {
+    match r {
+      Nil => __outcome!((${ok}, Nil))
+      _   => __outcome!((Nil, r))
+    }
+  } |
+  for (@${capture.pattern} <- __outcome) {
+    ${capture.block}
+  }
 }`;
     },
   },
@@ -448,12 +468,15 @@ ${seats.join(" |\n")} |
   balance: {
     help: "Read a REV balance (rho:rchain:revVault). Arg: a REV address, or $me.",
     write: false,
-    capture: true,   // $balance($me) as bal { … } — bal is the int, block runs
+    capture: true,   // $balance($me) as bal { … } — bal is the raw reply (the balance int)
     argSpec: [["addr", "string"]],
-    expand(args, sink) {
+    expand(args, capture) {
+      const sink = capture
+        ? `for (@${capture.pattern} <- ret) {\n    ${capture.block}\n  }`
+        : "for (@__r <- ret) { return!(__r) }";
       return `new revVault(\`rho:rchain:revVault\`), ret in {
   revVault!("getBalance", ${q(args.addr)}, *ret) |
-  ${sink ?? "for (@__r <- ret) { return!(__r) }"}
+  ${sink}
 }`;
     },
   },
@@ -725,8 +748,11 @@ function expandProgram(src) {
         throw fail(`${sigil}${name} does not support \`as … { … }\` — it reports to return`);
       }
       const args = bindArgs(macro, name, splitArgs(text.slice(open + 1, close)));
-      const sink = capture ? `for (@${capture.pattern} <- ret) {\n    ${capture.block}\n  }` : undefined;
-      out.push(macro.expand(args, sink));
+      // `capture` is `{ pattern, block }` or null. A macro that opts in builds
+      // its own `for (@<pattern> <- …) { <block> }` around whichever channel
+      // carries the value the block should see — usually `ret` (the raw reply),
+      // but `$transfer` normalises first (see its `expand`).
+      out.push(macro.expand(args, capture));
       expansions.push({ name, line: lineOf(text, i), write: !!macro.write });
     } catch (e) {
       errors.push({ line: lineOf(text, i), message: e?.message ?? String(e) });
@@ -833,9 +859,15 @@ function selftest() {
           && !r.source.includes("return!"); }],
     ["capture: default (no `as`) still reports to return",
       () => P('$balance("a")').source.includes("return!")],
-    ["capture: $transfer(10, a) as r { … } hands r the raw reply",
-      () => { const r = P('$transfer(10, "a") as r { stdout!(r) }');
-        return /for \(@r <- ret\) \{\s*stdout!\(r\)\s*\}/.test(r.source) && !r.source.includes("transfer ok"); }],
+    ["capture: $transfer as (result, error) normalises the reply into a tuple",
+      () => { const r = P('$transfer(10, "a") as (result, error) { stdout!((result, error)) }');
+        return r.errors.length === 0
+          && r.source.includes("for (@(result, error) <- __outcome) {")
+          && r.source.includes('Nil => __outcome!((("transfer ok", 10, "a"), Nil))')
+          && r.source.includes("_   => __outcome!((Nil, r))"); }],
+    ["capture: $transfer default reporting is the same (result, error) shape",
+      () => { const s = P('$transfer(10, "a")').source;
+        return s.includes('return!((("transfer ok", 10, "a"), Nil))') && s.includes("return!((Nil, r))"); }],
     ["capture: a macro without `capture` rejects `as`",
       () => { const r = P('$directory("x") as d { Nil }');
         return r.errors.length === 1 && /does not support `as/.test(r.errors[0].message); }],
