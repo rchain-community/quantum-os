@@ -2271,7 +2271,7 @@ const RHOLANG_HELP = [
   "  /rholang powerbox      — the names every program gets, and what each one takes.",
   "  /rholang macros        — the approved capability macro library ($name sites).",
   "  /rholang macro <n> …   — expand one macro on its own, when it is the whole program.",
-  "  $name(args)            — run a chain macro straight from the room line: $balance(me),",
+  "  $name(args)            — run a chain macro straight from the room line: $balance($me),",
   "                           $transfer(10, \"1111…\"), $verify(@x), $( …inline program… ).",
   "",
   "  The locker — your names and your identity record, kept on chain:",
@@ -2575,6 +2575,26 @@ async function explainRholangAsync(mode: "eval" | "deploy", source: string, cfg:
  */
 function expandRholangMacros(source: string, say: (t: string) => void): string {
   let out = source;
+  // `$me` — a client-side token, resolved to this browser's own REV address (a
+  // quoted rholang string) before the program reaches rnode. Write it bare:
+  // `$balance($me)`, `$transfer(10, $me)`. It is not a macro call site (no
+  // parens), so the scanners below leave it alone; it only exists here, where
+  // the deploy key is known. `me` (no `$`) still works in a `$balance(me)` chat
+  // line for convenience.
+  if (/\$me\b/.test(out)) {
+    const key = loadNodeConfig().key;
+    if (!key) {
+      say("✗ $me needs a deploy key — /rholang key generate, or /rholang key <hex>");
+    } else {
+      try {
+        const addr = revAddressOf(key);
+        out = out.replace(/\$me\b/g, JSON.stringify(addr));
+        say(`  · $me → ${addr}`);
+      } catch {
+        say("✗ $me: the stored key is not a valid secp256k1 key");
+      }
+    }
+  }
   if (out.includes("%") || out.includes("$")) {
     const p = expandMacroProgram(out);      // built-in library — `$name(` and legacy `%name(`
     for (const err of p.errors) say(`✗ line ${err.line}: ${err.message}`);
@@ -2890,7 +2910,7 @@ function runInput(text: string): string[] {
  * in rholang, so a missed expansion is a hard error at rnode, never silent).
  *
  *   $verify(@x)                 — a local read, answered here
- *   $balance(me)               — a chain read, unsigned `/rholang eval`
+ *   $balance($me)              — a chain read, unsigned `/rholang eval` ($me = your address)
  *   $transfer(10, "1111…")     — a write, `/rholang deploy` (signs, opens the editor)
  *   $( new x in { $anchor(@d, "^v", "note") } )   — a full inline program
  *
