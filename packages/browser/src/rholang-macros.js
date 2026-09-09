@@ -415,17 +415,17 @@ ${seats.join(" |\n")} |
   },
 
   transfer: {
-    help: "Transfer REV to an address (rho:rchain:revVault).",
+    help: "Transfer REV to an address (rho:rchain:revVault). Returns Nil on success.",
     write: true,
     argSpec: [["amount", "int"], ["to", "string"]],
     expand(args) {
-      return `new revAddress(\`rho:rev:address\`), revVault(\`rho:rchain:revVault\`),
-    deployerId(\`rho:rchain:deployerId\`), fromCh, ret in {
-  revAddress!("fromDeployerId", *deployerId, *fromCh) |
-  for (@from <- fromCh) {
-    revVault!("transfer", [from, ${q(args.to)}, ${args.amount}, *ret]) |
-    for (@r <- ret) { return!(r) }
-  }
+      // The revVault on the shipped bin/rnode takes the deployerId process
+      // directly (not a from-address resolved via rho:rev:address), then the
+      // to-address string, the amount, and a return channel — verified live.
+      // A success replies Nil; a failure replies an error string.
+      return `new revVault(\`rho:rchain:revVault\`), deployerId(\`rho:rchain:deployerId\`), ret in {
+  revVault!("transfer", *deployerId, ${q(args.to)}, ${args.amount}, *ret) |
+  for (@r <- ret) { return!(r) }
 }`;
     },
   },
@@ -722,7 +722,7 @@ function selftest() {
     ["transfer 10 bob", (r) => r.kind === "rholang" && r.source.includes("revVault!")],
     // amounts past 2^53 must survive verbatim, not be rounded through a double:
     ["transfer 12345678901234567890 bob",
-      (r) => r.source.includes("12345678901234567890, *ret]")],
+      (r) => r.source.includes("12345678901234567890, *ret)")],
     ["transfer 0x10 bob", () => { throw new Error("should have been rejected"); }],
     ["transfer 1e9 bob", () => { throw new Error("should have been rejected"); }],
     // hygiene / injection must be rejected:
