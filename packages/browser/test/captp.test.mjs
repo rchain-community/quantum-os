@@ -1,11 +1,11 @@
-// ctp.test.mjs — capability transport: bridge identity + derived room (Phase 1).
+// captp.test.mjs — capability transport: bridge identity + derived room (Phase 1).
 //
-// Covers `ctp.ts`: shard-ref normalization, the order-independent pair key,
+// Covers `captp.ts`: shard-ref normalization, the order-independent pair key,
 // and — the load-bearing bit — that `deriveBridgeRoom` is deterministic,
 // order-independent, owner-bound, and always yields a token that passes the
 // kernel's `validateCapability` (count balance ∧ Pauli closure).
 //
-//   node packages/browser/test/ctp.test.mjs
+//   node packages/browser/test/captp.test.mjs
 
 import { build } from "esbuild";
 import { fileURLToPath } from "node:url";
@@ -15,7 +15,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 
 const bundle = await build({
   absWorkingDir: here,
-  entryPoints: [join(here, "..", "src", "ctp.ts")],
+  entryPoints: [join(here, "..", "src", "captp.ts")],
   bundle: true, format: "esm", platform: "node", write: false,
   external: ["@quantum-os/zfa-core"], // WASM — pure-TS fallback on this path
 });
@@ -35,8 +35,8 @@ const { validateCapability } = await import(
 const {
   ownerId, normalizeShardRef, bridgePairKey, bridgeVaultHandle,
   deriveBridgeRoom, makeBridge, bridgeSpecIsConsistent,
-  newTransferId, transferNonce, ctpConservationCheck, ctpAdvance,
-  ctpOfferFromWire, burnReceiptFromWire, mintReceiptFromWire, ctpReceiptFromWire,
+  newTransferId, transferNonce, captpConservationCheck, captpAdvance,
+  captpOfferFromWire, burnReceiptFromWire, mintReceiptFromWire, captpReceiptFromWire,
   burnReceiptToTuple, burnReceiptFromTuple,
 } = mod;
 
@@ -75,7 +75,7 @@ const B = "http://127.0.0.1:40404";
   ok("pair key is 16 hex", /^[0-9a-f]{16}$/.test(bridgePairKey(A, B)));
   ok("different pairs differ", bridgePairKey(A, B) !== bridgePairKey(A, "http://127.0.0.1:40405"));
   ok("normalization feeds the key", bridgePairKey("127.0.0.1:40403", B) === bridgePairKey(A, B));
-  ok("vault handle namespaced", bridgeVaultHandle(A, B) === `ctp:${bridgePairKey(A, B)}`);
+  ok("vault handle namespaced", bridgeVaultHandle(A, B) === `captp:${bridgePairKey(A, B)}`);
 }
 
 // --- deriveBridgeRoom ---------------------------------------------------
@@ -116,58 +116,58 @@ const B = "http://127.0.0.1:40404";
   const a = newTransferId(), b = newTransferId();
   ok("transfer id is 16 hex", /^[0-9a-f]{16}$/.test(a));
   ok("transfer ids differ", a !== b);
-  ok("nonce is a pure function of the id", transferNonce(a) === transferNonce(a) && transferNonce(a) === `ctp-${a}`);
+  ok("nonce is a pure function of the id", transferNonce(a) === transferNonce(a) && transferNonce(a) === `captp-${a}`);
   ok("nonce accepts an offer or an id", transferNonce({ id: a }) === transferNonce(a));
 }
 
 // --- conservation -----------------------------------------------------
 {
-  const burn = { tag: "ctp-burn", srcShard: "root", subject: "1111x", amount: "30", nonce: "ctp-1", destAddr: "1111bob" };
-  const mint = { tag: "ctp-mint", dstShard: "shard-b", srcShard: "root", destAddr: "1111bob", amount: "30", nonce: "ctp-1" };
-  ok("matching burn/mint conserve", ctpConservationCheck(burn, mint));
-  ok("amount mismatch fails", !ctpConservationCheck(burn, { ...mint, amount: "31" }));
-  ok("nonce mismatch fails", !ctpConservationCheck(burn, { ...mint, nonce: "ctp-2" }));
-  ok("dest mismatch fails", !ctpConservationCheck(burn, { ...mint, destAddr: "1111eve" }));
-  ok("non-numeric amount fails", !ctpConservationCheck({ ...burn, amount: "3e1" }, { ...mint, amount: "3e1" }));
+  const burn = { tag: "captp-burn", srcShard: "root", subject: "1111x", amount: "30", nonce: "captp-1", destAddr: "1111bob" };
+  const mint = { tag: "captp-mint", dstShard: "shard-b", srcShard: "root", destAddr: "1111bob", amount: "30", nonce: "captp-1" };
+  ok("matching burn/mint conserve", captpConservationCheck(burn, mint));
+  ok("amount mismatch fails", !captpConservationCheck(burn, { ...mint, amount: "31" }));
+  ok("nonce mismatch fails", !captpConservationCheck(burn, { ...mint, nonce: "captp-2" }));
+  ok("dest mismatch fails", !captpConservationCheck(burn, { ...mint, destAddr: "1111eve" }));
+  ok("non-numeric amount fails", !captpConservationCheck({ ...burn, amount: "3e1" }, { ...mint, amount: "3e1" }));
 }
 
 // --- state machine ---------------------------------------------------
 {
   const offer = { id: "abc", pair: bridgePairKey(A, B), srcShard: A, dstShard: B, what: "value", amount: "30", destAddr: "1111bob", by: "p1", at: 1, expiresAt: 9 };
-  const burn = { tag: "ctp-burn", srcShard: "root", subject: "1111x", amount: "30", nonce: transferNonce("abc"), destAddr: "1111bob" };
-  const mint = { tag: "ctp-mint", dstShard: "shard-b", srcShard: "root", destAddr: "1111bob", amount: "30", nonce: transferNonce("abc") };
+  const burn = { tag: "captp-burn", srcShard: "root", subject: "1111x", amount: "30", nonce: transferNonce("abc"), destAddr: "1111bob" };
+  const mint = { tag: "captp-mint", dstShard: "shard-b", srcShard: "root", destAddr: "1111bob", amount: "30", nonce: transferNonce("abc") };
   let t = { offer, status: "offered", updatedAt: 0 };
 
   const t0 = t;
-  t = ctpAdvance(t, { k: "mint", mint }, 1);
+  t = captpAdvance(t, { k: "mint", mint }, 1);
   ok("mint before lock is a no-op", t === t0);
 
-  t = ctpAdvance(t, { k: "lock", burn }, 2);
+  t = captpAdvance(t, { k: "lock", burn }, 2);
   ok("lock advances offered → locked", t.status === "locked" && t.burn === burn);
 
   const tLocked = t;
-  t = ctpAdvance(t, { k: "lock", burn }, 3);
+  t = captpAdvance(t, { k: "lock", burn }, 3);
   ok("re-lock with the same burn is idempotent", t.status === "locked");
   ok("idempotent re-lock still updates the clock", t.updatedAt === 3);
-  t = ctpAdvance(tLocked, { k: "mint", mint: { ...mint, amount: "31" } }, 4);
+  t = captpAdvance(tLocked, { k: "mint", mint: { ...mint, amount: "31" } }, 4);
   ok("mint that breaks conservation is a no-op", t === tLocked);
 
-  t = ctpAdvance(tLocked, { k: "mint", mint }, 5);
+  t = captpAdvance(tLocked, { k: "mint", mint }, 5);
   ok("mint advances locked → minted", t.status === "minted" && t.mint === mint);
 
   const receipt = { id: "abc", burn, mint, at: 6 };
   const tMinted = t;
-  t = ctpAdvance(t, { k: "receipt", receipt }, 6);
+  t = captpAdvance(t, { k: "receipt", receipt }, 6);
   ok("receipt advances minted → receipted", t.status === "receipted" && t.receipt === receipt);
 
   const done = t;
-  t = ctpAdvance(t, { k: "abort", reason: "too late" }, 7);
+  t = captpAdvance(t, { k: "abort", reason: "too late" }, 7);
   ok("abort after receipted is a no-op", t === done);
 
   // abort from offered
-  let u = ctpAdvance({ offer, status: "offered", updatedAt: 0 }, { k: "abort", reason: "changed my mind" }, 1);
+  let u = captpAdvance({ offer, status: "offered", updatedAt: 0 }, { k: "abort", reason: "changed my mind" }, 1);
   ok("abort from offered → aborted", u.status === "aborted" && u.abortReason === "changed my mind");
-  ok("lock after abort is a no-op", ctpAdvance(u, { k: "lock", burn }, 2) === u);
+  ok("lock after abort is a no-op", captpAdvance(u, { k: "lock", burn }, 2) === u);
 }
 
 // --- wire validators ------------------------------------------------
@@ -176,33 +176,33 @@ const B = "http://127.0.0.1:40404";
     id: "d34db33f", pair: bridgePairKey(A, B), srcShard: "127.0.0.1:40403", dstShard: B,
     what: "value", amount: "30", destAddr: "1111bob", by: "peer1", at: 1, expiresAt: 2,
   };
-  const o = ctpOfferFromWire(good);
+  const o = captpOfferFromWire(good);
   ok("a good offer parses", !!o && o.srcShard === A && o.amount === "30");
   ok("offer normalizes shard refs", o.srcShard === A);
-  ok("wrong pair key is rejected", ctpOfferFromWire({ ...good, pair: "0000000000000000" }) === null);
-  ok("same src and dst is rejected", ctpOfferFromWire({ ...good, dstShard: "127.0.0.1:40403" }) === null);
-  ok("value offer needs a numeric amount", ctpOfferFromWire({ ...good, amount: "lots" }) === null);
-  ok("cap offer needs a cap", ctpOfferFromWire({ ...good, what: "cap", amount: undefined }) === null);
-  ok("missing destAddr is rejected", ctpOfferFromWire({ ...good, destAddr: "" }) === null);
-  ok("junk is rejected", ctpOfferFromWire(null) === null && ctpOfferFromWire("x") === null);
+  ok("wrong pair key is rejected", captpOfferFromWire({ ...good, pair: "0000000000000000" }) === null);
+  ok("same src and dst is rejected", captpOfferFromWire({ ...good, dstShard: "127.0.0.1:40403" }) === null);
+  ok("value offer needs a numeric amount", captpOfferFromWire({ ...good, amount: "lots" }) === null);
+  ok("cap offer needs a cap", captpOfferFromWire({ ...good, what: "cap", amount: undefined }) === null);
+  ok("missing destAddr is rejected", captpOfferFromWire({ ...good, destAddr: "" }) === null);
+  ok("junk is rejected", captpOfferFromWire(null) === null && captpOfferFromWire("x") === null);
 
-  const burn = { tag: "ctp-burn", srcShard: "root", subject: "1111x", amount: "30", nonce: "ctp-d34db33f", destAddr: "1111bob" };
-  const mint = { tag: "ctp-mint", dstShard: "shard-b", srcShard: "root", destAddr: "1111bob", amount: "30", nonce: "ctp-d34db33f" };
+  const burn = { tag: "captp-burn", srcShard: "root", subject: "1111x", amount: "30", nonce: "captp-d34db33f", destAddr: "1111bob" };
+  const mint = { tag: "captp-mint", dstShard: "shard-b", srcShard: "root", destAddr: "1111bob", amount: "30", nonce: "captp-d34db33f" };
   ok("burn receipt parses", !!burnReceiptFromWire(burn));
   ok("burn receipt with bad tag rejected", burnReceiptFromWire({ ...burn, tag: "x" }) === null);
   ok("mint receipt parses", !!mintReceiptFromWire(mint));
-  ok("ctp receipt parses and conserves", !!ctpReceiptFromWire({ id: "d34db33f", burn, mint, at: 5 }));
-  ok("ctp receipt rejects non-conserving pair", ctpReceiptFromWire({ id: "x", burn, mint: { ...mint, amount: "1" }, at: 5 }) === null);
+  ok("captp receipt parses and conserves", !!captpReceiptFromWire({ id: "d34db33f", burn, mint, at: 5 }));
+  ok("captp receipt rejects non-conserving pair", captpReceiptFromWire({ id: "x", burn, mint: { ...mint, amount: "1" }, at: 5 }) === null);
 }
 
 // --- rholang tuple round-trip -------------------------------------
 {
-  const burn = { tag: "ctp-burn", srcShard: "root", subject: "1111x", amount: "30", nonce: "ctp-abc", destAddr: "1111bob" };
+  const burn = { tag: "captp-burn", srcShard: "root", subject: "1111x", amount: "30", nonce: "captp-abc", destAddr: "1111bob" };
   const tuple = burnReceiptToTuple(burn);
-  ok("tuple text is the rholang shape", tuple === `("ctp-burn", "root", "1111x", 30, "ctp-abc", "1111bob")`);
+  ok("tuple text is the rholang shape", tuple === `("captp-burn", "root", "1111x", 30, "captp-abc", "1111bob")`);
   const back = burnReceiptFromTuple(tuple);
-  ok("tuple round-trips", !!back && back.srcShard === "root" && back.subject === "1111x" && back.amount === "30" && back.nonce === "ctp-abc" && back.destAddr === "1111bob");
-  ok("an error list is not a burn receipt", burnReceiptFromTuple('["dup nonce", "ctp-abc"]') === null);
+  ok("tuple round-trips", !!back && back.srcShard === "root" && back.subject === "1111x" && back.amount === "30" && back.nonce === "captp-abc" && back.destAddr === "1111bob");
+  ok("an error list is not a burn receipt", burnReceiptFromTuple('["dup nonce", "captp-abc"]') === null);
   ok("whitespace is tolerated", !!burnReceiptFromTuple(`  ${tuple}  `));
 }
 
