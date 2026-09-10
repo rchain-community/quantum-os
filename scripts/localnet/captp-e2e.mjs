@@ -1,15 +1,15 @@
 #!/usr/bin/env node
-// ctp-e2e.mjs — a REAL signed end-to-end of a CTP bridge across TWO rnodes.
+// captp-e2e.mjs — a REAL signed end-to-end of a CapTP bridge across TWO rnodes.
 //
-// Unlike ctp-escrow-check.mjs (exploratory, revVault stubbed) this signs and
+// Unlike captp-escrow-check.mjs (exploratory, revVault stubbed) this signs and
 // deploys for real with genesis-funded keys, and exercises the exact path
-// `/ctp setup` + `/ctp send` take: install the escrow on node A and node B,
+// `/captp setup` + `/captp send` take: install the escrow on node A and node B,
 // register each as the other's counterpart, `lock` on A, `mint` on B, and
 // check the recipient's REV balance on B moved by the transfer amount.
 //
 //   bash scripts/localnet/run-node.sh                       # node A :40403
 //   ... a second node on other ports ...                    # node B :41403
-//   node scripts/localnet/ctp-e2e.mjs
+//   node scripts/localnet/captp-e2e.mjs
 //     --a <url>   default http://127.0.0.1:40403
 //     --b <url>   default http://127.0.0.1:41403
 
@@ -40,7 +40,7 @@ const bundleOf = async (entry) => {
 };
 
 const rho = await bundleOf("rholang.ts");
-const escrow = await bundleOf("ctp-escrow.js");
+const escrow = await bundleOf("captp-escrow.js");
 const { deployToNode, revAddressOf, generateKey, nodeStatus, evalTerm, DEFAULT_CONFIG } = rho;
 const { installProgram, registerProgram, lockProgram, mintProgram } = escrow;
 
@@ -62,7 +62,7 @@ const step = async (label, fn) => {
   catch (e) { console.log(`  ✗ ${label} — ${e?.message ?? e}`); fail++; throw e; }
 };
 
-console.log(`ctp-e2e — A ${URL_A}  ·  B ${URL_B}`);
+console.log(`captp-e2e — A ${URL_A}  ·  B ${URL_B}`);
 const [sa, sb] = await Promise.all([
   nodeStatus(cfgFor(keys.deployer, URL_A)).catch(() => null),
   nodeStatus(cfgFor(keys.deployer, URL_B)).catch(() => null),
@@ -95,13 +95,13 @@ try {
   const burnTuple = await step(`user locks 5 on A`, async () => {
     const o = await deployToNode(cfgFor(keys.validator, URL_A), URL_A, lockProgram(uriA, userAddr, 5, recipient, "e2e-1"), 40);
     if (!o.ok) throw new Error(o.message);
-    if (!/^\(\s*"ctp-burn"/.test(String(o.value ?? "").trim())) throw new Error("no burn receipt: " + o.value);
+    if (!/^\(\s*"captp-burn"/.test(String(o.value ?? "").trim())) throw new Error("no burn receipt: " + o.value);
     return o.value.trim();
   });
   await step(`owner mints on B`, async () => {
     const o = await deployToNode(cfgFor(keys.deployer, URL_B), URL_B, mintProgram(uriB, burnTuple), 40);
     if (!o.ok) throw new Error(o.message);
-    if (!/^\(\s*"ctp-mint"/.test(String(o.value ?? "").trim())) throw new Error("no mint receipt: " + o.value);
+    if (!/^\(\s*"captp-mint"/.test(String(o.value ?? "").trim())) throw new Error("no mint receipt: " + o.value);
     return o.value.trim();
   });
 

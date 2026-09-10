@@ -1,4 +1,4 @@
-// ctp-escrow.js — the cross-shard transport escrow, one per shard.
+// captp-escrow.js — the cross-shard transport escrow, one per shard.
 //
 // A bridge (a dual-shard account, see CapabilityTransport.md) moves value
 // between two shards by locking on the source and minting on the destination.
@@ -22,12 +22,12 @@
 // multisig escrow — is Tier 2, built when a bridge's value justifies it.
 //
 // Three levels of check:
-//   * shape — `node packages/browser/src/ctp-escrow.js --selftest` (in CI):
+//   * shape — `node packages/browser/src/captp-escrow.js --selftest` (in CI):
 //     balanced, verb names, arg positions, ≥2 params, no quoted names.
-//   * behaviour — `node scripts/localnet/ctp-escrow-check.mjs` against a live
+//   * behaviour — `node scripts/localnet/captp-escrow-check.mjs` against a live
 //     rnode: the contract parses and reduces, every verb returns what its help
 //     says (with `revVault` stubbed).
-//   * end to end — `node scripts/localnet/ctp-e2e.mjs`: REAL signed deploys with
+//   * end to end — `node scripts/localnet/captp-e2e.mjs`: REAL signed deploys with
 //     genesis-funded keys — install both escrows, register, a funded `lock` and
 //     `mint`, and the recipient's REV balance moves by the transfer amount.
 //     Verified on bin/rnode 0.1.0.
@@ -45,7 +45,7 @@
  *   , "locks":        { nonce: {subject, amount, destAddr, status} }
  *   , "minted":       { nonce: <mint receipt> } }   // dedupe on the mint side
  */
-export const CTP_ESCROW_RHO = `new st,
+export const CAPTP_ESCROW_RHO = `new st,
     doRegister, doLock, doMint, doRefund, doLockOf, doInfo,
     revVault(\`rho:rchain:revVault\`),
     insertArbitrary(\`rho:registry:insertArbitrary\`),
@@ -83,7 +83,7 @@ in {
               Nil => {
                 st!(s.set("locks", s.get("locks").set(nonce,
                   {"subject": subjectAddr, "amount": amount, "destAddr": destAddr, "status": "locked"}))) |
-                ret!(("ctp-burn", s.get("shardId"), subjectAddr, amount, nonce, destAddr))
+                ret!(("captp-burn", s.get("shardId"), subjectAddr, amount, nonce, destAddr))
               }
               _ => { st!(s) | ret!(["transfer failed", a]) }
             }
@@ -102,7 +102,7 @@ in {
       if (s.get("owner") != id) { st!(s) | ret!(["denied", "owner only"]) }
       else {
         match burnReceipt {
-          ("ctp-burn", srcShard, subject, amount, nonce, destAddr) => {
+          ("captp-burn", srcShard, subject, amount, nonce, destAddr) => {
             if (s.get("minted").contains(nonce)) { st!(s) | ret!(s.get("minted").get(nonce)) }
             else {
               if (s.get("counterparts").contains(srcShard)) {
@@ -112,7 +112,7 @@ in {
                     match a {
                       Nil => {
                         new mr in {
-                          mr!(("ctp-mint", s.get("shardId"), destAddr, amount, nonce, srcShard)) |
+                          mr!(("captp-mint", s.get("shardId"), destAddr, amount, nonce, srcShard)) |
                           for (@receipt <- mr) {
                             st!(s.set("minted", s.get("minted").set(nonce, receipt))) |
                             ret!(receipt)
@@ -200,7 +200,7 @@ const q = (s) => JSON.stringify(String(s));
  * @param {string} shardId   this shard's id (stamped into burn receipts)
  */
 export function installProgram(poolAddr, shardId) {
-  return CTP_ESCROW_RHO
+  return CAPTP_ESCROW_RHO
     .replace("POOL", q(poolAddr))
     .replace("SHARD", q(shardId))
     .replace("CAPS", `insertArbitrary!(${FACETS}, *ret) |
@@ -256,7 +256,7 @@ export function lockProgram(escrowUri, subjectAddr, amount, destAddr, nonce) {
 
 /**
  * Mint against a burn receipt relayed from the source shard (owner only).
- * `burnReceiptTerm` is the rholang tuple `("ctp-burn", …)` as text.
+ * `burnReceiptTerm` is the rholang tuple `("captp-burn", …)` as text.
  */
 export function mintProgram(escrowUri, burnReceiptTerm) {
   return escrowCall(escrowUri, "mint", [String(burnReceiptTerm)]);
@@ -278,7 +278,7 @@ export function infoProgram(escrowUri) {
 }
 
 // ---------------------------------------------------------------------------
-// Selftest — node packages/browser/src/ctp-escrow.js --selftest
+// Selftest — node packages/browser/src/captp-escrow.js --selftest
 //
 // The contract is exercised against a live rnode elsewhere (issue #173). What
 // this checks is the half that ships: every program is well-formed, names the
@@ -306,16 +306,16 @@ export function selftest() {
 
   const URI = "rho:id:abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqr";
 
-  ok("the contract template is delimiter-balanced", balanced(CTP_ESCROW_RHO));
-  ok("the contract quotes no name", !/@"/.test(CTP_ESCROW_RHO), "@\"…\" — see SECURITY.md");
+  ok("the contract template is delimiter-balanced", balanced(CAPTP_ESCROW_RHO));
+  ok("the contract quotes no name", !/@"/.test(CAPTP_ESCROW_RHO), "@\"…\" — see SECURITY.md");
   ok("every contract takes at least two parameters",
-     [...CTP_ESCROW_RHO.matchAll(/contract\s+\w+\(([^)]*)\)/g)]
+     [...CAPTP_ESCROW_RHO.matchAll(/contract\s+\w+\(([^)]*)\)/g)]
        .every((m) => m[1].split(",").filter((x) => x.trim()).length >= 2),
      "a one-binder persistent receive in a nested new runs away — rchain-rust#19");
-  ok("readers consume and restore, never peek", !/<<-/.test(CTP_ESCROW_RHO));
+  ok("readers consume and restore, never peek", !/<<-/.test(CAPTP_ESCROW_RHO));
   ok("all six verbs are defined",
      ["doRegister", "doLock", "doMint", "doRefund", "doLockOf", "doInfo"]
-       .every((v) => CTP_ESCROW_RHO.includes(`contract ${v}(`)));
+       .every((v) => CAPTP_ESCROW_RHO.includes(`contract ${v}(`)));
 
   const install = installProgram("11112pooladdr", "root");
   ok("install is well-formed", balanced(install));
@@ -337,10 +337,10 @@ export function selftest() {
   ok("lock carries subject, amount, dest, nonce in order",
      /@verb!\(\*deployerId, "1111alice", 30, "1111bob", "n-abc123", \*ret\)/.test(lock), lock.slice(-300));
 
-  const mint = mintProgram(URI, '("ctp-burn", "root", "1111alice", 30, "n-abc123", "1111bob")');
+  const mint = mintProgram(URI, '("captp-burn", "root", "1111alice", 30, "n-abc123", "1111bob")');
   ok("mint is well-formed", balanced(mint));
   ok("mint passes deployerId then the burn-receipt tuple",
-     /@verb!\(\*deployerId, \("ctp-burn", "root", "1111alice", 30, "n-abc123", "1111bob"\), \*ret\)/.test(mint), mint.slice(-360));
+     /@verb!\(\*deployerId, \("captp-burn", "root", "1111alice", 30, "n-abc123", "1111bob"\), \*ret\)/.test(mint), mint.slice(-360));
 
   const refund = refundProgram(URI, "n-abc123");
   ok("refund carries only the nonce after the id", /@verb!\(\*deployerId, "n-abc123", \*ret\)/.test(refund), refund.slice(-220));

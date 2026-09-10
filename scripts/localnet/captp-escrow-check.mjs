@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// ctp-escrow-check.mjs — does the CTP escrow rholang actually run on rnode?
+// captp-escrow-check.mjs — does the CapTP escrow rholang actually run on rnode?
 //
-// ctp-escrow.js's selftest checks the SHAPE of the contract (balanced, verb
+// captp-escrow.js's selftest checks the SHAPE of the contract (balanced, verb
 // names, arg positions). It cannot check that rnode parses and reduces it. This
 // does: it deploys the contract as an EXPLORATORY deploy with `revVault` stubbed
 // to always succeed, drives the six verbs through a scripted sequence, and
@@ -16,10 +16,10 @@
 // genesis-funded key and is a manual step — see issue #173.
 //
 //   bash scripts/localnet/run-node.sh      # one terminal
-//   node scripts/localnet/ctp-escrow-check.mjs
+//   node scripts/localnet/captp-escrow-check.mjs
 //     --node <url>   default http://127.0.0.1:40403
 
-import { CTP_ESCROW_RHO } from "../../packages/browser/src/ctp-escrow.js";
+import { CAPTP_ESCROW_RHO } from "../../packages/browser/src/captp-escrow.js";
 
 const arg = (flag, dflt) => {
   const i = process.argv.indexOf(flag);
@@ -32,7 +32,7 @@ const NODE = arg("--node", "http://127.0.0.1:40403");
 // *deployerId, unbound in an exploratory deploy), and revVault is a local stub
 // that always replies Nil (success) so the value-moving verbs exercise their
 // full logic without a funded vault.
-const CONTRACT = CTP_ESCROW_RHO
+const CONTRACT = CAPTP_ESCROW_RHO
   .replace("POOL", '"1111pool"')
   .replace("SHARD", '"shard-A"')
   .replace("*deployerId", '"OWNER"')
@@ -54,13 +54,13 @@ const DRIVER = `
     for (@r3 <- s3) {
     doLockOf!("n1", *s4) |
     for (@r4 <- s4) {
-    doMint!("OWNER", ("ctp-burn", "shard-B", "1111x", 30, "n2", "1111bob"), *s5) |
+    doMint!("OWNER", ("captp-burn", "shard-B", "1111x", 30, "n2", "1111bob"), *s5) |
     for (@r5 <- s5) {
-    doMint!("OWNER", ("ctp-burn", "shard-B", "1111x", 30, "n2", "1111bob"), *s6) |
+    doMint!("OWNER", ("captp-burn", "shard-B", "1111x", 30, "n2", "1111bob"), *s6) |
     for (@r6 <- s6) {
-    doMint!("OWNER", ("ctp-burn", "shard-X", "1111x", 30, "n3", "1111bob"), *s7) |
+    doMint!("OWNER", ("captp-burn", "shard-X", "1111x", 30, "n3", "1111bob"), *s7) |
     for (@r7 <- s7) {
-    doMint!("EVE", ("ctp-burn", "shard-B", "1111x", 30, "n4", "1111bob"), *s8) |
+    doMint!("EVE", ("captp-burn", "shard-B", "1111x", 30, "n4", "1111bob"), *s8) |
     for (@r8 <- s8) {
     doRefund!("OWNER", "n1", *s9) |
     for (@r9 <- s9) {
@@ -91,7 +91,7 @@ async function explore(term) {
 }
 
 // --- run ---
-console.log(`ctp-escrow-check — ${NODE}\n`);
+console.log(`captp-escrow-check — ${NODE}\n`);
 try {
   const s = await (await fetch(NODE + "/api/status")).json();
   console.log(`rnode ${s.version?.node ?? "?"} · shard ${s.shardId} · height ${s.latestBlockNumber}\n`);
@@ -124,11 +124,11 @@ const want = (label, needle) => {
 console.log("\nchecks:");
 want("register succeeded", "registered");
 want("dup nonce refused", "dup nonce");
-want("mint of a registered counterpart is not denied/rejected", "ctp-mint");
+want("mint of a registered counterpart is not denied/rejected", "captp-mint");
 want("unknown counterpart rejected", "unknown counterpart");
 want("non-owner mint denied", "denied");
 want("refund of a real lock", "refunded");
 
 console.log(`\n${fail ? "SOME CHECKS FAILED" : "all structural checks passed"} — ${pass}/${pass + fail}`);
-console.log("(real funded transfers across two nodes: scripts/localnet/ctp-e2e.mjs)");
+console.log("(real funded transfers across two nodes: scripts/localnet/captp-e2e.mjs)");
 process.exit(fail ? 1 : 0);
