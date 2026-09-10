@@ -173,6 +173,7 @@ its stale view until it re-syncs; *revoked* is shown as distinct from *gone*.
 
 ## Related
 
+- [`ExchangeDemo.md`](ExchangeDemo.md) — end-user walkthrough of the pooled token exchange and its `link`/`route` cross-shard federation over Layer 1.
 - [`Room_Bridges.md`](Room_Bridges.md) — a peer in two rooms is the shared closure (the gateway is that, between a room and a shard).
 - [`Governance.md`](Governance.md) — group ownership of a gateway; delegation- and trust-weighted decisions; censure.
 - [quantum-os#173](https://github.com/rchain-community/quantum-os/issues/173) (Layer 2) · [rchain-rust#33](https://github.com/rchain-community/rchain-rust/issues/33) (Layer 1) · [#138](https://github.com/rchain-community/quantum-os/issues/138) · [#107](https://github.com/rchain-community/quantum-os/issues/107).
