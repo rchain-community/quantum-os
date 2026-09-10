@@ -27,10 +27,8 @@ import { issueId, isMember, isAdmin, memberLabel, findIssue, resolveWeights, del
 import { installProgram, registerProgram, bindProgram, resolveProgram,
          readProgram, grantProgram } from "./locker.js";
 import {
-  type BridgeOwner, type BridgeSpec, type CtpOffer, type CtpTransfer, type CtpReceipt,
-  type CtpBurnReceipt, type CtpMintReceipt,
-  ownerId as ctpOwnerId, normalizeShardRef, bridgePairKey, bridgeVaultHandle,
-  deriveBridgeRoom, makeBridgeSpec, bridgeSpecIsConsistent,
+  type BridgeSpec, type CtpOffer, type CtpTransfer, type CtpReceipt, type CtpMintReceipt,
+  normalizeShardRef, bridgePairKey, makeBridge, bridgeSpecIsConsistent,
   newTransferId, transferNonce, ctpConservationCheck, ctpAdvance,
   ctpOfferFromWire, burnReceiptFromWire, mintReceiptFromWire, ctpReceiptFromWire,
   burnReceiptToTuple, burnReceiptFromTuple,
@@ -38,7 +36,7 @@ import {
 import {
   installProgram as ctpEscrowInstallProgram, registerProgram as ctpEscrowRegisterProgram,
   lockProgram as ctpLockProgram, mintProgram as ctpMintProgram,
-  refundProgram as ctpRefundProgram, lockOfProgram as ctpLockOfProgram,
+  refundProgram as ctpRefundProgram,
 } from "./ctp-escrow.js";
 import { parseDefinition, parseInvocation, expandCommand, expandCallSites,
          formatDefinition, findMacros, bodyKind, MacroError,
@@ -4525,34 +4523,34 @@ function handleCommand(raw: string): string[] {
 
     case "ctp": {
       // Cross-shard capability transport (#173, CapabilityTransport.md). A
-      // bridge is a dual-shard account; its room is derived from the owner id +
-      // the shard pair. This MVP does the coordination + audit + broadcast; the
-      // on-shard `lock`/`mint` deploys are run by the operator via /rholang
-      // (the recipe is printed) until a multi-node deploy path lands (Phase 3c).
+      // bridge is one account (this browser's /rholang key) with an escrow on
+      // two rnodes; `/ctp send` deploys the burn on one and the mint on the
+      // other and broadcasts the receipt to the room you are in. No separate
+      // "bridge room" — that (deriveBridgeRoom, ctp-offer/-lock/-mint) is kept
+      // in the code for Phase 4 (group-owned bridges), unused here.
       const t = arg.trim();
       const tks = t ? t.split(/\s+/) : [];
       const sub = (tks[0] ?? "").toLowerCase();
       const cfg = loadNodeConfig();
 
       const pkey = (s: BridgeSpec) => bridgePairKey(s.shardA, s.shardB);
+      const looksPair = (x: string) => /^[0-9a-f]{16}$/.test(x);
       const bridgeByPair = (k: string): BridgeSpec | undefined =>
         ctpBridgeStore.get(k) ?? [...ctpBridgeStore.values()].find((s) => pkey(s) === k);
-      const bridgeForRoom = (): BridgeSpec | undefined =>
-        [...ctpBridgeStore.values()].find((s) => s.roomCap === activeRoom.roomId);
+      const soleBridge = (): BridgeSpec | undefined =>
+        ctpBridgeStore.size === 1 ? [...ctpBridgeStore.values()][0] : undefined;
       const showSpec = (s: BridgeSpec) => {
-        sys(`  ${pkey(s)}${s.owner.kind === "group" ? `  (group ${shortId(s.owner.groupId)})` : ""}`);
-        sys(`    A ${s.shardA}${s.escrowA ? `\n      escrow ${s.escrowA}` : "   (no escrow — /ctp setup)"}`);
-        sys(`    B ${s.shardB}${s.escrowB ? `\n      escrow ${s.escrowB}` : "   (no escrow — /ctp setup)"}`);
-        sys(`    room ${s.roomCap}`);
+        sys(`  ${pkey(s)}`);
+        sys(`    A  ${s.shardA}  (id ${s.idA})${s.escrowA ? `\n       escrow ${s.escrowA}` : "   — not set up"}`);
+        sys(`    B  ${s.shardB}  (id ${s.idB})${s.escrowB ? `\n       escrow ${s.escrowB}` : "   — not set up"}`);
       };
       const fmtTransfer = (tr: CtpTransfer) => {
         const o = tr.offer;
-        sys(`  ${o.id}  ${tr.status}  ${o.what === "value" ? o.amount + " REV" : o.cap}  →  ${o.destAddr}`);
-        sys(`    ${o.srcShard}  →  ${o.dstShard}${tr.abortReason ? `   (${tr.abortReason})` : ""}`);
+        sys(`  ${o.id}  ${tr.status}  ${o.what === "value" ? o.amount + " REV" : o.cap}  ${o.srcShard} → ${o.dstShard} → ${o.destAddr}${tr.abortReason ? `  (${tr.abortReason})` : ""}`);
       };
 
       if (!sub || sub === "list") {
-        if (!ctpBridgeStore.size) { sys("no bridges — /ctp new <shardA-url> <shardB-url>"); break; }
+        if (!ctpBridgeStore.size) { sys("no bridges — /ctp new <rnode-A-url> <rnode-B-url>"); break; }
         sys(`bridges (${ctpBridgeStore.size}):`);
         for (const s of ctpBridgeStore.values()) showSpec(s);
         break;
@@ -4560,108 +4558,74 @@ function handleCommand(raw: string): string[] {
 
       if (sub === "help") {
         for (const l of [
-          "/ctp new <shardA-url> <shardB-url> [--group <id>]  — create a bridge",
-          "/ctp list · show [<pair>] · join <pair>            — manage bridges",
-          "/ctp setup <pair>                                  — the escrow deploy recipe",
-          "/ctp escrow <pair> <A|B> <rho:id:…>                — record an escrow uri",
-          "/ctp send <amount> to <A|B> [<destAddr>]           — start a transfer (in the bridge room)",
-          "/ctp lock <id> [<burn-tuple>] · mint <id>          — record + broadcast each leg",
-          "/ctp status [<id>] · receipts · abort <id>",
+          "/ctp new <rnode-A-url> <rnode-B-url>   — register a bridge between two nodes",
+          "/ctp list · /ctp show [<pair>]",
+          "/ctp setup [<pair>]                    — deploy the escrow on both nodes (needs /rholang key)",
+          "/ctp escrow <pair> <A|B> <rho:id:…>    — record an escrow uri by hand",
+          "/ctp send [<pair>] <amount> to <A|B> [<destAddr>] [--manual]",
+          "/ctp status [<id>] · /ctp receipts · /ctp abort <id>",
+          "/ctp lock <id> [<tuple>] · /ctp mint <id>   — record a leg run by hand (--manual)",
         ]) sys(l);
         break;
       }
 
       if (sub === "new") {
         const a = normalizeShardRef(tks[1] ?? ""); const b = normalizeShardRef(tks[2] ?? "");
-        if (!a || !b) { sys("usage: /ctp new <shardA-url> <shardB-url> [--group <id>]"); break; }
-        if (a === b) { sys("a bridge needs two distinct shards"); break; }
-        let owner: BridgeOwner = { kind: "person", anchor: dyncapState?.anchor ?? "" };
-        const gi = tks.indexOf("--group");
-        if (gi > -1 && tks[gi + 1]) {
-          const gq = tks[gi + 1];
-          const g = groupStore.get(gq) ?? [...groupStore.values()].find((x) => x.name.toLowerCase() === gq.toLowerCase());
-          if (!g) { sys(`no group "${gq}" — /gov list`); break; }
-          owner = { kind: "group", groupId: g.id };
-        }
-        if (owner.kind === "person" && !owner.anchor) { sys("no identity yet — set a name first (/name)"); break; }
-        const k = bridgePairKey(a, b);
-        if (ctpBridgeStore.has(k)) { sys(`a bridge for this pair exists (${k}) — /ctp show ${k}`); break; }
-        const spec = makeBridgeSpec(owner, a, b);
-        ctpBridgeStore.set(k, spec); saveCtpBridges();
-        sys(`✓ bridge ${k} created`);
-        showSpec(spec);
-        sys(`  next:  /ctp join ${k}   then   /ctp setup ${k}`);
+        if (!a || !b) { sys("usage: /ctp new <rnode-A-url> <rnode-B-url>"); break; }
+        if (a === b) { sys("a bridge needs two distinct rnode URLs (start a second node on other ports)"); break; }
+        if (ctpBridgeStore.has(bridgePairKey(a, b))) { sys(`a bridge for that pair exists — /ctp show ${bridgePairKey(a, b)}`); break; }
+        const newCtx = activeRoom;
+        const line = (txt: string) => inRoom(newCtx, () => addMessage("", txt, "system"));
+        sys(`asking both nodes their shard id…`);
+        void (async () => {
+          const [sa, sb] = await Promise.all([
+            nodeStatus({ ...cfg, url: a }).catch(() => null),
+            nodeStatus({ ...cfg, url: b }).catch(() => null),
+          ]);
+          if (!sa || !sb) { line(`  ✗ could not reach ${!sa ? a : b}`); return; }
+          let idA = sa.shardId || "shard-a", idB = sb.shardId || "shard-b";
+          if (idA === idB) { idA = `${idA}-a`; idB = `${idB}-b`; }   // one id per side
+          const spec = makeBridge(a, b, idA, idB);
+          inRoom(newCtx, () => { ctpBridgeStore.set(pkey(spec), spec); saveCtpBridges(); });
+          line(`  ✓ bridge ${pkey(spec)}`);
+          inRoom(newCtx, () => showSpec(spec));
+          line(`  next:  /ctp setup ${pkey(spec)}`);
+        })();
         break;
       }
 
       if (sub === "show") {
-        const s = tks[1] ? bridgeByPair(tks[1]) : bridgeForRoom();
-        if (!s) { sys(tks[1] ? `no bridge ${tks[1]}` : "not in a bridge room — /ctp show <pair>"); break; }
+        const s = tks[1] ? bridgeByPair(tks[1]) : soleBridge();
+        if (!s) { sys(tks[1] ? `no bridge ${tks[1]}` : "which bridge? /ctp show <pair>  (/ctp list)"); break; }
         showSpec(s);
-        const flight = [...ctpTransfers.values()].filter((tr) => bridgePairKey(tr.offer.srcShard, tr.offer.dstShard) === pkey(s));
-        if (flight.length) { sys(`  in flight:`); for (const tr of flight) fmtTransfer(tr); }
-        break;
-      }
-
-      if (sub === "join") {
-        const s = bridgeByPair(tks[1] ?? "");
-        if (!s) { sys("usage: /ctp join <pair>  (/ctp list for the keys)"); break; }
-        sys(`joining the bridge room for ${pkey(s)}…`);
-        for (const l of handleCommand(`/room join ${s.roomCap}`)) sys("  " + l);
+        for (const tr of ctpTransfers.values()) if (bridgePairKey(tr.offer.srcShard, tr.offer.dstShard) === pkey(s)) fmtTransfer(tr);
         break;
       }
 
       if (sub === "setup") {
-        const s = tks[1] ? bridgeByPair(tks[1]) : bridgeForRoom();
-        if (!s) { sys("usage: /ctp setup <pair> [--deploy]"); break; }
-        if (!cfg.key) { sys("✗ no deploy key — the bridge account's key must be set: /rholang key <hex>"); break; }
+        const s = tks[1] ? bridgeByPair(tks[1]) : soleBridge();
+        if (!s) { sys("usage: /ctp setup <pair>"); break; }
+        if (!cfg.key) { sys("✗ no deploy key — /rholang key generate, or /rholang key <hex>"); break; }
         const pool = revAddressOf(cfg.key);
-        const aId = normalizeShardRef(s.shardA)!, bId = normalizeShardRef(s.shardB)!;
-
-        if (tks.includes("--deploy")) {
-          const setupCtx = activeRoom;
-          const line = (txt: string) => inRoom(setupCtx, () => addMessage("", txt, "system"));
-          sys(`deploying the escrow to both shards of ${pkey(s)}…`);
-          void (async () => {
-            for (const [side, url, id, cpId] of [["A", s.shardA, aId, bId], ["B", s.shardB, bId, aId]] as const) {
-              line(`  … installing escrow on ${url}`);
-              const inst = await deployToNode(cfg, url, ctpEscrowInstallProgram(pool, id)).catch((e) => ({ ok: false, message: String(e), value: undefined as string | undefined }));
-              if (!inst.ok || !inst.value || !/^rho:id:/.test(inst.value.trim())) {
-                line(`  ✗ install on ${url} ${inst.ok ? `returned no uri (${inst.value ?? "nothing"})` : `rejected: ${inst.message}`}`);
-                return;
-              }
-              const uri = inst.value.trim();
-              inRoom(setupCtx, () => { if (side === "A") s.escrowA = uri; else s.escrowB = uri; saveCtpBridges(); });
-              line(`  ✓ escrow ${side} = ${uri}`);
-              line(`  … registering counterpart ${cpId}`);
-              const reg = await deployToNode(cfg, url, ctpEscrowRegisterProgram(uri, cpId)).catch((e) => ({ ok: false, message: String(e), value: undefined as string | undefined }));
-              line(reg.ok ? `  ✓ registered ${cpId} on ${side}` : `  ✗ register on ${side}: ${reg.message}`);
-            }
-            line(`  bridge ${pkey(s)} ready — /ctp send <amount> to <A|B>`);
-          })();
-          break;
-        }
-
-        sys(`the escrow deploy recipe for bridge ${pkey(s)} — run each block on the named shard (or /ctp setup ${pkey(s)} --deploy):`);
-        sys("");
-        sys(`# on shard A (${s.shardA}) — /rholang rnode ${s.shardA}`);
-        sys("```");
-        sys(ctpEscrowInstallProgram(pool, aId));
-        sys("```");
-        sys(`# then, once its rho:id:… is known:  /ctp escrow ${pkey(s)} A <uri>`);
-        sys(`# and register the counterpart:`);
-        sys("```");
-        sys(ctpEscrowRegisterProgram("<escrow-A-uri>", bId));
-        sys("```");
-        sys("");
-        sys(`# on shard B (${s.shardB}) — /rholang rnode ${s.shardB}`);
-        sys("```");
-        sys(ctpEscrowInstallProgram(pool, bId));
-        sys("```");
-        sys(`# then:  /ctp escrow ${pkey(s)} B <uri>   and register:`);
-        sys("```");
-        sys(ctpEscrowRegisterProgram("<escrow-B-uri>", aId));
-        sys("```");
+        const setupCtx = activeRoom;
+        const line = (txt: string) => inRoom(setupCtx, () => addMessage("", txt, "system"));
+        sys(`deploying the escrow on both nodes of ${pkey(s)}…`);
+        void (async () => {
+          for (const side of ["A", "B"] as const) {
+            const url = side === "A" ? s.shardA : s.shardB;
+            const id = side === "A" ? s.idA : s.idB;
+            const cpId = side === "A" ? s.idB : s.idA;
+            line(`  … install on ${url}  (id ${id})`);
+            const inst = await deployToNode(cfg, url, ctpEscrowInstallProgram(pool, id)).catch((e) => ({ ok: false, message: String(e), value: undefined as string | undefined }));
+            const uri = String(inst.value ?? "").trim();
+            if (!inst.ok || !/^rho:id:/.test(uri)) { line(`  ✗ install on ${side}: ${inst.ok ? `no uri (${inst.value ?? "nothing"})` : inst.message}`); return; }
+            inRoom(setupCtx, () => { if (side === "A") s.escrowA = uri; else s.escrowB = uri; saveCtpBridges(); });
+            line(`  ✓ escrow ${side} = ${uri}`);
+            const reg = await deployToNode(cfg, url, ctpEscrowRegisterProgram(uri, cpId)).catch((e) => ({ ok: false, message: String(e), value: undefined as string | undefined }));
+            line(reg.ok ? `  ✓ ${side} trusts counterpart ${cpId}` : `  ✗ register on ${side}: ${reg.message}`);
+          }
+          line(`  bridge ${pkey(s)} ready — /ctp send ${ctpBridgeStore.size > 1 ? pkey(s) + " " : ""}<amount> to <A|B>`);
+        })();
         break;
       }
 
@@ -4669,89 +4633,73 @@ function handleCommand(raw: string): string[] {
         const s = bridgeByPair(tks[1] ?? "");
         const side = (tks[2] ?? "").toUpperCase();
         const uri = tks[3] ?? "";
-        if (!s || (side !== "A" && side !== "B") || !/^rho:id:/.test(uri)) {
-          sys("usage: /ctp escrow <pair> <A|B> <rho:id:…>"); break;
-        }
+        if (!s || (side !== "A" && side !== "B") || !/^rho:id:/.test(uri)) { sys("usage: /ctp escrow <pair> <A|B> <rho:id:…>"); break; }
         if (side === "A") s.escrowA = uri; else s.escrowB = uri;
         saveCtpBridges();
         sys(`✓ escrow ${side} = ${uri}`);
         break;
       }
 
-      // --- transfer verbs: operate on the bridge room the user is in ---
-      const spec = bridgeForRoom();
-      if (["send", "lock", "mint", "abort"].includes(sub) && !spec) {
-        sys("not in a bridge room — /ctp join <pair> first"); break;
-      }
-
       if (sub === "send") {
-        // /ctp send <amount> to <A|B> [<destAddr>] [--manual]
+        // /ctp send [<pair>] <amount> to <A|B> [<destAddr>] [--manual]
         const manual = tks.includes("--manual");
-        const rest = tks.filter((x) => x !== "--manual");
-        const amount = rest[1] ?? "";
+        const w = tks.filter((x) => x !== "--manual").slice(1);
+        const s = looksPair(w[0] ?? "") ? bridgeByPair(w[0]) : soleBridge();
+        if (!s) { sys(looksPair(w[0] ?? "") ? `no bridge ${w[0]}` : "which bridge? /ctp send <pair> <amount> to <A|B>"); break; }
+        const rest = looksPair(w[0] ?? "") ? w.slice(1) : w;
+        const amount = rest[0] ?? "";
         const toIx = rest.indexOf("to");
         const dstSel = (rest[toIx + 1] ?? "").toUpperCase();
         if (!/^\d{1,40}$/.test(amount) || toIx < 0 || (dstSel !== "A" && dstSel !== "B")) {
-          sys("usage: /ctp send <amount> to <A|B> [<destAddr>] [--manual]"); break;
+          sys("usage: /ctp send [<pair>] <amount> to <A|B> [<destAddr>]"); break;
         }
-        const dstShard = dstSel === "A" ? spec!.shardA : spec!.shardB;
-        const srcShard = dstSel === "A" ? spec!.shardB : spec!.shardA;
+        const dstUrl = dstSel === "A" ? s.shardA : s.shardB;
+        const srcUrl = dstSel === "A" ? s.shardB : s.shardA;
+        const srcId = dstSel === "A" ? s.idB : s.idA;
+        const dstId = dstSel === "A" ? s.idA : s.idB;
+        const escrowSrc = dstSel === "A" ? s.escrowB : s.escrowA;
+        const escrowDst = dstSel === "A" ? s.escrowA : s.escrowB;
         const destAddr = rest[toIx + 2] ?? (cfg.key ? revAddressOf(cfg.key) : "");
         if (!destAddr) { sys("no destination address — /ctp send <amount> to <A|B> <destAddr>"); break; }
-        const escrowSrc = srcShard === spec!.shardA ? spec!.escrowA : spec!.escrowB;
-        const escrowDst = dstShard === spec!.shardA ? spec!.escrowA : spec!.escrowB;
+        if (!escrowSrc || !escrowDst) { sys(`escrow not set up — /ctp setup ${pkey(s)}`); break; }
         const subjectAddr = cfg.key ? revAddressOf(cfg.key) : "<your-rev-address>";
         const id = newTransferId();
         const nonce = transferNonce(id);
         const now = Date.now();
         const offer: CtpOffer = {
-          id, pair: pkey(spec!), srcShard, dstShard, what: "value", amount, destAddr,
+          id, pair: pkey(s), srcShard: srcUrl, dstShard: dstUrl, what: "value", amount, destAddr,
           by: qpeer?.peerId ?? "local", at: now, expiresAt: now + 3600_000,
         };
         ctpTransfers.set(id, { offer, status: "offered", updatedAt: now });
-        signedBroadcast({ kind: "ctp-offer", ...offer });
-        sys(`✓ transfer ${id} offered — ${amount} REV  ${srcShard} → ${dstShard}  for ${destAddr}  (nonce ${nonce})`);
+        sys(`transfer ${id}: ${amount} REV  ${srcId} → ${dstId} → ${destAddr}  (nonce ${nonce})`);
 
-        if (!escrowSrc || !escrowDst) {
-          sys(`  ✗ escrow not set for ${!escrowSrc ? "the source" : "the destination"} shard — /ctp setup ${pkey(spec!)}`);
-          break;
-        }
         if (manual || !cfg.key) {
-          if (!cfg.key) sys("  (no deploy key — printing the recipe; set one with /rholang key <hex> to automate)");
-          sys(`  1. /rholang rnode ${srcShard}  then deploy:`);
+          if (!cfg.key) sys("  (no deploy key — printing the recipe)");
+          sys(`  1. /rholang rnode ${srcUrl}  then deploy:`);
           sys("  ```"); sys("  " + ctpLockProgram(escrowSrc, subjectAddr, amount, destAddr, nonce).replace(/\n/g, "\n  ")); sys("  ```");
-          sys(`  2. /ctp lock ${id} "<the ctp-burn tuple it returned>"`);
-          sys(`  3. /rholang rnode ${dstShard}  then deploy the mint  ·  4. /ctp mint ${id}`);
+          sys(`  2. /ctp lock ${id} "<the ctp-burn tuple>"`);
+          sys(`  3. /rholang rnode ${dstUrl}  then deploy the mint  ·  4. /ctp mint ${id}`);
           break;
         }
 
-        // Automated: deploy both legs with the bridge key, per-node nonce.
         const sendCtx = activeRoom;
         const line = (txt: string) => inRoom(sendCtx, () => addMessage("", txt, "system"));
         void (async () => {
-          line(`  … deploying lock on ${srcShard}`);
-          const lockOut = await deployToNode(cfg, srcShard, ctpLockProgram(escrowSrc, subjectAddr, amount, destAddr, nonce)).catch((e) => ({ ok: false, message: String(e), value: undefined }));
-          if (!lockOut.ok) { line(`  ✗ lock deploy rejected: ${lockOut.message}`); return; }
-          const burn = lockOut.value ? burnReceiptFromTuple(lockOut.value) : null;
-          if (!burn) {
-            line(`  ⚠ lock deployed but no ctp-burn receipt came back${lockOut.value ? ` (got: ${lockOut.value})` : " (a failed transfer sends nothing)"}`);
-            line(`     check with /rholang rnode ${srcShard} then /rholang read, then /ctp lock ${id} "<tuple>"`);
-            return;
-          }
+          line(`  … lock on ${srcUrl}`);
+          const lo = await deployToNode(cfg, srcUrl, ctpLockProgram(escrowSrc, subjectAddr, amount, destAddr, nonce)).catch((e) => ({ ok: false, message: String(e), value: undefined as string | undefined }));
+          if (!lo.ok) { line(`  ✗ lock rejected: ${lo.message}`); return; }
+          const burn = lo.value ? burnReceiptFromTuple(lo.value) : null;
+          if (!burn) { line(`  ⚠ lock deployed but no burn receipt (${lo.value ?? "empty — a failed transfer sends nothing"}); check /rholang read on ${srcUrl}, then /ctp lock ${id} "<tuple>"`); return; }
           inRoom(sendCtx, () => {
             const tr = ctpTransfers.get(id); if (!tr) return;
             const nx = ctpAdvance(tr, { k: "lock", burn });
-            if (nx !== tr) { ctpTransfers.set(id, nx); signedBroadcast({ kind: "ctp-lock", id, burn }); }
+            if (nx !== tr) ctpTransfers.set(id, nx);
           });
-          line(`  ✓ locked on ${srcShard} — burn ${burn.amount} nonce ${burn.nonce}`);
-
-          line(`  … deploying mint on ${dstShard}`);
-          const mintOut = await deployToNode(cfg, dstShard, ctpMintProgram(escrowDst, burnReceiptToTuple(burn))).catch((e) => ({ ok: false, message: String(e), value: undefined }));
-          if (!mintOut.ok) { line(`  ✗ mint deploy rejected: ${mintOut.message} — the lock is refundable (/ctp abort ${id})`); return; }
-          const mint: CtpMintReceipt = {
-            tag: "ctp-mint", dstShard, srcShard: burn.srcShard,
-            destAddr: burn.destAddr, amount: burn.amount, nonce: burn.nonce,
-          };
+          line(`  ✓ locked — burn ${burn.amount} nonce ${burn.nonce}`);
+          line(`  … mint on ${dstUrl}`);
+          const mo = await deployToNode(cfg, dstUrl, ctpMintProgram(escrowDst, burnReceiptToTuple(burn))).catch((e) => ({ ok: false, message: String(e), value: undefined as string | undefined }));
+          if (!mo.ok) { line(`  ✗ mint rejected: ${mo.message} — the lock is refundable (/ctp abort ${id})`); return; }
+          const mint: CtpMintReceipt = { tag: "ctp-mint", dstShard: dstId, srcShard: burn.srcShard, destAddr: burn.destAddr, amount: burn.amount, nonce: burn.nonce };
           const receipt: CtpReceipt = { id, burn, mint, at: Date.now() };
           inRoom(sendCtx, () => {
             let tr = ctpTransfers.get(id); if (!tr) return;
@@ -4759,10 +4707,9 @@ function handleCommand(raw: string): string[] {
             tr = ctpAdvance(tr, { k: "receipt", receipt });
             ctpTransfers.set(id, tr);
             ctpReceiptStore.set(id, receipt); saveCtpReceipts();
-            signedBroadcast({ kind: "ctp-mint", id, mint });
             signedBroadcast({ kind: "ctp-receipt", ...receipt });
           });
-          line(`  ✓ transfer ${id} complete — ${amount} REV to ${destAddr} on ${dstShard}${mintOut.value ? ` (${mintOut.value})` : ""}`);
+          line(`  ✓ transfer ${id} complete — ${amount} REV to ${destAddr} on ${dstId}${mo.value ? `  ${mo.value}` : ""}`);
         })();
         break;
       }
@@ -4772,52 +4719,39 @@ function handleCommand(raw: string): string[] {
         const tr = ctpTransfers.get(id);
         if (!tr) { sys(`no transfer ${id} — /ctp status`); break; }
         const tuple = tks.slice(2).join(" ").trim();
-        let burn: CtpBurnReceipt | null = null;
-        if (tuple) burn = burnReceiptFromTuple(tuple);
-        else {
-          // Derive it from the offer — subject defaults to this browser's address.
-          burn = {
-            tag: "ctp-burn", srcShard: tr.offer.srcShard,
-            subject: cfg.key ? revAddressOf(cfg.key) : tr.offer.destAddr,
-            amount: tr.offer.amount ?? "0", nonce: transferNonce(id), destAddr: tr.offer.destAddr,
-          };
+        const burn = tuple ? burnReceiptFromTuple(tuple) : {
+          tag: "ctp-burn" as const, srcShard: "",
+          subject: cfg.key ? revAddressOf(cfg.key) : tr.offer.destAddr,
+          amount: tr.offer.amount ?? "0", nonce: transferNonce(id), destAddr: tr.offer.destAddr,
+        };
+        if (!burn || (!tuple && !burn.srcShard)) {
+          const sp = bridgeByPair(tr.offer.pair);
+          if (!tuple && sp) burn!.srcShard = tr.offer.srcShard === sp.shardA ? sp.idA : sp.idB;
         }
-        if (!burn) { sys("could not read that as a ctp-burn tuple — paste exactly what `lock` returned"); break; }
+        if (!burn) { sys("could not read that as a ctp-burn tuple"); break; }
         const next = ctpAdvance(tr, { k: "lock", burn });
-        if (next === tr) { sys(`can't lock from status "${tr.status}"`); break; }
+        if (next === tr) { sys(`can't lock from "${tr.status}"`); break; }
         ctpTransfers.set(id, next);
-        signedBroadcast({ kind: "ctp-lock", id, burn });
-        sys(`✓ ${id} locked — burn receipt broadcast`);
-        const escrowDst = tr.offer.dstShard === spec!.shardA ? spec!.escrowA : spec!.escrowB;
-        if (!escrowDst) { sys(`  ✗ no escrow for the destination shard — /ctp setup ${pkey(spec!)}`); break; }
-        sys(`  next:  /rholang rnode ${tr.offer.dstShard}   then deploy:`);
-        sys("  ```");
-        sys("  " + ctpMintProgram(escrowDst, burnReceiptToTuple(burn)).replace(/\n/g, "\n  "));
-        sys("  ```");
-        sys(`  then:  /ctp mint ${id}`);
+        sys(`✓ ${id} locked — burn recorded`);
         break;
       }
 
       if (sub === "mint") {
         const id = tks[1] ?? "";
         const tr = ctpTransfers.get(id);
-        if (!tr || !tr.burn) { sys(`no locked transfer ${id} — /ctp status`); break; }
-        const mint: CtpMintReceipt = {
-          tag: "ctp-mint", dstShard: tr.offer.dstShard, srcShard: tr.burn.srcShard,
-          destAddr: tr.burn.destAddr, amount: tr.burn.amount, nonce: tr.burn.nonce,
-        };
-        if (!ctpConservationCheck(tr.burn, mint)) { sys("✗ internal: burn/mint do not conserve"); break; }
+        if (!tr || !tr.burn) { sys(`no locked transfer ${id}`); break; }
+        const sp = bridgeByPair(tr.offer.pair);
+        const dstId = sp ? (tr.offer.dstShard === sp.shardA ? sp.idA : sp.idB) : tr.offer.dstShard;
+        const mint: CtpMintReceipt = { tag: "ctp-mint", dstShard: dstId, srcShard: tr.burn.srcShard, destAddr: tr.burn.destAddr, amount: tr.burn.amount, nonce: tr.burn.nonce };
+        if (!ctpConservationCheck(tr.burn, mint)) { sys("✗ burn/mint do not conserve"); break; }
         let next = ctpAdvance(tr, { k: "mint", mint });
-        if (next === tr) { sys(`can't mint from status "${tr.status}"`); break; }
+        if (next === tr) { sys(`can't mint from "${tr.status}"`); break; }
         const receipt: CtpReceipt = { id, burn: tr.burn, mint, at: Date.now() };
         next = ctpAdvance(next, { k: "receipt", receipt });
         ctpTransfers.set(id, next);
-        ctpReceiptStore.set(id, receipt);
-        saveCtpReceipts();
-        signedBroadcast({ kind: "ctp-mint", id, mint });
+        ctpReceiptStore.set(id, receipt); saveCtpReceipts();
         signedBroadcast({ kind: "ctp-receipt", ...receipt });
-        sys(`✓ ${id} minted — ${mint.amount} REV to ${mint.destAddr} on ${mint.dstShard}`);
-        sys(`  receipt recorded and broadcast`);
+        sys(`✓ ${id} minted — ${mint.amount} REV to ${mint.destAddr}, receipt broadcast`);
         break;
       }
 
@@ -4825,19 +4759,18 @@ function handleCommand(raw: string): string[] {
         const id = tks[1] ?? "";
         const tr = ctpTransfers.get(id);
         if (!tr) { sys(`no transfer ${id}`); break; }
-        const reason = tks.slice(2).join(" ") || "aborted by operator";
+        const reason = tks.slice(2).join(" ") || "aborted";
         const next = ctpAdvance(tr, { k: "abort", reason });
-        if (next === tr) { sys(`can't abort from status "${tr.status}"`); break; }
+        if (next === tr) { sys(`can't abort from "${tr.status}"`); break; }
         ctpTransfers.set(id, next);
         signedBroadcast({ kind: "ctp-abort", id, reason });
         sys(`✓ ${id} aborted (${reason})`);
         if (tr.burn) {
-          const escrowSrc = tr.offer.srcShard === spec!.shardA ? spec!.escrowA : spec!.escrowB;
+          const sp = bridgeByPair(tr.offer.pair);
+          const escrowSrc = sp ? (tr.offer.srcShard === sp.shardA ? sp.escrowA : sp.escrowB) : undefined;
           if (escrowSrc) {
-            sys(`  the lock on ${tr.offer.srcShard} is refundable — /rholang rnode ${tr.offer.srcShard} then deploy:`);
-            sys("  ```");
-            sys("  " + ctpRefundProgram(escrowSrc, tr.burn.nonce).replace(/\n/g, "\n  "));
-            sys("  ```");
+            sys(`  the lock is refundable — /rholang rnode ${tr.offer.srcShard}  then deploy:`);
+            sys("  ```"); sys("  " + ctpRefundProgram(escrowSrc, tr.burn.nonce).replace(/\n/g, "\n  ")); sys("  ```");
           }
         }
         break;
@@ -4845,9 +4778,8 @@ function handleCommand(raw: string): string[] {
 
       if (sub === "status") {
         const id = tks[1];
-        const all = [...ctpTransfers.values()];
-        const list = id ? all.filter((tr) => tr.offer.id === id) : all;
-        if (!list.length) { sys(id ? `no transfer ${id}` : "no transfers in flight"); break; }
+        const list = [...ctpTransfers.values()].filter((tr) => !id || tr.offer.id === id);
+        if (!list.length) { sys(id ? `no transfer ${id}` : "no transfers"); break; }
         sys(`transfers (${list.length}):`);
         for (const tr of list) fmtTransfer(tr);
         break;
@@ -4857,20 +4789,8 @@ function handleCommand(raw: string): string[] {
         if (!ctpReceiptStore.size) { sys("no completed transfers in this room"); break; }
         sys(`completed (${ctpReceiptStore.size}):`);
         for (const r of ctpReceiptStore.values()) {
-          sys(`  ${r.id}  ${r.mint.amount} REV  ${r.burn.srcShard} → ${r.mint.dstShard}  → ${r.mint.destAddr}`);
+          sys(`  ${r.id}  ${r.mint.amount} REV  ${r.burn.srcShard} → ${r.mint.dstShard} → ${r.mint.destAddr}`);
         }
-        break;
-      }
-
-      if (sub === "verify" || sub === "lockof") {
-        const s = bridgeForRoom() ?? bridgeByPair(tks[1] ?? "");
-        const nonce = (sub === "lockof" ? tks[1] : tks[2]) ?? "";
-        const escrow = s ? (s.escrowA ?? s.escrowB) : "";
-        if (!s || !nonce || !escrow) { sys("usage: /ctp lockof <nonce>   (in a bridge room with an escrow set)"); break; }
-        sys(`# read the lock — /rholang rnode ${s.shardA}   then eval:`);
-        sys("```");
-        sys(ctpLockOfProgram(s.escrowA ?? escrow, nonce));
-        sys("```");
         break;
       }
 

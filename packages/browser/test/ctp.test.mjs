@@ -34,7 +34,7 @@ const { validateCapability } = await import(
 
 const {
   ownerId, normalizeShardRef, bridgePairKey, bridgeVaultHandle,
-  deriveBridgeRoom, makeBridgeSpec, bridgeSpecIsConsistent,
+  deriveBridgeRoom, makeBridge, bridgeSpecIsConsistent,
   newTransferId, transferNonce, ctpConservationCheck, ctpAdvance,
   ctpOfferFromWire, burnReceiptFromWire, mintReceiptFromWire, ctpReceiptFromWire,
   burnReceiptToTuple, burnReceiptFromTuple,
@@ -98,15 +98,17 @@ const B = "http://127.0.0.1:40404";
   ok("two of the same shard throws", threw);
 }
 
-// --- makeBridgeSpec / consistency --------------------------------------
+// --- makeBridge / consistency ----------------------------------------
 {
-  const spec = makeBridgeSpec(alice, "127.0.0.1:40403", B, 111);
+  const spec = makeBridge("127.0.0.1:40403", B, "root", "shard-b", 111);
   ok("spec normalizes shard refs", spec.shardA === A && spec.shardB === B);
-  ok("spec roomCap matches deriveBridgeRoom", spec.roomCap === deriveBridgeRoom(alice, A, B));
+  ok("spec carries the ids", spec.idA === "root" && spec.idB === "shard-b");
   ok("spec carries the timestamp", spec.at === 111);
+  ok("ids default when blank", makeBridge(A, B, "", "").idA === "shard-a");
   ok("fresh spec is consistent", bridgeSpecIsConsistent(spec));
-  ok("tampered roomCap is caught", !bridgeSpecIsConsistent({ ...spec, roomCap: "cap:room:2460" }));
-  ok("tampered owner is caught", !bridgeSpecIsConsistent({ ...spec, owner: bob }));
+  ok("same-node bridge is rejected", (() => { try { makeBridge(A, A, "x", "y"); return false; } catch { return true; } })());
+  ok("a spec with equal urls is inconsistent", !bridgeSpecIsConsistent({ ...spec, shardB: A }));
+  ok("a spec missing an id is inconsistent", !bridgeSpecIsConsistent({ ...spec, idB: "" }));
 }
 
 // --- transfer id + deterministic nonce --------------------------------
@@ -120,8 +122,8 @@ const B = "http://127.0.0.1:40404";
 
 // --- conservation -----------------------------------------------------
 {
-  const burn = { tag: "ctp-burn", srcShard: A, subject: "1111x", amount: "30", nonce: "ctp-1", destAddr: "1111bob" };
-  const mint = { tag: "ctp-mint", dstShard: B, srcShard: A, destAddr: "1111bob", amount: "30", nonce: "ctp-1" };
+  const burn = { tag: "ctp-burn", srcShard: "root", subject: "1111x", amount: "30", nonce: "ctp-1", destAddr: "1111bob" };
+  const mint = { tag: "ctp-mint", dstShard: "shard-b", srcShard: "root", destAddr: "1111bob", amount: "30", nonce: "ctp-1" };
   ok("matching burn/mint conserve", ctpConservationCheck(burn, mint));
   ok("amount mismatch fails", !ctpConservationCheck(burn, { ...mint, amount: "31" }));
   ok("nonce mismatch fails", !ctpConservationCheck(burn, { ...mint, nonce: "ctp-2" }));
@@ -132,8 +134,8 @@ const B = "http://127.0.0.1:40404";
 // --- state machine ---------------------------------------------------
 {
   const offer = { id: "abc", pair: bridgePairKey(A, B), srcShard: A, dstShard: B, what: "value", amount: "30", destAddr: "1111bob", by: "p1", at: 1, expiresAt: 9 };
-  const burn = { tag: "ctp-burn", srcShard: A, subject: "1111x", amount: "30", nonce: transferNonce("abc"), destAddr: "1111bob" };
-  const mint = { tag: "ctp-mint", dstShard: B, srcShard: A, destAddr: "1111bob", amount: "30", nonce: transferNonce("abc") };
+  const burn = { tag: "ctp-burn", srcShard: "root", subject: "1111x", amount: "30", nonce: transferNonce("abc"), destAddr: "1111bob" };
+  const mint = { tag: "ctp-mint", dstShard: "shard-b", srcShard: "root", destAddr: "1111bob", amount: "30", nonce: transferNonce("abc") };
   let t = { offer, status: "offered", updatedAt: 0 };
 
   const t0 = t;
@@ -184,8 +186,8 @@ const B = "http://127.0.0.1:40404";
   ok("missing destAddr is rejected", ctpOfferFromWire({ ...good, destAddr: "" }) === null);
   ok("junk is rejected", ctpOfferFromWire(null) === null && ctpOfferFromWire("x") === null);
 
-  const burn = { tag: "ctp-burn", srcShard: A, subject: "1111x", amount: "30", nonce: "ctp-d34db33f", destAddr: "1111bob" };
-  const mint = { tag: "ctp-mint", dstShard: B, srcShard: A, destAddr: "1111bob", amount: "30", nonce: "ctp-d34db33f" };
+  const burn = { tag: "ctp-burn", srcShard: "root", subject: "1111x", amount: "30", nonce: "ctp-d34db33f", destAddr: "1111bob" };
+  const mint = { tag: "ctp-mint", dstShard: "shard-b", srcShard: "root", destAddr: "1111bob", amount: "30", nonce: "ctp-d34db33f" };
   ok("burn receipt parses", !!burnReceiptFromWire(burn));
   ok("burn receipt with bad tag rejected", burnReceiptFromWire({ ...burn, tag: "x" }) === null);
   ok("mint receipt parses", !!mintReceiptFromWire(mint));
@@ -195,11 +197,11 @@ const B = "http://127.0.0.1:40404";
 
 // --- rholang tuple round-trip -------------------------------------
 {
-  const burn = { tag: "ctp-burn", srcShard: A, subject: "1111x", amount: "30", nonce: "ctp-abc", destAddr: "1111bob" };
+  const burn = { tag: "ctp-burn", srcShard: "root", subject: "1111x", amount: "30", nonce: "ctp-abc", destAddr: "1111bob" };
   const tuple = burnReceiptToTuple(burn);
-  ok("tuple text is the rholang shape", tuple === `("ctp-burn", ${JSON.stringify(A)}, "1111x", 30, "ctp-abc", "1111bob")`);
+  ok("tuple text is the rholang shape", tuple === `("ctp-burn", "root", "1111x", 30, "ctp-abc", "1111bob")`);
   const back = burnReceiptFromTuple(tuple);
-  ok("tuple round-trips", !!back && back.subject === "1111x" && back.amount === "30" && back.nonce === "ctp-abc" && back.destAddr === "1111bob");
+  ok("tuple round-trips", !!back && back.srcShard === "root" && back.subject === "1111x" && back.amount === "30" && back.nonce === "ctp-abc" && back.destAddr === "1111bob");
   ok("an error list is not a burn receipt", burnReceiptFromTuple('["dup nonce", "ctp-abc"]') === null);
   ok("whitespace is tolerated", !!burnReceiptFromTuple(`  ${tuple}  `));
 }
