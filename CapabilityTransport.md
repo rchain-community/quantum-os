@@ -7,17 +7,17 @@ chains later — with a [quantum-os](README.md) room as the venue.
 
 Status: **design + Phases 1–3 landed.** The shipped flow is deliberately
 minimal: a **bridge is one account — this browser's `/rholang` key — with a
-`ctpEscrow` deployed on two rnodes**. `/ctp new` registers the pair, `/ctp setup`
-deploys and cross-registers the two escrows, `/ctp send` deploys the burn on one
+`captpEscrow` deployed on two rnodes**. `/captp new` registers the pair, `/captp setup`
+deploys and cross-registers the two escrows, `/captp send` deploys the burn on one
 node and the mint on the other (via
 [`deployToNode`](packages/browser/src/rholang.ts), a per-node deploy) and
 broadcasts the receipt to whatever room you are in. Verified end to end across
 two real nodes with real funded deploys by
-[`ctp-e2e.mjs`](scripts/localnet/ctp-e2e.mjs).
+[`captp-e2e.mjs`](scripts/localnet/captp-e2e.mjs).
 
 The rest of this document — a **derived coordination room**, group ownership,
 multiple operators, non-key-holding users routed in through a helper — is the
-**Phase 4** design. `deriveBridgeRoom` and the `ctp-offer`/`ctp-lock`/`ctp-mint`
+**Phase 4** design. `deriveBridgeRoom` and the `captp-offer`/`captp-lock`/`captp-mint`
 wire kinds are in the code, unused by the single-operator flow, waiting for it.
 Tracked in [issue #173](https://github.com/rchain-community/quantum-os/issues/173).
 
@@ -50,7 +50,7 @@ shared closure between them (ER=EPR, [`Room_Bridges.md`](Room_Bridges.md)).
 | **Nearest common ancestor** — where a cross-shard exchange is a normal transaction | the **bridge room** — the interaction manifold |
 | **Object reference / sturdyref** · a **purse** | a ZFA `cap:` token · a `/note` (split/merge preserve ZFA count-balance — "a purse sprouts from a purse") |
 | **Vat** · a **shard** | a shard, reached over `/rholang`'s HTTP API, or via a helper daemon |
-| **Mint / KonsensusProxy** — validator-gated burn-and-mint at the boundary | a rholang **`ctpEscrow`** contract per shard, gated by the bridge account's `deployerId` |
+| **Mint / KonsensusProxy** — validator-gated burn-and-mint at the boundary | a rholang **`captpEscrow`** contract per shard, gated by the bridge account's `deployerId` |
 | **Three-party handoff / "gifting"** — certificate-based introduction | group ownership of the bridge: a `/gov` decision is the certificate; `/gov censure` + treasury slash is the deterrent |
 | **Distributed GC** | out of scope |
 
@@ -95,7 +95,7 @@ code path.
 > **Phase 4, not the shipped flow.** Everything from here to the end of this
 > section is the design for group-owned bridges and multi-operator coordination.
 > The shipped single-operator flow needs none of it — a bridge is a stored
-> `{shardA, shardB, idA, idB, escrowA, escrowB}` config, and `/ctp send` runs
+> `{shardA, shardB, idA, idB, escrowA, escrowB}` config, and `/captp send` runs
 > two deploys from the one operator's key.
 
 ### The bridge room is derived, not minted
@@ -104,13 +104,13 @@ The room where a bridge operates is a **pure function of the owner id and the
 (unordered) shard pair**:
 
 ```
-roomCap = zfaRejectionSample( SHA256( "quantum-os/ctp-room:v1"
+roomCap = zfaRejectionSample( SHA256( "quantum-os/captp-room:v1"
                                       ‖ ownerId
                                       ‖ min(shardA, shardB)
                                       ‖ max(shardA, shardB) ) )
 ```
 
-`deriveBridgeRoom` in [`ctp.ts`](packages/browser/src/ctp.ts). Every operator of
+`deriveBridgeRoom` in [`captp.ts`](packages/browser/src/captp.ts). Every operator of
 the account computes the same address; nothing is announced. The room is
 **private because its address is only computable by the owner** — the same
 predictable-derivation-from-a-key idiom the deploy-result registry slot already
@@ -142,30 +142,30 @@ signed state today.
 ## The transfer — lock-and-mint
 
 Value crossing from shard A to shard B. The escrow contract is
-[`ctp-escrow.js`](packages/browser/src/ctp-escrow.js) (`CTP_ESCROW_RHO` +
+[`captp-escrow.js`](packages/browser/src/captp-escrow.js) (`CAPTP_ESCROW_RHO` +
 `installProgram` / `lockProgram` / `mintProgram` / `refundProgram` /
 `lockOfProgram` / `infoProgram`), one deployed per shard by the bridge account.
 
-1. **Lock on A.** `ctpEscrow.lock(amount, destAddrOnB, nonce)` on shard A. A
+1. **Lock on A.** `captpEscrow.lock(amount, destAddrOnB, nonce)` on shard A. A
    reused `nonce` is refused; otherwise `amount` REV moves from the caller's
    vault to the bridge account's own address on shard A (`poolAddr`), a lock
    record `{subject, amount, destAddr, status:"locked"}` is stored under
    `nonce`, and the call returns the **burn receipt**
-   `("ctp-burn", shardA, subject, amount, nonce, destAddrOnB)`.
-2. **Relay.** The burn receipt goes into the bridge room as a `ctp-lock`
+   `("captp-burn", shardA, subject, amount, nonce, destAddrOnB)`.
+2. **Relay.** The burn receipt goes into the bridge room as a `captp-lock`
    envelope (dyncap-signed). A counterpart operator or an auditor can check it
-   against shard A independently with `ctpEscrow.lockOf(nonce)`.
-3. **Mint on B.** `ctpEscrow.mint(burnReceipt)` on shard B (owner only) checks
+   against shard A independently with `captpEscrow.lockOf(nonce)`.
+3. **Mint on B.** `captpEscrow.mint(burnReceipt)` on shard B (owner only) checks
    the receipt shape, that `shardA` is a **registered counterpart**, and that
    `nonce` is unseen; then `amount` REV moves from the bridge account's address
    on shard B to `destAddrOnB`, and the mint receipt is stored under `nonce`.
-   **Idempotent by nonce** — a replayed `ctp-mint` returns the stored receipt
+   **Idempotent by nonce** — a replayed `captp-mint` returns the stored receipt
    and pays nothing.
-4. **Receipt.** A permanent `ctp-receipt` `(burnReceipt, mintReceipt, srcBlock,
+4. **Receipt.** A permanent `captp-receipt` `(burnReceipt, mintReceipt, srcBlock,
    dstBlock)` is broadcast and stored (non-transferable, tombstone-aware, like
    `/note` receipts).
 
-If the mint never happens, `ctpEscrow.refund(nonce)` on shard A (owner only)
+If the mint never happens, `captpEscrow.refund(nonce)` on shard A (owner only)
 returns `amount` from `poolAddr` to the original subject and marks the lock
 refunded. Atomicity is **best-effort, like `/rdv`** — safe under retry because
 `mint` is nonce-idempotent and an un-minted `lock` is refundable by the same
@@ -176,19 +176,19 @@ deploy key (`findOrCreate` needs a `deployerId`), so the escrow contract cannot
 hold REV in its own name — the in-transit amount sits in the bridge account's
 `poolAddr` from the moment of `lock`, and `refund` is owner-gated. A Tier‑1
 bridge operator is therefore trusted for good faith, with the deterrents being
-social (`/gov censure`, the room's `ctp-*` audit trail, `lockOf` verification)
+social (`/gov censure`, the room's `captp-*` audit trail, `lockOf` verification)
 rather than an on-chain guarantee. Tier 2 (below) is what removes that trust.
 Bearer-`cap:` transport (a `proxyId` under `rho:qucalc:verify`, Phase 5) has no
 custody question — nothing is escrowed, only forwarded and revocable.
 
 ### The rholang is the DNA, and rnode is untouched
 
-`ctpEscrow` is an ordinary rholang contract deployed **by the bridge account**
+`captpEscrow` is an ordinary rholang contract deployed **by the bridge account**
 to each shard's registry through the existing `/rholang deploy` path
 (secp256k1 over blake2b256 of the `DeployDataProto`). It is gated by
 `deployerId` — the locker's "the id IS the authority" rule
 ([`locker.js`](packages/browser/src/locker.js)) — so only the bridge account
-can `register` a counterpart or `refund`. A `$ctp` macro family drives the
+can `register` a counterpart or `refund`. A `$captp` macro family drives the
 deploys ("the macro is the bridge",
 [issue #138](https://github.com/rchain-community/quantum-os/issues/138)). It
 uses only powerbox names that already ship (`rho:qucalc:verify`,
@@ -203,13 +203,13 @@ conveniences, not dependencies.
 
 When a group owns the bridge, moving value is a governed act.
 
-- **Custody** — the key is a `gov-vault` record under a `ctp:<pair>` handle,
+- **Custody** — the key is a `gov-vault` record under a `captp:<pair>` handle,
   replicated to members and daemon-persisted; ⅔ rotates it (and rotation
   matters after a member leaves — a departed member still saw past ciphertext,
   which is offline-crackable, `SECURITY.md`).
 - **Policy** — `group-meta` records the bridge's `{ pair, escrowUris,
   autoThreshold }`. A transfer at or below `autoThreshold` executes
-  immediately (any vault-holding member). Above it, `/ctp send` opens a `/gov`
+  immediately (any vault-holding member). Above it, `/captp send` opens a `/gov`
   issue and a bound `/poll`, and the **mint leg waits for a weighted ⅔**
   (`resolveWeights` + `trustWeightsFor` — delegation- and trust-weighted, per
   [`Governance.md`](Governance.md)).
@@ -243,9 +243,9 @@ For adversarial or high-value bridges, escalated to by a group-set threshold:
   its own key and broadcasts a **secp256k1-signed** attestation
   `{ program, preStateHash, postStateHash, result, blockHash }`; the room
   confirms a leg only when attestations reach a `/probe`-style supermajority,
-  `/gov`-trust-weighted (`ctp-quorum.ts`, mirroring
+  `/gov`-trust-weighted (`captp-quorum.ts`, mirroring
   [`probe.ts`](packages/browser/src/probe.ts)).
-- **On-chain multisig escrow.** `ctpEscrow` gated by an M-of-N threshold over
+- **On-chain multisig escrow.** `captpEscrow` gated by an M-of-N threshold over
   members' individual keys (`$multisig` territory) instead of the one shared
   key — real enforcement, at the cost of every member being funded on both
   shards and every transfer collecting signatures.
@@ -258,7 +258,7 @@ For adversarial or high-value bridges, escalated to by a group-set threshold:
 spending them in a different room is **undetectable** — "closing it would
 require a shared nullifier set, which means consensus — out of scope."
 
-**That limitation is resolved for `/ctp` transfers.** `ctpEscrow`'s
+**That limitation is resolved for `/captp` transfers.** `captpEscrow`'s
 consumed-nonce set lives on a deterministic, replicated rnode — it *is* the
 shared nullifier set, and a shard *is* the consensus the earlier note said would
 be needed. A `lock` whose nonce is already spent is rejected; a `mint` whose
@@ -282,8 +282,8 @@ stays undetectable; a transfer that goes through a shard does not.
   the contract and is deferred; Tier 2 removes the trust rather than softening
   it.
 - **The escrow rholang is verified end to end.**
-  `scripts/localnet/ctp-escrow-check.mjs` drives every verb on a live rnode
-  (`revVault` stubbed); `scripts/localnet/ctp-e2e.mjs` does the whole flow with
+  `scripts/localnet/captp-escrow-check.mjs` drives every verb on a live rnode
+  (`revVault` stubbed); `scripts/localnet/captp-e2e.mjs` does the whole flow with
   **real signed, genesis-funded deploys** — install both escrows, register,
   a funded `lock` and `mint` — and asserts the recipient's REV balance moved by
   the transfer amount. Both pass on bin/rnode 0.1.0. What is *not* yet covered:
@@ -301,7 +301,7 @@ stays undetectable; a transfer that goes through a shard does not.
 
 ## Future — interface to Agoric
 
-The wire vocabulary (`ctp-offer` / `ctp-lock` / `ctp-mint` / `ctp-receipt`) and
+The wire vocabulary (`captp-offer` / `captp-lock` / `captp-mint` / `captp-receipt`) and
 the receipt shape are chosen to line up with **OCapN**'s `op:deliver` /
 `op:deliver-only` and its handoff-certificate model, so a future
 `scripts/qos-cli/ocapn-netlayer.mjs` adapter can present a quantum-os room as an
@@ -317,7 +317,7 @@ depend on it.
 
 - [`Room_Bridges.md`](Room_Bridges.md) — information across rooms; the bridge-peer / ER=EPR model this builds on.
 - [`Governance.md`](Governance.md) — a group as an identity; delegation- and trust-weighted tally; treasury; censure.
-- [`SECURITY.md`](SECURITY.md) — the threat model, including the double-spend limitation this closes for `/ctp`.
+- [`SECURITY.md`](SECURITY.md) — the threat model, including the double-spend limitation this closes for `/captp`.
 - [issue #173](https://github.com/rchain-community/quantum-os/issues/173) — the tracking issue for this work.
 - [issue #138](https://github.com/rchain-community/quantum-os/issues/138) — rnodes as room members, multi-chain, "the macro is the bridge".
 - [issue #107](https://github.com/rchain-community/quantum-os/issues/107) — revocable proxy capabilities.

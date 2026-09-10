@@ -82,16 +82,16 @@ jobs:
       - name: Locker selftest
         run: node packages/browser/src/locker.js --selftest
 
-      # The cross-shard transport escrow (#173) — plain JS like the locker, so
-      # its shape (balanced, verb names, arg positions, no quoted names) is
-      # checked with no build. Live-node verification is tracked on the issue.
-      - name: CTP escrow selftest
-        run: node packages/browser/src/ctp-escrow.js --selftest
+      # The /captp cross-shard transport escrow (#173) — plain JS like the
+      # locker, so its shape (balanced, verb names, arg positions, no quoted
+      # names) is checked with no build. Live-node verification is on the issue.
+      - name: CapTP escrow selftest
+        run: node packages/browser/src/captp-escrow.js --selftest
 
-      # Bridge identity + the derived room — deterministic, order-independent,
-      # owner-bound, and always a ZFA-valid room cap.
-      - name: CTP transport test
-        run: node packages/browser/test/ctp.test.mjs
+      # /captp protocol — the transfer nonce, conservation, the state machine,
+      # the wire validators, the rholang-tuple round-trip.
+      - name: CapTP transport test
+        run: node packages/browser/test/captp.test.mjs
 
       # Browser behaviour, against stubbed media. Not a rendering test — it
       # asserts which track ends up in the stream a joiner would be given.

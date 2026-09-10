@@ -20,7 +20,7 @@
 /// idiom the deploy-result registry slot already uses (`registryUriOf`).
 ///
 /// This module is pure — no DOM, no storage, no app imports beyond `zfa.ts`.
-/// It mirrors `probe.ts` / `polls.ts` in that respect. The `/ctp` command
+/// It mirrors `probe.ts` / `polls.ts` in that respect. The `/captp` command
 /// wiring, wire kinds, and stores live in `app.ts`; see `CapabilityTransport.md`.
 
 import { sha256 } from "@noble/hashes/sha2.js";
@@ -86,14 +86,14 @@ export function bridgePairKey(shardA: string, shardB: string): string {
 /// The `gov-vault` / `vault.ts` handle under which a bridge account key is
 /// stored. Namespaced so it can never collide with a person's login handle.
 export function bridgeVaultHandle(shardA: string, shardB: string): string {
-  return `ctp:${bridgePairKey(shardA, shardB)}`;
+  return `captp:${bridgePairKey(shardA, shardB)}`;
 }
 
 // ---------------------------------------------------------------------------
 // Deriving the bridge room
 // ---------------------------------------------------------------------------
 
-const ROOM_DOMAIN = "quantum-os/ctp-room:v1";
+const ROOM_DOMAIN = "quantum-os/captp-room:v1";
 
 /// The maximum number of rejection-sampling iterations before we give up.
 /// `bytesToTwists` makes the count balance hold by construction, so only Pauli
@@ -149,7 +149,7 @@ export interface BridgeSpec {
   /// (disambiguated if both nodes report the same id).
   idA: string;
   idB: string;
-  /// Registry URIs of the `ctpEscrow` contract on each side, once `/ctp setup`
+  /// Registry URIs of the `captpEscrow` contract on each side, once `/captp setup`
   /// has deployed them. `rho:id:…`.
   escrowA?: string;
   escrowB?: string;
@@ -238,20 +238,20 @@ function twistsToHex(twists: Uint8Array): string {
 }
 
 // ===========================================================================
-// The `/ctp` transport protocol
+// The `/captp` transport protocol
 //
 // A transfer moves value (or a capability) from a source shard to a
 // destination shard through the bridge room. The wire kinds are dyncap-signed
-// and follow the `/rdv` lineage; the on-shard legs are `ctpEscrow` deploys
-// (`ctp-escrow.js`). This section is the pure protocol: the envelope shapes,
+// and follow the `/rdv` lineage; the on-shard legs are `captpEscrow` deploys
+// (`captp-escrow.js`). This section is the pure protocol: the envelope shapes,
 // their defensive validators (every one arrives from a peer), the deterministic
 // nonce, the conservation check, and the state machine.
 // ===========================================================================
 
-export type CtpKind = "ctp-offer" | "ctp-lock" | "ctp-mint" | "ctp-receipt" | "ctp-abort";
+export type CaptpKind = "captp-offer" | "captp-lock" | "captp-mint" | "captp-receipt" | "captp-abort";
 
 /// A proposed transfer, broadcast into the bridge room by the initiator.
-export interface CtpOffer {
+export interface CaptpOffer {
   id: string;                 // transfer id — `newTransferId()`
   pair: string;               // `bridgePairKey(srcShard, dstShard)`
   srcShard: string;           // normalized rnode url — where value is locked
@@ -265,10 +265,10 @@ export interface CtpOffer {
   expiresAt: number;
 }
 
-/// What `ctpEscrow.lock` returns and `ctp-lock` carries. Mirrors the rholang
-/// tuple `("ctp-burn", shardId, subject, amount, nonce, destAddr)`.
-export interface CtpBurnReceipt {
-  tag: "ctp-burn";
+/// What `captpEscrow.lock` returns and `captp-lock` carries. Mirrors the rholang
+/// tuple `("captp-burn", shardId, subject, amount, nonce, destAddr)`.
+export interface CaptpBurnReceipt {
+  tag: "captp-burn";
   srcShard: string;
   subject: string;            // the address/id debited on the source shard
   amount: string;             // decimal string
@@ -276,10 +276,10 @@ export interface CtpBurnReceipt {
   destAddr: string;
 }
 
-/// What `ctpEscrow.mint` returns and `ctp-mint` carries. Mirrors the rholang
-/// tuple `("ctp-mint", shardId, destAddr, amount, nonce, srcShard)`.
-export interface CtpMintReceipt {
-  tag: "ctp-mint";
+/// What `captpEscrow.mint` returns and `captp-mint` carries. Mirrors the rholang
+/// tuple `("captp-mint", shardId, destAddr, amount, nonce, srcShard)`.
+export interface CaptpMintReceipt {
+  tag: "captp-mint";
   dstShard: string;
   destAddr: string;
   amount: string;
@@ -289,26 +289,26 @@ export interface CtpMintReceipt {
 
 /// The permanent record, broadcast on completion and stored (non-transferable,
 /// tombstone-aware) — the audit trail for a completed crossing.
-export interface CtpReceipt {
+export interface CaptpReceipt {
   id: string;
-  burn: CtpBurnReceipt;
-  mint: CtpMintReceipt;
+  burn: CaptpBurnReceipt;
+  mint: CaptpMintReceipt;
   srcBlock?: string;
   dstBlock?: string;
   at: number;
 }
 
-export type CtpStatus = "offered" | "locked" | "minted" | "receipted" | "aborted";
+export type CaptpStatus = "offered" | "locked" | "minted" | "receipted" | "aborted";
 
 /// In-flight transfer state, kept per bridge room (not persisted — the
-/// permanent record is the `CtpReceipt`; a reload rebuilds in-flight state from
-/// the `ctp-*` envelopes still in the room, or the operator re-checks on chain).
-export interface CtpTransfer {
-  offer: CtpOffer;
-  status: CtpStatus;
-  burn?: CtpBurnReceipt;
-  mint?: CtpMintReceipt;
-  receipt?: CtpReceipt;
+/// permanent record is the `CaptpReceipt`; a reload rebuilds in-flight state from
+/// the `captp-*` envelopes still in the room, or the operator re-checks on chain).
+export interface CaptpTransfer {
+  offer: CaptpOffer;
+  status: CaptpStatus;
+  burn?: CaptpBurnReceipt;
+  mint?: CaptpMintReceipt;
+  receipt?: CaptpReceipt;
   abortReason?: string;
   updatedAt: number;
 }
@@ -323,22 +323,22 @@ export function newTransferId(): string {
 }
 
 /// The escrow nonce for a transfer — a pure function of its id, so the `lock`
-/// leg and the `mint` leg always agree and a replayed `ctp-mint` hits the
+/// leg and the `mint` leg always agree and a replayed `captp-mint` hits the
 /// escrow's idempotency check rather than paying twice.
-export function transferNonce(offerOrId: CtpOffer | string): string {
+export function transferNonce(offerOrId: CaptpOffer | string): string {
   const id = typeof offerOrId === "string" ? offerOrId : offerOrId.id;
-  return `ctp-${id}`;
+  return `captp-${id}`;
 }
 
 // --- conservation --------------------------------------------------------
 
 /// The burn and the mint describe the same crossing: same nonce, same amount,
 /// same destination. (The escrow enforces this on chain too — this is the
-/// room's own check before it writes a `ctp-receipt`.)
-export function ctpConservationCheck(burn: CtpBurnReceipt, mint: CtpMintReceipt): boolean {
+/// room's own check before it writes a `captp-receipt`.)
+export function captpConservationCheck(burn: CaptpBurnReceipt, mint: CaptpMintReceipt): boolean {
   return (
-    burn.tag === "ctp-burn" &&
-    mint.tag === "ctp-mint" &&
+    burn.tag === "captp-burn" &&
+    mint.tag === "captp-mint" &&
     burn.nonce === mint.nonce &&
     burn.amount === mint.amount &&
     burn.destAddr === mint.destAddr &&
@@ -349,33 +349,33 @@ export function ctpConservationCheck(burn: CtpBurnReceipt, mint: CtpMintReceipt)
 
 // --- the state machine --------------------------------------------------
 
-export type CtpEvent =
-  | { k: "lock"; burn: CtpBurnReceipt }
-  | { k: "mint"; mint: CtpMintReceipt }
-  | { k: "receipt"; receipt: CtpReceipt }
+export type CaptpEvent =
+  | { k: "lock"; burn: CaptpBurnReceipt }
+  | { k: "mint"; mint: CaptpMintReceipt }
+  | { k: "receipt"; receipt: CaptpReceipt }
   | { k: "abort"; reason: string };
 
 /// Advance a transfer. Ordering is enforced (`mint` needs a `lock`; nothing
 /// follows `receipted` or `aborted` except an idempotent repeat of the same
 /// step). An illegal transition returns the state unchanged — callers compare
 /// identity to tell whether anything happened.
-export function ctpAdvance(t: CtpTransfer, ev: CtpEvent, now: number = Date.now()): CtpTransfer {
+export function captpAdvance(t: CaptpTransfer, ev: CaptpEvent, now: number = Date.now()): CaptpTransfer {
   const done = t.status === "receipted" || t.status === "aborted";
   switch (ev.k) {
     case "lock": {
       if (t.status !== "offered" && !(t.status === "locked" && sameBurn(t.burn, ev.burn))) return t;
-      if (ev.burn.tag !== "ctp-burn") return t;
+      if (ev.burn.tag !== "captp-burn") return t;
       return { ...t, status: "locked", burn: ev.burn, updatedAt: now };
     }
     case "mint": {
       if (!t.burn) return t;
       if (t.status !== "locked" && !(t.status === "minted" && sameMint(t.mint, ev.mint))) return t;
-      if (ev.mint.tag !== "ctp-mint" || !ctpConservationCheck(t.burn, ev.mint)) return t;
+      if (ev.mint.tag !== "captp-mint" || !captpConservationCheck(t.burn, ev.mint)) return t;
       return { ...t, status: "minted", mint: ev.mint, updatedAt: now };
     }
     case "receipt": {
       if (t.status !== "minted" && !(t.status === "receipted")) return t;
-      if (!t.burn || !ctpConservationCheck(t.burn, ev.receipt.mint)) return t;
+      if (!t.burn || !captpConservationCheck(t.burn, ev.receipt.mint)) return t;
       return { ...t, status: "receipted", receipt: ev.receipt, updatedAt: now };
     }
     case "abort": {
@@ -385,10 +385,10 @@ export function ctpAdvance(t: CtpTransfer, ev: CtpEvent, now: number = Date.now(
   }
 }
 
-function sameBurn(a: CtpBurnReceipt | undefined, b: CtpBurnReceipt): boolean {
+function sameBurn(a: CaptpBurnReceipt | undefined, b: CaptpBurnReceipt): boolean {
   return !!a && a.nonce === b.nonce && a.amount === b.amount && a.destAddr === b.destAddr;
 }
-function sameMint(a: CtpMintReceipt | undefined, b: CtpMintReceipt): boolean {
+function sameMint(a: CaptpMintReceipt | undefined, b: CaptpMintReceipt): boolean {
   return !!a && a.nonce === b.nonce && a.amount === b.amount && a.destAddr === b.destAddr;
 }
 
@@ -397,7 +397,7 @@ function sameMint(a: CtpMintReceipt | undefined, b: CtpMintReceipt): boolean {
 const isStr = (v: unknown): v is string => typeof v === "string" && v.length > 0;
 const isAmount = (v: unknown): v is string => typeof v === "string" && /^\d{1,40}$/.test(v);
 
-export function ctpOfferFromWire(x: unknown): CtpOffer | null {
+export function captpOfferFromWire(x: unknown): CaptpOffer | null {
   if (!x || typeof x !== "object") return null;
   const o = x as Record<string, unknown>;
   if (!isStr(o.id) || !isStr(o.pair) || !isStr(o.by) || !isStr(o.destAddr)) return null;
@@ -419,30 +419,30 @@ export function ctpOfferFromWire(x: unknown): CtpOffer | null {
   };
 }
 
-export function burnReceiptFromWire(x: unknown): CtpBurnReceipt | null {
+export function burnReceiptFromWire(x: unknown): CaptpBurnReceipt | null {
   if (!x || typeof x !== "object") return null;
   const b = x as Record<string, unknown>;
-  if (b.tag !== "ctp-burn") return null;
+  if (b.tag !== "captp-burn") return null;
   // srcShard here is the shard *id* the contract stamped (opaque), not a URL.
   if (!isStr(b.srcShard) || !isStr(b.subject) || !isAmount(b.amount) || !isStr(b.nonce) || !isStr(b.destAddr)) return null;
-  return { tag: "ctp-burn", srcShard: b.srcShard, subject: b.subject, amount: String(b.amount), nonce: b.nonce, destAddr: b.destAddr };
+  return { tag: "captp-burn", srcShard: b.srcShard, subject: b.subject, amount: String(b.amount), nonce: b.nonce, destAddr: b.destAddr };
 }
 
-export function mintReceiptFromWire(x: unknown): CtpMintReceipt | null {
+export function mintReceiptFromWire(x: unknown): CaptpMintReceipt | null {
   if (!x || typeof x !== "object") return null;
   const m = x as Record<string, unknown>;
-  if (m.tag !== "ctp-mint") return null;
+  if (m.tag !== "captp-mint") return null;
   // dstShard / srcShard are shard *ids* the contracts stamped, not URLs.
   if (!isStr(m.dstShard) || !isStr(m.srcShard) || !isStr(m.destAddr) || !isAmount(m.amount) || !isStr(m.nonce)) return null;
-  return { tag: "ctp-mint", dstShard: m.dstShard, srcShard: m.srcShard, destAddr: m.destAddr, amount: String(m.amount), nonce: m.nonce };
+  return { tag: "captp-mint", dstShard: m.dstShard, srcShard: m.srcShard, destAddr: m.destAddr, amount: String(m.amount), nonce: m.nonce };
 }
 
-export function ctpReceiptFromWire(x: unknown): CtpReceipt | null {
+export function captpReceiptFromWire(x: unknown): CaptpReceipt | null {
   if (!x || typeof x !== "object") return null;
   const r = x as Record<string, unknown>;
   const burn = burnReceiptFromWire(r.burn);
   const mint = mintReceiptFromWire(r.mint);
-  if (!isStr(r.id) || !burn || !mint || !ctpConservationCheck(burn, mint)) return null;
+  if (!isStr(r.id) || !burn || !mint || !captpConservationCheck(burn, mint)) return null;
   const at = Number(r.at);
   return {
     id: r.id, burn, mint, at: Number.isFinite(at) ? at : Date.now(),
@@ -451,25 +451,25 @@ export function ctpReceiptFromWire(x: unknown): CtpReceipt | null {
   };
 }
 
-// --- rholang tuple <-> CtpBurnReceipt (bridges ctp.ts <-> ctp-escrow.js) --
+// --- rholang tuple <-> CaptpBurnReceipt (bridges captp.ts <-> captp-escrow.js) --
 
 /// The rholang term text for a burn receipt, to hand to `mintProgram`.
-export function burnReceiptToTuple(b: CtpBurnReceipt): string {
+export function burnReceiptToTuple(b: CaptpBurnReceipt): string {
   const q = (s: string) => JSON.stringify(s);
-  return `("ctp-burn", ${q(b.srcShard)}, ${q(b.subject)}, ${b.amount}, ${q(b.nonce)}, ${q(b.destAddr)})`;
+  return `("captp-burn", ${q(b.srcShard)}, ${q(b.subject)}, ${b.amount}, ${q(b.nonce)}, ${q(b.destAddr)})`;
 }
 
-/// Parse what `ctpEscrow.lock` returned — the rholang render of
-/// `("ctp-burn", <str>, <str>, <int>, <str>, <str>)`. Tolerant of surrounding
+/// Parse what `captpEscrow.lock` returned — the rholang render of
+/// `("captp-burn", <str>, <str>, <int>, <str>, <str>)`. Tolerant of surrounding
 /// whitespace; returns null on anything else (a `["dup nonce", …]` / error list,
 /// or a shape this build renders differently).
-export function burnReceiptFromTuple(s: string): CtpBurnReceipt | null {
-  const m = /^\s*\(\s*"ctp-burn"\s*,\s*("(?:[^"\\]|\\.)*")\s*,\s*("(?:[^"\\]|\\.)*")\s*,\s*(\d{1,40})\s*,\s*("(?:[^"\\]|\\.)*")\s*,\s*("(?:[^"\\]|\\.)*")\s*\)\s*$/.exec(s);
+export function burnReceiptFromTuple(s: string): CaptpBurnReceipt | null {
+  const m = /^\s*\(\s*"captp-burn"\s*,\s*("(?:[^"\\]|\\.)*")\s*,\s*("(?:[^"\\]|\\.)*")\s*,\s*(\d{1,40})\s*,\s*("(?:[^"\\]|\\.)*")\s*,\s*("(?:[^"\\]|\\.)*")\s*\)\s*$/.exec(s);
   if (!m) return null;
   const unq = (x: string) => {
     try { return JSON.parse(x) as string; } catch { return null; }
   };
   const srcShard = unq(m[1]), subject = unq(m[2]), nonce = unq(m[4]), destAddr = unq(m[5]);
   if (srcShard == null || subject == null || nonce == null || destAddr == null) return null;
-  return { tag: "ctp-burn", srcShard, subject, amount: m[3], nonce, destAddr };
+  return { tag: "captp-burn", srcShard, subject, amount: m[3], nonce, destAddr };
 }
