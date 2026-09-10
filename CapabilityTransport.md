@@ -7,8 +7,9 @@ chains later — with a [quantum-os](README.md) room as the venue.
 
 Status: **design + Phase 1 landed** (`packages/browser/src/ctp.ts` — bridge
 identity and the derived room). The transport protocol, the rholang escrow, the
-helper daemon, and group policy are specified here and tracked in the issue this
-doc links; they are not built yet.
+helper daemon, and group policy are specified here and tracked in
+[issue #173](https://github.com/rchain-community/quantum-os/issues/173); they are
+not built yet.
 
 ---
 
@@ -272,6 +273,7 @@ depend on it.
 - [`Room_Bridges.md`](Room_Bridges.md) — information across rooms; the bridge-peer / ER=EPR model this builds on.
 - [`Governance.md`](Governance.md) — a group as an identity; delegation- and trust-weighted tally; treasury; censure.
 - [`SECURITY.md`](SECURITY.md) — the threat model, including the double-spend limitation this closes for `/ctp`.
+- [issue #173](https://github.com/rchain-community/quantum-os/issues/173) — the tracking issue for this work.
 - [issue #138](https://github.com/rchain-community/quantum-os/issues/138) — rnodes as room members, multi-chain, "the macro is the bridge".
 - [issue #107](https://github.com/rchain-community/quantum-os/issues/107) — revocable proxy capabilities.
 - [issue #103](https://github.com/rchain-community/quantum-os/issues/103) — a group is an identity.
