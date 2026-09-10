@@ -5,11 +5,13 @@ Companion to [`Room_Bridges.md`](Room_Bridges.md) (information across rooms) and
 moving **value and capabilities between shards** — RChain shards now, other
 chains later — with a [quantum-os](README.md) room as the venue.
 
-Status: **design + Phase 1 landed** (`packages/browser/src/ctp.ts` — bridge
-identity and the derived room). The transport protocol, the rholang escrow, the
-helper daemon, and group policy are specified here and tracked in
-[issue #173](https://github.com/rchain-community/quantum-os/issues/173); they are
-not built yet.
+Status: **design + Phases 1–2 landed.** Phase 1 —
+[`ctp.ts`](packages/browser/src/ctp.ts), bridge identity and the derived room.
+Phase 2 — [`ctp-escrow.js`](packages/browser/src/ctp-escrow.js), the rholang
+escrow contract and its deploy programs (shape-checked; live-node verification
+is a tracked follow-up). The `/ctp` wire protocol, the helper daemon, and group
+policy are specified here and tracked in
+[issue #173](https://github.com/rchain-community/quantum-os/issues/173).
 
 ---
 
@@ -123,32 +125,47 @@ signed state today.
 
 ---
 
-## The transfer — non-custodial burn-and-mint
+## The transfer — lock-and-mint
 
-Value crossing from shard A to shard B, with the bridge providing **liveness,
-never custody**:
+Value crossing from shard A to shard B. The escrow contract is
+[`ctp-escrow.js`](packages/browser/src/ctp-escrow.js) (`CTP_ESCROW_RHO` +
+`installProgram` / `lockProgram` / `mintProgram` / `refundProgram` /
+`lockOfProgram` / `infoProgram`), one deployed per shard by the bridge account.
 
-1. **Lock on A.** The user (or the bridge, on the user's behalf) deploys
-   `ctpEscrow.lock(amount | cap, destAddrOnB, nonce)` on shard A. It debits the
-   user's `revVault` — or, for a bearer `cap:` capability, consumes it after
-   `rho:qucalc:verify` re-checks ZFA closure — records `nonce` in a per-shard
-   consumed set, and writes a **burn receipt**
-   `(shardA, subject, amount, nonce, destAddrOnB, postStateHash)` to the
-   escrow's registry slot.
+1. **Lock on A.** `ctpEscrow.lock(amount, destAddrOnB, nonce)` on shard A. A
+   reused `nonce` is refused; otherwise `amount` REV moves from the caller's
+   vault to the bridge account's own address on shard A (`poolAddr`), a lock
+   record `{subject, amount, destAddr, status:"locked"}` is stored under
+   `nonce`, and the call returns the **burn receipt**
+   `("ctp-burn", shardA, subject, amount, nonce, destAddrOnB)`.
 2. **Relay.** The burn receipt goes into the bridge room as a `ctp-lock`
-   envelope (dyncap-signed).
-3. **Mint on B.** `ctpEscrow.mint(burnReceipt)` on shard B verifies the receipt
-   shape and that `shardA` is a **registered counterpart**, then credits
-   `destAddrOnB`. It is **idempotent by nonce** — a replayed `ctp-mint` returns
-   the prior result and cannot double-credit.
+   envelope (dyncap-signed). A counterpart operator or an auditor can check it
+   against shard A independently with `ctpEscrow.lockOf(nonce)`.
+3. **Mint on B.** `ctpEscrow.mint(burnReceipt)` on shard B (owner only) checks
+   the receipt shape, that `shardA` is a **registered counterpart**, and that
+   `nonce` is unseen; then `amount` REV moves from the bridge account's address
+   on shard B to `destAddrOnB`, and the mint receipt is stored under `nonce`.
+   **Idempotent by nonce** — a replayed `ctp-mint` returns the stored receipt
+   and pays nothing.
 4. **Receipt.** A permanent `ctp-receipt` `(burnReceipt, mintReceipt, srcBlock,
    dstBlock)` is broadcast and stored (non-transferable, tombstone-aware, like
    `/note` receipts).
 
-If the mint never happens (helper offline, counterpart not registered, timeout),
-`ctpEscrow.refund(nonce)` on shard A reverses the un-minted lock. Atomicity is
-**best-effort, like `/rdv`** — but safe under retry, because `mint` is
-nonce-idempotent and an un-minted `lock` is refundable by the same nonce.
+If the mint never happens, `ctpEscrow.refund(nonce)` on shard A (owner only)
+returns `amount` from `poolAddr` to the original subject and marks the lock
+refunded. Atomicity is **best-effort, like `/rdv`** — safe under retry because
+`mint` is nonce-idempotent and an un-minted `lock` is refundable by the same
+nonce.
+
+**On custody (Tier 1).** The shipped rnode's `revVault` binds a vault to a
+deploy key (`findOrCreate` needs a `deployerId`), so the escrow contract cannot
+hold REV in its own name — the in-transit amount sits in the bridge account's
+`poolAddr` from the moment of `lock`, and `refund` is owner-gated. A Tier‑1
+bridge operator is therefore trusted for good faith, with the deterrents being
+social (`/gov censure`, the room's `ctp-*` audit trail, `lockOf` verification)
+rather than an on-chain guarantee. Tier 2 (below) is what removes that trust.
+Bearer-`cap:` transport (a `proxyId` under `rho:qucalc:verify`, Phase 5) has no
+custody question — nothing is escrowed, only forwarded and revocable.
 
 ### The rholang is the DNA, and rnode is untouched
 
@@ -245,6 +262,15 @@ stays undetectable; a transfer that goes through a shard does not.
   property of the escrow contract on a live rnode, not of the room.
 - **A shared bridge key is mutual unilateral authority.** Tier 1 is for
   cooperating operators. Tier 2 exists precisely for when they are not.
+- **Tier 1 has a custody window.** Locked value sits in the bridge account's
+  address between `lock` and `refund`/`mint`, and `refund` is owner-gated —
+  see "On custody" above. A self-service timeout refund needs block height in
+  the contract and is deferred; Tier 2 removes the trust rather than softening
+  it.
+- **The escrow rholang is not yet live-verified.** `ctp-escrow.js` is
+  shape-checked (balanced, verb names, arg positions, ≥2 params, no quoted
+  names) the way `locker.js` was before its exploratory-deploy pass; the same
+  pass for this contract is a follow-up on #173.
 - **Revocation binds only those who check** ([issue #107](https://github.com/rchain-community/quantum-os/issues/107)).
   A capability transported as a proxy can be switched off by its owner
   (a dyncap anchor, or a ⅔ group) via a `proxy-set` envelope and a `revoke`
