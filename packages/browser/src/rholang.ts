@@ -782,3 +782,54 @@ export async function deployTerm(cfg: NodeConfig, term: string): Promise<DeployO
   const ok = /success/i.test(text);
   return { ok, message: text, resultNonce: ok ? nonce : undefined, sig: ok ? signature : undefined };
 }
+
+// A workflow can span shards (CapabilityTransport.md): the bridge key signs on
+// both nodes, but the same key has an *independent* result-slot nonce on each
+// (separate tuplespaces). `deployTerm` above tracks one nonce in the persisted
+// config; this tracks a nonce per node URL, in memory, seeded from each node's
+// own slot on first use — and never writes the persisted config, so pointing it
+// at shard B does not repoint `/rholang`.
+const nodeResultNonce = new Map<string, number>();
+
+/**
+ * Deploy `term` to `url` with `baseCfg`'s key and phlo, without touching the
+ * persisted single-node config. Returns the deploy outcome plus — polled from
+ * that node's result slot — the value the program sent to `return`, or
+ * undefined if nothing landed in the window (a failed transfer may send
+ * nothing, leaving the slot empty).
+ */
+export async function deployToNode(
+  baseCfg: NodeConfig, url: string, term: string, waitAttempts = 20,
+): Promise<DeployOutcome & { value?: string }> {
+  if (!baseCfg.key) return { ok: false, message: "no deploy key — /rholang key generate, or /rholang key <hex>" };
+  const cfg: NodeConfig = { ...baseCfg, url };
+
+  let nonce = nodeResultNonce.get(url);
+  if (nonce === undefined) {
+    const rec = await readResultRecord(cfg).catch(() => ({ nonce: null as number | null }));
+    nonce = (rec.nonce ?? 0) + 1;
+  }
+  nodeResultNonce.set(url, nonce + 1);
+
+  const status = await nodeStatus(cfg).catch(() => ({} as NodeStatus));
+  const data: DeployData = {
+    term: wrapProgram(term, "deploy", nonce),
+    timestamp: Date.now(),
+    phloPrice: cfg.phloPrice,
+    phloLimit: cfg.phloLimit,
+    validAfterBlockNumber: Math.max(0, (status.latestBlockNumber ?? 0) - 1),
+    shardId: status.shardId || cfg.shard,
+  };
+  const { deployer, signature } = signDeployData(data, baseCfg.key);
+  const reply = await postJson(cfg, "/api/deploy", { data, deployer, signature, sigAlgorithm: "secp256k1" });
+  const text = typeof reply === "string" ? reply : JSON.stringify(reply);
+  const ok = /success/i.test(text);
+  if (!ok) return { ok, message: text };
+  const value = await readResultsFresh(cfg, nonce, waitAttempts);
+  return { ok, message: text, resultNonce: nonce, sig: signature, value: value ?? undefined };
+}
+
+/** Read what a deploy answered at a specific node (its result slot). */
+export async function readResultAt(baseCfg: NodeConfig, url: string): Promise<{ nonce: number | null; value: string | null }> {
+  return readResultRecord({ ...baseCfg, url }).catch(() => ({ nonce: null, value: null }));
+}

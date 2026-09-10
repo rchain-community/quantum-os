@@ -21,15 +21,16 @@
 // path — distinct per-shard keys + a secp256k1 attestation quorum, or an M-of-N
 // multisig escrow — is Tier 2, built when a bridge's value justifies it.
 //
-// Two levels of check:
+// Three levels of check:
 //   * shape — `node packages/browser/src/ctp-escrow.js --selftest` (in CI):
 //     balanced, verb names, arg positions, ≥2 params, no quoted names.
 //   * behaviour — `node scripts/localnet/ctp-escrow-check.mjs` against a live
-//     rnode: the contract parses and reduces, and every verb returns what its
-//     help says (with `revVault` stubbed to succeed). Verified on bin/rnode
-//     0.1.0. What still needs a signed, genesis-funded deploy: real
-//     `rho:rchain:revVault` semantics (a funded transfer, a failed transfer's
-//     reply). Tracked on issue #173.
+//     rnode: the contract parses and reduces, every verb returns what its help
+//     says (with `revVault` stubbed).
+//   * end to end — `node scripts/localnet/ctp-e2e.mjs`: REAL signed deploys with
+//     genesis-funded keys — install both escrows, register, a funded `lock` and
+//     `mint`, and the recipient's REV balance moves by the transfer amount.
+//     Verified on bin/rnode 0.1.0.
 
 /**
  * The escrow contract. Deployed once per shard; its uri is then the address the
@@ -68,8 +69,10 @@ in {
 
   // Lock value on the source shard. The caller's vault is debited to the bridge
   // pool; a burn receipt is recorded under \`nonce\` and returned. A reused nonce
-  // is refused before any transfer.
-  contract doLock(@id, @amount, @destAddr, @nonce, ret) = {
+  // is refused before any transfer. \`subjectAddr\` is the caller's own REV
+  // address, carried in the receipt (a deployerId is an unforgeable name and
+  // cannot be serialised) and used as the refund target.
+  contract doLock(@id, @subjectAddr, @amount, @destAddr, @nonce, ret) = {
     for (@s <- st) {
       if (s.get("locks").contains(nonce)) { st!(s) | ret!(["dup nonce", nonce]) }
       else {
@@ -79,8 +82,8 @@ in {
             match a {
               Nil => {
                 st!(s.set("locks", s.get("locks").set(nonce,
-                  {"subject": id, "amount": amount, "destAddr": destAddr, "status": "locked"}))) |
-                ret!(("ctp-burn", s.get("shardId"), id, amount, nonce, destAddr))
+                  {"subject": subjectAddr, "amount": amount, "destAddr": destAddr, "status": "locked"}))) |
+                ret!(("ctp-burn", s.get("shardId"), subjectAddr, amount, nonce, destAddr))
               }
               _ => { st!(s) | ret!(["transfer failed", a]) }
             }
@@ -242,9 +245,13 @@ export function registerProgram(escrowUri, counterpartShardId) {
   return escrowCall(escrowUri, "register", [q(counterpartShardId)]);
 }
 
-/** Lock `amount` REV for `destAddr` on the far shard, keyed by `nonce`. */
-export function lockProgram(escrowUri, amount, destAddr, nonce) {
-  return escrowCall(escrowUri, "lock", [String(amount), q(destAddr), q(nonce)]);
+/**
+ * Lock `amount` REV for `destAddr` on the far shard, keyed by `nonce`.
+ * `subjectAddr` is the caller's own REV address (carried in the burn receipt,
+ * and the refund target) — a `deployerId` cannot be serialised.
+ */
+export function lockProgram(escrowUri, subjectAddr, amount, destAddr, nonce) {
+  return escrowCall(escrowUri, "lock", [q(subjectAddr), String(amount), q(destAddr), q(nonce)]);
 }
 
 /**
@@ -325,15 +332,15 @@ export function selftest() {
   ok("register names the register facet", reg.includes('caps.get("register")'));
   ok("a call unwraps what lookup answers with", /match record \{\s*\(_, caps\)/.test(reg));
 
-  const lock = lockProgram(URI, 30n, "1111bob", "n-abc123");
+  const lock = lockProgram(URI, "1111alice", 30n, "1111bob", "n-abc123");
   ok("lock is well-formed", balanced(lock));
-  ok("lock carries amount, dest, nonce in order",
-     /@verb!\(\*deployerId, 30, "1111bob", "n-abc123", \*ret\)/.test(lock), lock.slice(-300));
+  ok("lock carries subject, amount, dest, nonce in order",
+     /@verb!\(\*deployerId, "1111alice", 30, "1111bob", "n-abc123", \*ret\)/.test(lock), lock.slice(-300));
 
-  const mint = mintProgram(URI, '("ctp-burn", "root", *someId, 30, "n-abc123", "1111bob")');
+  const mint = mintProgram(URI, '("ctp-burn", "root", "1111alice", 30, "n-abc123", "1111bob")');
   ok("mint is well-formed", balanced(mint));
   ok("mint passes deployerId then the burn-receipt tuple",
-     /@verb!\(\*deployerId, \("ctp-burn", "root", \*someId, 30, "n-abc123", "1111bob"\), \*ret\)/.test(mint), mint.slice(-360));
+     /@verb!\(\*deployerId, \("ctp-burn", "root", "1111alice", 30, "n-abc123", "1111bob"\), \*ret\)/.test(mint), mint.slice(-360));
 
   const refund = refundProgram(URI, "n-abc123");
   ok("refund carries only the nonce after the id", /@verb!\(\*deployerId, "n-abc123", \*ret\)/.test(refund), refund.slice(-220));
@@ -346,7 +353,7 @@ export function selftest() {
   ok("info passes Nil, no deployerId", /@verb!\(Nil, \*ret\)/.test(info), info.slice(-200));
 
   // A hostile nonce cannot escape its string literal.
-  const nasty = lockProgram(URI, 1n, "1111bob", 'x", *evil) | @"stolen"!("');
+  const nasty = lockProgram(URI, "1111alice", 1n, "1111bob", 'x", *evil) | @"stolen"!("');
   ok("a hostile nonce stays inside its literal",
      balanced(nasty) && !/@"stolen"!/.test(nasty.replace(/"(?:[^"\\]|\\.)*"/g, '""')), nasty);
 

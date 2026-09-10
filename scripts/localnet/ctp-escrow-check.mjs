@@ -48,9 +48,9 @@ const DRIVER = `
   new s1, s2, s3, s4, s5, s6, s7, s8, s9 in {
     doRegister!("OWNER", "shard-B", *s1) |
     for (@r1 <- s1) {
-    doLock!("SUBJ", 30, "1111bob", "n1", *s2) |
+    doLock!("OWNER", "1111subj", 30, "1111bob", "n1", *s2) |
     for (@r2 <- s2) {
-    doLock!("SUBJ", 30, "1111bob", "n1", *s3) |
+    doLock!("OWNER", "1111subj", 30, "1111bob", "n1", *s3) |
     for (@r3 <- s3) {
     doLockOf!("n1", *s4) |
     for (@r4 <- s4) {
