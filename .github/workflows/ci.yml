@@ -82,6 +82,11 @@ jobs:
       - name: Locker selftest
         run: node packages/browser/src/locker.js --selftest
 
+      # The pooled token exchange contract + its `$x*` macro call-site shape.
+      # Shape only; live-node behaviour is verified manually against localnet.
+      - name: Exchange selftest
+        run: node packages/browser/src/rholang-exchange.js --selftest
+
       # Browser behaviour, against stubbed media. Not a rendering test — it
       # asserts which track ends up in the stream a joiner would be given.
       - name: Calls test

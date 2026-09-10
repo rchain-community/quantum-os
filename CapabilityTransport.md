@@ -8,12 +8,15 @@ Two layers, and most uses only need the first:
 
 | layer | what | where |
 |---|---|---|
-| **1 — linked invoke** | your *own* account, signed, reaching across a link to invoke a capability on another shard | [rchain-community/rchain-rust#33](https://github.com/rchain-community/rchain-rust/issues/33) |
+| **1 — linked invoke** | your *own* account, signed — a remote deploy to another shard to invoke a capability there | [rchain-rust#33](https://github.com/rchain-community/rchain-rust/issues/33) / [#34](https://github.com/rchain-community/rchain-rust/pull/34) |
 | **2 — CapTP** | handing someone a *revocable, attenuated* proxy that acts on your behalf; promise pipelining; routing to non-linked shards and other chains | [quantum-os#173](https://github.com/rchain-community/quantum-os/issues/173) |
 
-Status: **design.** A first cut (a burn/mint value-transfer escrow, `/captp`
-command) was built and removed — it moved the platform token and assumed equal
-value, both ruled out. What is kept:
+Status: **Layer 1 in draft** ([rchain-rust#34](https://github.com/rchain-community/rchain-rust/pull/34):
+`casper::shard_invoke`, the decision record, the exchange contract — CI green,
+and the branch build verified against the local chain). Layer 2 is design.
+An earlier quantum-os cut (a burn/mint value-transfer escrow, `/captp` command)
+was built and removed — it moved the platform token and assumed equal value,
+both ruled out. What is kept client-side:
 [`deployToNode`](packages/browser/src/rholang.ts) (deploy to a specific node,
 per-node result-slot nonce) and this document.
 
@@ -37,39 +40,66 @@ same account on every shard. So invoking a capability on another shard is not
 a transport problem — it is signed message-passing where the far shard binds
 *your own* `deployerId`.
 
-- **A link** between two rnodes: a mutual registration holding each rnode's
-  endpoint and the set of registry URIs that shard exposes to the link. **No
-  identity key on the link** — reachability, not authority. A link cannot reach
-  a URI it was not granted.
-- **`rho:shard:invoke(linkId, targetUri, method, args, *ret)`** — runs inside
-  *your* deploy on the home shard, so rnode has your real `deployerId`. It
-  relays `{caller: deployerId, sig, targetUri, method, args}` over the link;
-  the far rnode **verifies `sig` against `deployerId`, binds it**, and runs
-  `lookup(targetUri) → target!(method, …args, *r)` as that identity. A
-  `deployerId`-gated capability there (the locker, an escrow facet) sees exactly
-  the identity it would if you had deployed locally. Phlo is charged to your
-  account on the far shard. Failure is a value — `("shard-error", reason)` —
-  not a hang.
-- **Trust model:** your own key + the registry uri + the link grant. No
-  intermediary. This is why Layer 1 needs no CapTP.
-- **The security is capability security, which is proven:** you can only invoke
-  a uri you were handed and the link was granted; the far contract enforces
-  whatever it enforces against your real identity.
-- **Composability:** the invoke happens inside the home shard's reduction, so it
-  composes with local operations into one closure — which is what makes a
-  joint-ZFA-closure conservation check meaningful (see *Exchange support*).
+**It is an ordinary, caller-signed deploy submitted to the target shard —
+no relay, no link table, no new consensus** (resolved in
+[rchain-rust#33](https://github.com/rchain-community/rchain-rust/issues/33),
+draft PR rchain-rust#34). A deploy already *is* the signed message that carries
+the identity; a home-shard relay would have to re-sign a different payload as
+the caller, which the home node cannot do (it holds only the public key).
 
-Keep rnode minimal: **one powerbox process + a link table.** No new consensus —
-message passing, not shared state. Discovery, governance, the client-side
-promise machinery, non-RChain chains, and everything in Layer 2 stay out of
-rnode.
+- **`$at(shard, `rho:id:x`)!(method, args…)`** expands, at the client, to a
+  normal deploy signed with the caller's key, whose term runs on the target
+  shard:
+  ```rholang
+  new lookup(`rho:registry:lookup`), cap in {
+    lookup!(`rho:id:x`, *cap) |
+    for (@(_, target) <- cap) { @target!(method, args…, `rho:rchain:deployId`) }
+  }
+  ```
+- **Identity:** the far node binds `rho:rchain:deployerId` from the signature —
+  the caller's own key — so a `deployerId`-gated capability there (the locker,
+  an escrow facet) sees exactly the caller it would locally. Nothing is
+  delegated or wrapped.
+- **Reply:** written to `` `rho:rchain:deployId` `` (the deploy's own id). The
+  client **listens on that channel** (`listenForDataAtName`) and resolves on
+  the value — no `deployStatus` polling; a caller-local `*ret` cannot cross
+  shards, so a channel listen is the equivalent of a local `for`.
+- **Failure is a value:** a missed lookup, a rejected deploy, or a listen that
+  times out yields `("shard-error", reason)` — never a hang.
+- **Phlo** is charged to the caller's account on the far shard — the same
+  account, same key, same REV vault.
+- **The "link table" collapses** to an endpoint (the target's deploy service)
+  plus the registry URI (the capability handle you were handed). Reachability,
+  not authority; no replicated link state, so no new consensus. Revocation is
+  the far contract's own authorization, or not handing out the URI.
+- **The security is capability security, which is proven:** you can only invoke
+  a URI you were handed; the far contract enforces whatever it enforces against
+  your real identity.
+
+**Honest consequence.** A remote deploy is a *separate transaction* on the far
+shard, so it cannot compose into one home-shard closure. A bilateral exchange
+is therefore **client-orchestrated and non-atomic across shards**: each escrow
+is individually conserved, and the joint ZFA closure is a `rho:qucalc:verify`
+*monitor* over committed facts, not a transport guarantee. Atomic
+single-closure composition would be Layer 2, and is deliberately out of rnode.
 
 ### Exchange support — a contract on Layer 1
 
-A bilateral exchange-rate escrow for fungible *non-REV* tokens: an escrow on
-each side, pre-funded, with an exchange rate. A send adds to the local escrow
-and consumes from the remote one through `rho:shard:invoke`, conservation held
-per escrow.
+Two shapes, both built:
+
+- **Bilateral escrow** (`qucalc/examples/shard_exchange.rho`, rchain-rust#34):
+  an escrow on each shard, pre-funded, fixed rate; a send `deposit`s locally and
+  `consume`s the remote one through a remote invoke.
+- **Pooled exchange** (`packages/browser/src/rholang-exchange.js`, quantum-os;
+  `$xopen` / `$xprovide` / `$xdeposit` / `$xquote` / `$xswap` / `$xwithdraw`):
+  a pool trades one token pair at an owner-set rate; `$xlink` / `$xroute`
+  federate it — `route` swaps locally, then returns a
+  `("$at", shard, uri, "swap", …)` descriptor the client runs as a cross-shard
+  remote deploy. Verified end to end against localnet. A quantum-os `/note`
+  currency reaches a pool as its token contract's URI.
+
+Both: conservation held per pool/escrow, and the transport is a remote deploy —
+so a multi-shard route is **not atomic**.
 
 **Capability security is the proof.** The escrow contract exposes no method that
 pays the operator, holds no capability that drains it outside the rate, and
@@ -77,8 +107,9 @@ fixes or governs the rate at deploy. There is nothing to corrupt because there
 is no ambient authority. The joint-ZFA-closure reading — one closure spanning
 both escrows (`crates/zfa-core/src/coupling.rs` `coupled`) — is a *check* the
 contract runs with `rho:qucalc:verify`, which rnode already exposes, not a
-prerequisite. rchain-rust already carries the QLF primitives, so the escrow
-lives there.
+prerequisite. Because the two legs are separate deploys, the joint check is a
+**monitor** over committed facts, not a precondition of one atomic move.
+rchain-rust already carries the QLF primitives, so the escrow lives there.
 
 ---
 
@@ -115,8 +146,11 @@ new price in {
 }
 ```
 
-`$at(shardOrLink, uri)` expands to a `rho:shard:invoke` (Layer 1, a link) or to
-the gateway-routing glue (Layer 2, no link) — the same call site either way.
+`$at(shard, uri)` expands, at the client, to a **remote signed deploy** whose
+reply lands on `` `rho:rchain:deployId` `` (Layer 1 — the client listens on that
+channel), or to **gateway-routing glue** (Layer 2 — a promise-proxy the client
+machinery resolves). Same call site either way; the `for` above is the local
+idiom the client presents over the channel listen.
 
 Revocation binds only those who check: a peer offline for a `proxy-revoke` keeps
 its stale view until it re-syncs; *revoked* is shown as distinct from *gone*.
@@ -125,9 +159,10 @@ its stale view until it re-syncs; *revoked* is shown as distinct from *gone*.
 
 ## Phases
 
-1. **Layer 1** — `rho:shard:invoke` + the link table (rchain-rust#33); `$at`
-   resolving to a link.
-2. Exchange support — the bilateral escrow contract (rchain-rust#33).
+1. **Layer 1** — the client-side `$at` → remote signed deploy + reply-channel
+   listen (rchain-rust#33 / #34: `casper::shard_invoke`).
+2. Exchange support — the bilateral escrow contract
+   (`qucalc/examples/shard_exchange.rho`, rchain-rust#34).
 3. **Layer 2** — `$proxy` + the gateway peer + `captp-export` / `captp-invoke`
    / `captp-result` / `captp-revoke`; synchronous invocation.
 4. Promise pipelining.
