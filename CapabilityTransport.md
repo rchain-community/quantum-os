@@ -5,13 +5,16 @@ Companion to [`Room_Bridges.md`](Room_Bridges.md) (information across rooms) and
 moving **value and capabilities between shards** — RChain shards now, other
 chains later — with a [quantum-os](README.md) room as the venue.
 
-Status: **design + Phases 1–2 landed.** Phase 1 —
-[`ctp.ts`](packages/browser/src/ctp.ts), bridge identity and the derived room.
-Phase 2 — [`ctp-escrow.js`](packages/browser/src/ctp-escrow.js), the rholang
-escrow contract and its deploy programs (shape-checked in CI; behaviour
-verified against a live rnode by
+Status: **design + Phases 1–3b landed.**
+Phase 1 — [`ctp.ts`](packages/browser/src/ctp.ts), bridge identity and the
+derived room. Phase 2 — [`ctp-escrow.js`](packages/browser/src/ctp-escrow.js),
+the escrow contract + deploy programs (shape-checked in CI; behaviour verified
+against a live rnode by
 [`ctp-escrow-check.mjs`](scripts/localnet/ctp-escrow-check.mjs), bar real
-`revVault` semantics). The `/ctp` wire protocol, the helper daemon, and group
+`revVault` semantics). Phase 3 — the `/ctp` command, the `ctp-*` wire kinds and
+the in-flight/receipt stores in `app.ts` (3b); the on-shard `lock`/`mint`
+deploys are still run by the operator through `/rholang` (the recipe is
+printed) until a multi-node deploy path lands (3c). The helper daemon and group
 policy are specified here and tracked in
 [issue #173](https://github.com/rchain-community/quantum-os/issues/173).
 

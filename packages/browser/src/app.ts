@@ -26,6 +26,20 @@ import { issueId, isMember, isAdmin, memberLabel, findIssue, resolveWeights, del
          rekeyMember, type Group, type Issue, type Role, type VaultRecord } from "./gov.js";
 import { installProgram, registerProgram, bindProgram, resolveProgram,
          readProgram, grantProgram } from "./locker.js";
+import {
+  type BridgeOwner, type BridgeSpec, type CtpOffer, type CtpTransfer, type CtpReceipt,
+  type CtpBurnReceipt, type CtpMintReceipt,
+  ownerId as ctpOwnerId, normalizeShardRef, bridgePairKey, bridgeVaultHandle,
+  deriveBridgeRoom, makeBridgeSpec, bridgeSpecIsConsistent,
+  newTransferId, transferNonce, ctpConservationCheck, ctpAdvance,
+  ctpOfferFromWire, burnReceiptFromWire, mintReceiptFromWire, ctpReceiptFromWire,
+  burnReceiptToTuple, burnReceiptFromTuple,
+} from "./ctp.js";
+import {
+  installProgram as ctpEscrowInstallProgram, registerProgram as ctpEscrowRegisterProgram,
+  lockProgram as ctpLockProgram, mintProgram as ctpMintProgram,
+  refundProgram as ctpRefundProgram, lockOfProgram as ctpLockOfProgram,
+} from "./ctp-escrow.js";
 import { parseDefinition, parseInvocation, expandCommand, expandCallSites,
          formatDefinition, findMacros, bodyKind, MacroError,
          MACRO_NAME_RE, MAX_BODY } from "./macro-lang.js";
@@ -300,6 +314,11 @@ interface RoomContext {
   // Retraction tombstones: "<kind>:<id>" of removed gossiped items (poll/lemma)
   // so a peer's later sync-* can't heal them back. Persisted per room.
   retracted: Set<string>;
+  // Cross-shard transport (#173). In-flight transfers (in-memory: rebuilt from
+  // the room's ctp-* envelopes / re-checked on chain after a reload) and the
+  // permanent receipts of completed crossings (persisted, tombstone-aware).
+  ctpTransfers: Map<string, CtpTransfer>;
+  ctpReceiptStore: Map<string, CtpReceipt>;
   // Chat history for this room (replayed on tab switch)
   chatLog: ChatLine[];
   // Persisted user-set name for this room's signaling connection (UI only)
@@ -349,6 +368,8 @@ function createRoom(roomId: string): RoomContext {
     pollCards: new Map(),
     groupStore: new Map(),
     retracted: new Set(),
+    ctpTransfers: new Map(),
+    ctpReceiptStore: new Map(),
     chatLog: loadChat(roomId),
     signalingUrl: DEFAULT_SIGNAL,
     hasUnread: false,
@@ -446,6 +467,26 @@ function setFocusedGroup(id: string): void {
   try { sessionStorage.setItem("qos-focused-group", id); } catch { /* ignore */ }
 }
 let retracted: Set<string> = new Set();
+let ctpTransfers: Map<string, CtpTransfer> = new Map();
+let ctpReceiptStore: Map<string, CtpReceipt> = new Map();
+// Bridges are a per-BROWSER store, not per-room (like macroStore): a bridge you
+// run follows you. Keyed by bridgePairKey. Persisted under qos-ctp-bridges.
+const ctpBridgeStore: Map<string, BridgeSpec> = new Map();
+function saveCtpBridges(): void {
+  try {
+    localStorage.setItem("qos-ctp-bridges", JSON.stringify(Object.fromEntries(ctpBridgeStore.entries())));
+  } catch { /* full / blocked */ }
+}
+function loadCtpBridges(): void {
+  try {
+    const raw = localStorage.getItem("qos-ctp-bridges");
+    if (!raw) return;
+    const data = JSON.parse(raw) as Record<string, BridgeSpec>;
+    for (const [k, spec] of Object.entries(data)) {
+      if (spec && bridgeSpecIsConsistent(spec)) ctpBridgeStore.set(k, spec);
+    }
+  } catch { /* corrupt */ }
+}
 
 function setActiveRoom(ctx: RoomContext): void {
   activeRoom = ctx;
@@ -484,8 +525,10 @@ function setActiveRoom(ctx: RoomContext): void {
   pollStore          = ctx.pollStore;
   pollCards          = ctx.pollCards;
   groupStore         = ctx.groupStore;
-  // macroStore is per-browser, not aliased per room
+  // macroStore / ctpBridgeStore are per-browser, not aliased per room
   retracted          = ctx.retracted;
+  ctpTransfers       = ctx.ctpTransfers;
+  ctpReceiptStore    = ctx.ctpReceiptStore;
 }
 
 // Mutate both the active-room's qpeer and the module-level alias in lockstep.
@@ -654,6 +697,23 @@ function addLibraryEntry(raw: unknown): LibraryEntry | null {
 function savePolls(): void {
   localStorage.setItem(`qos-polls-${activeRoom.roomId}`,
     JSON.stringify(Object.fromEntries(pollStore.entries())));
+}
+
+function saveCtpReceipts(): void {
+  try {
+    localStorage.setItem(`qos-ctp-receipts-${activeRoom.roomId}`,
+      JSON.stringify(Object.fromEntries(ctpReceiptStore.entries())));
+  } catch { /* full / blocked */ }
+}
+function loadCtpReceipts(): void {
+  try {
+    const raw = localStorage.getItem(`qos-ctp-receipts-${activeRoom.roomId}`);
+    if (!raw) return;
+    for (const [id, r] of Object.entries(JSON.parse(raw) as Record<string, unknown>)) {
+      const rec = ctpReceiptFromWire(r);
+      if (rec && !isRetracted("ctp-receipt", id)) ctpReceiptStore.set(id, rec);
+    }
+  } catch { /* corrupt */ }
 }
 
 function saveGroups(): void {
@@ -1545,6 +1605,7 @@ function loadRoomState(ctx: RoomContext): void {
   loadPolls();
   loadGroups();
   loadRetracted();
+  loadCtpReceipts();
   if (previousActive) setActiveRoom(previousActive);
 }
 
@@ -4461,6 +4522,286 @@ function handleCommand(raw: string): string[] {
       break;
     }
 
+    case "ctp": {
+      // Cross-shard capability transport (#173, CapabilityTransport.md). A
+      // bridge is a dual-shard account; its room is derived from the owner id +
+      // the shard pair. This MVP does the coordination + audit + broadcast; the
+      // on-shard `lock`/`mint` deploys are run by the operator via /rholang
+      // (the recipe is printed) until a multi-node deploy path lands (Phase 3c).
+      const t = arg.trim();
+      const tks = t ? t.split(/\s+/) : [];
+      const sub = (tks[0] ?? "").toLowerCase();
+      const cfg = loadNodeConfig();
+
+      const pkey = (s: BridgeSpec) => bridgePairKey(s.shardA, s.shardB);
+      const bridgeByPair = (k: string): BridgeSpec | undefined =>
+        ctpBridgeStore.get(k) ?? [...ctpBridgeStore.values()].find((s) => pkey(s) === k);
+      const bridgeForRoom = (): BridgeSpec | undefined =>
+        [...ctpBridgeStore.values()].find((s) => s.roomCap === activeRoom.roomId);
+      const showSpec = (s: BridgeSpec) => {
+        sys(`  ${pkey(s)}${s.owner.kind === "group" ? `  (group ${shortId(s.owner.groupId)})` : ""}`);
+        sys(`    A ${s.shardA}${s.escrowA ? `\n      escrow ${s.escrowA}` : "   (no escrow — /ctp setup)"}`);
+        sys(`    B ${s.shardB}${s.escrowB ? `\n      escrow ${s.escrowB}` : "   (no escrow — /ctp setup)"}`);
+        sys(`    room ${s.roomCap}`);
+      };
+      const fmtTransfer = (tr: CtpTransfer) => {
+        const o = tr.offer;
+        sys(`  ${o.id}  ${tr.status}  ${o.what === "value" ? o.amount + " REV" : o.cap}  →  ${o.destAddr}`);
+        sys(`    ${o.srcShard}  →  ${o.dstShard}${tr.abortReason ? `   (${tr.abortReason})` : ""}`);
+      };
+
+      if (!sub || sub === "list") {
+        if (!ctpBridgeStore.size) { sys("no bridges — /ctp new <shardA-url> <shardB-url>"); break; }
+        sys(`bridges (${ctpBridgeStore.size}):`);
+        for (const s of ctpBridgeStore.values()) showSpec(s);
+        break;
+      }
+
+      if (sub === "help") {
+        for (const l of [
+          "/ctp new <shardA-url> <shardB-url> [--group <id>]  — create a bridge",
+          "/ctp list · show [<pair>] · join <pair>            — manage bridges",
+          "/ctp setup <pair>                                  — the escrow deploy recipe",
+          "/ctp escrow <pair> <A|B> <rho:id:…>                — record an escrow uri",
+          "/ctp send <amount> to <A|B> [<destAddr>]           — start a transfer (in the bridge room)",
+          "/ctp lock <id> [<burn-tuple>] · mint <id>          — record + broadcast each leg",
+          "/ctp status [<id>] · receipts · abort <id>",
+        ]) sys(l);
+        break;
+      }
+
+      if (sub === "new") {
+        const a = normalizeShardRef(tks[1] ?? ""); const b = normalizeShardRef(tks[2] ?? "");
+        if (!a || !b) { sys("usage: /ctp new <shardA-url> <shardB-url> [--group <id>]"); break; }
+        if (a === b) { sys("a bridge needs two distinct shards"); break; }
+        let owner: BridgeOwner = { kind: "person", anchor: dyncapState?.anchor ?? "" };
+        const gi = tks.indexOf("--group");
+        if (gi > -1 && tks[gi + 1]) {
+          const gq = tks[gi + 1];
+          const g = groupStore.get(gq) ?? [...groupStore.values()].find((x) => x.name.toLowerCase() === gq.toLowerCase());
+          if (!g) { sys(`no group "${gq}" — /gov list`); break; }
+          owner = { kind: "group", groupId: g.id };
+        }
+        if (owner.kind === "person" && !owner.anchor) { sys("no identity yet — set a name first (/name)"); break; }
+        const k = bridgePairKey(a, b);
+        if (ctpBridgeStore.has(k)) { sys(`a bridge for this pair exists (${k}) — /ctp show ${k}`); break; }
+        const spec = makeBridgeSpec(owner, a, b);
+        ctpBridgeStore.set(k, spec); saveCtpBridges();
+        sys(`✓ bridge ${k} created`);
+        showSpec(spec);
+        sys(`  next:  /ctp join ${k}   then   /ctp setup ${k}`);
+        break;
+      }
+
+      if (sub === "show") {
+        const s = tks[1] ? bridgeByPair(tks[1]) : bridgeForRoom();
+        if (!s) { sys(tks[1] ? `no bridge ${tks[1]}` : "not in a bridge room — /ctp show <pair>"); break; }
+        showSpec(s);
+        const flight = [...ctpTransfers.values()].filter((tr) => bridgePairKey(tr.offer.srcShard, tr.offer.dstShard) === pkey(s));
+        if (flight.length) { sys(`  in flight:`); for (const tr of flight) fmtTransfer(tr); }
+        break;
+      }
+
+      if (sub === "join") {
+        const s = bridgeByPair(tks[1] ?? "");
+        if (!s) { sys("usage: /ctp join <pair>  (/ctp list for the keys)"); break; }
+        sys(`joining the bridge room for ${pkey(s)}…`);
+        for (const l of handleCommand(`/room join ${s.roomCap}`)) sys("  " + l);
+        break;
+      }
+
+      if (sub === "setup") {
+        const s = tks[1] ? bridgeByPair(tks[1]) : bridgeForRoom();
+        if (!s) { sys("usage: /ctp setup <pair>"); break; }
+        if (!cfg.key) { sys("✗ no deploy key — the bridge account's key must be set: /rholang key <hex>"); break; }
+        const pool = revAddressOf(cfg.key);
+        const aId = normalizeShardRef(s.shardA)!, bId = normalizeShardRef(s.shardB)!;
+        sys(`the escrow deploy recipe for bridge ${pkey(s)} — run each block on the named shard:`);
+        sys("");
+        sys(`# on shard A (${s.shardA}) — /rholang rnode ${s.shardA}`);
+        sys("```");
+        sys(ctpEscrowInstallProgram(pool, aId));
+        sys("```");
+        sys(`# then, once its rho:id:… is known:  /ctp escrow ${pkey(s)} A <uri>`);
+        sys(`# and register the counterpart:`);
+        sys("```");
+        sys(ctpEscrowRegisterProgram("<escrow-A-uri>", bId));
+        sys("```");
+        sys("");
+        sys(`# on shard B (${s.shardB}) — /rholang rnode ${s.shardB}`);
+        sys("```");
+        sys(ctpEscrowInstallProgram(pool, bId));
+        sys("```");
+        sys(`# then:  /ctp escrow ${pkey(s)} B <uri>   and register:`);
+        sys("```");
+        sys(ctpEscrowRegisterProgram("<escrow-B-uri>", aId));
+        sys("```");
+        break;
+      }
+
+      if (sub === "escrow") {
+        const s = bridgeByPair(tks[1] ?? "");
+        const side = (tks[2] ?? "").toUpperCase();
+        const uri = tks[3] ?? "";
+        if (!s || (side !== "A" && side !== "B") || !/^rho:id:/.test(uri)) {
+          sys("usage: /ctp escrow <pair> <A|B> <rho:id:…>"); break;
+        }
+        if (side === "A") s.escrowA = uri; else s.escrowB = uri;
+        saveCtpBridges();
+        sys(`✓ escrow ${side} = ${uri}`);
+        break;
+      }
+
+      // --- transfer verbs: operate on the bridge room the user is in ---
+      const spec = bridgeForRoom();
+      if (["send", "lock", "mint", "abort"].includes(sub) && !spec) {
+        sys("not in a bridge room — /ctp join <pair> first"); break;
+      }
+
+      if (sub === "send") {
+        // /ctp send <amount> to <A|B> [<destAddr>]
+        const amount = tks[1] ?? "";
+        const toIx = tks.indexOf("to");
+        const dstSel = (tks[toIx + 1] ?? "").toUpperCase();
+        if (!/^\d{1,40}$/.test(amount) || toIx < 0 || (dstSel !== "A" && dstSel !== "B")) {
+          sys("usage: /ctp send <amount> to <A|B> [<destAddr>]"); break;
+        }
+        const dstShard = dstSel === "A" ? spec!.shardA : spec!.shardB;
+        const srcShard = dstSel === "A" ? spec!.shardB : spec!.shardA;
+        const destAddr = tks[toIx + 2] ?? (cfg.key ? revAddressOf(cfg.key) : "");
+        if (!destAddr) { sys("no destination address — /ctp send <amount> to <A|B> <destAddr>"); break; }
+        const id = newTransferId();
+        const now = Date.now();
+        const offer: CtpOffer = {
+          id, pair: pkey(spec!), srcShard, dstShard, what: "value", amount, destAddr,
+          by: qpeer?.peerId ?? "local", at: now, expiresAt: now + 3600_000,
+        };
+        const tr: CtpTransfer = { offer, status: "offered", updatedAt: now };
+        ctpTransfers.set(id, tr);
+        signedBroadcast({ kind: "ctp-offer", ...offer });
+        sys(`✓ transfer ${id} offered — ${amount} REV  ${srcShard} → ${dstShard}  for ${destAddr}`);
+        sys(`  nonce ${transferNonce(id)}`);
+        const escrowSrc = srcShard === spec!.shardA ? spec!.escrowA : spec!.escrowB;
+        if (!escrowSrc) { sys(`  ✗ no escrow recorded for the source shard — /ctp setup ${pkey(spec!)}`); break; }
+        sys(`  1. /rholang rnode ${srcShard}   then deploy:`);
+        sys("  ```");
+        sys("  " + ctpLockProgram(escrowSrc, amount, destAddr, transferNonce(id)).replace(/\n/g, "\n  "));
+        sys("  ```");
+        sys(`  2. /ctp lock ${id}      (records the burn receipt + tells the room)`);
+        break;
+      }
+
+      if (sub === "lock") {
+        const id = tks[1] ?? "";
+        const tr = ctpTransfers.get(id);
+        if (!tr) { sys(`no transfer ${id} — /ctp status`); break; }
+        const tuple = tks.slice(2).join(" ").trim();
+        let burn: CtpBurnReceipt | null = null;
+        if (tuple) burn = burnReceiptFromTuple(tuple);
+        else {
+          // Derive it from the offer — subject defaults to this browser's address.
+          burn = {
+            tag: "ctp-burn", srcShard: tr.offer.srcShard,
+            subject: cfg.key ? revAddressOf(cfg.key) : tr.offer.destAddr,
+            amount: tr.offer.amount ?? "0", nonce: transferNonce(id), destAddr: tr.offer.destAddr,
+          };
+        }
+        if (!burn) { sys("could not read that as a ctp-burn tuple — paste exactly what `lock` returned"); break; }
+        const next = ctpAdvance(tr, { k: "lock", burn });
+        if (next === tr) { sys(`can't lock from status "${tr.status}"`); break; }
+        ctpTransfers.set(id, next);
+        signedBroadcast({ kind: "ctp-lock", id, burn });
+        sys(`✓ ${id} locked — burn receipt broadcast`);
+        const escrowDst = tr.offer.dstShard === spec!.shardA ? spec!.escrowA : spec!.escrowB;
+        if (!escrowDst) { sys(`  ✗ no escrow for the destination shard — /ctp setup ${pkey(spec!)}`); break; }
+        sys(`  next:  /rholang rnode ${tr.offer.dstShard}   then deploy:`);
+        sys("  ```");
+        sys("  " + ctpMintProgram(escrowDst, burnReceiptToTuple(burn)).replace(/\n/g, "\n  "));
+        sys("  ```");
+        sys(`  then:  /ctp mint ${id}`);
+        break;
+      }
+
+      if (sub === "mint") {
+        const id = tks[1] ?? "";
+        const tr = ctpTransfers.get(id);
+        if (!tr || !tr.burn) { sys(`no locked transfer ${id} — /ctp status`); break; }
+        const mint: CtpMintReceipt = {
+          tag: "ctp-mint", dstShard: tr.offer.dstShard, srcShard: tr.burn.srcShard,
+          destAddr: tr.burn.destAddr, amount: tr.burn.amount, nonce: tr.burn.nonce,
+        };
+        if (!ctpConservationCheck(tr.burn, mint)) { sys("✗ internal: burn/mint do not conserve"); break; }
+        let next = ctpAdvance(tr, { k: "mint", mint });
+        if (next === tr) { sys(`can't mint from status "${tr.status}"`); break; }
+        const receipt: CtpReceipt = { id, burn: tr.burn, mint, at: Date.now() };
+        next = ctpAdvance(next, { k: "receipt", receipt });
+        ctpTransfers.set(id, next);
+        ctpReceiptStore.set(id, receipt);
+        saveCtpReceipts();
+        signedBroadcast({ kind: "ctp-mint", id, mint });
+        signedBroadcast({ kind: "ctp-receipt", ...receipt });
+        sys(`✓ ${id} minted — ${mint.amount} REV to ${mint.destAddr} on ${mint.dstShard}`);
+        sys(`  receipt recorded and broadcast`);
+        break;
+      }
+
+      if (sub === "abort") {
+        const id = tks[1] ?? "";
+        const tr = ctpTransfers.get(id);
+        if (!tr) { sys(`no transfer ${id}`); break; }
+        const reason = tks.slice(2).join(" ") || "aborted by operator";
+        const next = ctpAdvance(tr, { k: "abort", reason });
+        if (next === tr) { sys(`can't abort from status "${tr.status}"`); break; }
+        ctpTransfers.set(id, next);
+        signedBroadcast({ kind: "ctp-abort", id, reason });
+        sys(`✓ ${id} aborted (${reason})`);
+        if (tr.burn) {
+          const escrowSrc = tr.offer.srcShard === spec!.shardA ? spec!.escrowA : spec!.escrowB;
+          if (escrowSrc) {
+            sys(`  the lock on ${tr.offer.srcShard} is refundable — /rholang rnode ${tr.offer.srcShard} then deploy:`);
+            sys("  ```");
+            sys("  " + ctpRefundProgram(escrowSrc, tr.burn.nonce).replace(/\n/g, "\n  "));
+            sys("  ```");
+          }
+        }
+        break;
+      }
+
+      if (sub === "status") {
+        const id = tks[1];
+        const all = [...ctpTransfers.values()];
+        const list = id ? all.filter((tr) => tr.offer.id === id) : all;
+        if (!list.length) { sys(id ? `no transfer ${id}` : "no transfers in flight"); break; }
+        sys(`transfers (${list.length}):`);
+        for (const tr of list) fmtTransfer(tr);
+        break;
+      }
+
+      if (sub === "receipts") {
+        if (!ctpReceiptStore.size) { sys("no completed transfers in this room"); break; }
+        sys(`completed (${ctpReceiptStore.size}):`);
+        for (const r of ctpReceiptStore.values()) {
+          sys(`  ${r.id}  ${r.mint.amount} REV  ${r.burn.srcShard} → ${r.mint.dstShard}  → ${r.mint.destAddr}`);
+        }
+        break;
+      }
+
+      if (sub === "verify" || sub === "lockof") {
+        const s = bridgeForRoom() ?? bridgeByPair(tks[1] ?? "");
+        const nonce = (sub === "lockof" ? tks[1] : tks[2]) ?? "";
+        const escrow = s ? (s.escrowA ?? s.escrowB) : "";
+        if (!s || !nonce || !escrow) { sys("usage: /ctp lockof <nonce>   (in a bridge room with an escrow set)"); break; }
+        sys(`# read the lock — /rholang rnode ${s.shardA}   then eval:`);
+        sys("```");
+        sys(ctpLockOfProgram(s.escrowA ?? escrow, nonce));
+        sys("```");
+        break;
+      }
+
+      sys(`unknown: /ctp ${sub} — /ctp help`);
+      break;
+    }
+
     case "conj": {
       let ctwists: Uint8Array | null = null;
       let csrc = "";
@@ -7235,6 +7576,70 @@ async function connect(): Promise<void> {
           }
           return;
         }
+        // --- Cross-shard transport (#173). These carry the room's shared view
+        // of a transfer: peers record the same in-flight state and the same
+        // permanent receipt. Only the initiator actually deploys.
+        if (d.kind === "ctp-offer") {
+          const status = await verifyDyncapIfPresent(from, d); setActiveRoom(ctx);
+          if (status.startsWith("  · refused")) return;
+          const offer = ctpOfferFromWire(d);
+          if (!offer || ctpTransfers.has(offer.id)) return;
+          ctpTransfers.set(offer.id, { offer, status: "offered", updatedAt: Date.now() });
+          addMessage("", `⇄ ${peerLabel(from)} offered transfer ${offer.id} — ${offer.what === "value" ? offer.amount + " REV" : offer.cap}  ${offer.srcShard} → ${offer.dstShard}`, "system");
+          return;
+        }
+        if (d.kind === "ctp-lock") {
+          const status = await verifyDyncapIfPresent(from, d); setActiveRoom(ctx);
+          if (status.startsWith("  · refused")) return;
+          const id = String(d.id ?? "");
+          const tr = ctpTransfers.get(id);
+          const burn = burnReceiptFromWire(d.burn);
+          if (!tr || !burn) return;
+          const next = ctpAdvance(tr, { k: "lock", burn });
+          if (next === tr) return;
+          ctpTransfers.set(id, next);
+          addMessage("", `⇄ ${id} locked on ${burn.srcShard} — burn ${burn.amount} nonce ${burn.nonce}`, "system");
+          return;
+        }
+        if (d.kind === "ctp-mint") {
+          const status = await verifyDyncapIfPresent(from, d); setActiveRoom(ctx);
+          if (status.startsWith("  · refused")) return;
+          const id = String(d.id ?? "");
+          const tr = ctpTransfers.get(id);
+          const mint = mintReceiptFromWire(d.mint);
+          if (!tr || !mint) return;
+          const next = ctpAdvance(tr, { k: "mint", mint });
+          if (next === tr) return;
+          ctpTransfers.set(id, next);
+          addMessage("", `⇄ ${id} minted on ${mint.dstShard} — ${mint.amount} REV to ${mint.destAddr}`, "system");
+          return;
+        }
+        if (d.kind === "ctp-receipt") {
+          const status = await verifyDyncapIfPresent(from, d); setActiveRoom(ctx);
+          if (status.startsWith("  · refused")) return;
+          const receipt = ctpReceiptFromWire(d);
+          if (!receipt || isRetracted("ctp-receipt", receipt.id)) return;
+          if (ctpReceiptStore.has(receipt.id)) return;                 // first-write-wins
+          ctpReceiptStore.set(receipt.id, receipt);
+          saveCtpReceipts();
+          const tr = ctpTransfers.get(receipt.id);
+          if (tr) ctpTransfers.set(receipt.id, ctpAdvance(tr, { k: "receipt", receipt }));
+          addMessage("", `✓ transfer ${receipt.id} complete — ${receipt.mint.amount} REV crossed ${receipt.burn.srcShard} → ${receipt.mint.dstShard}`, "system");
+          return;
+        }
+        if (d.kind === "ctp-abort") {
+          const status = await verifyDyncapIfPresent(from, d); setActiveRoom(ctx);
+          if (status.startsWith("  · refused")) return;
+          const id = String(d.id ?? "");
+          const tr = ctpTransfers.get(id);
+          if (!tr) return;
+          const reason = String(d.reason ?? "aborted");
+          const next = ctpAdvance(tr, { k: "abort", reason });
+          if (next === tr) return;
+          ctpTransfers.set(id, next);
+          addMessage("", `⇄ transfer ${id} aborted — ${reason}`, "system");
+          return;
+        }
         if (d.kind === "poll-open") {
           const status = await verifyDyncapIfPresent(from, d); setActiveRoom(ctx);
           if (status.startsWith("  · refused")) return;
@@ -7951,7 +8356,7 @@ function send(): void {
     if (cmd !== "help" && cmd !== "dump") {
       sessionLog.push({ who: myName || "you", cmd, arg, summary: lines[0] ?? "" });
     }
-    if (lines.length > 0 && cmd !== "help" && cmd !== "grant" && cmd !== "lemma" && cmd !== "note" && cmd !== "rdv" && cmd !== "forget" && cmd !== "remove" && cmd !== "retract" && cmd !== "rm" && cmd !== "gov" && cmd !== "dyncap" && cmd !== "probe" && cmd !== "room" && cmd !== "share" && cmd !== "channel" && cmd !== "script" && cmd !== "persist" && cmd !== "rhoqu" && cmd !== "macro" && cmd !== "macros" && cmd !== "rholang" && cmd !== "estimate" && cmd !== "facil" && cmd !== "facilitator" && cmd !== "scribe" && cmd !== "skeptic" && cmd !== "greeter" && cmd !== "password" && cmd !== "login" && cmd !== "name" && cmd !== "render" && cmd !== "animate" && cmd !== "record" && cmd !== "ice" && cmd !== "conn" && cmd !== "search" && cmd !== "solve" && cmd !== "reset") {
+    if (lines.length > 0 && cmd !== "help" && cmd !== "grant" && cmd !== "lemma" && cmd !== "note" && cmd !== "rdv" && cmd !== "forget" && cmd !== "remove" && cmd !== "retract" && cmd !== "rm" && cmd !== "gov" && cmd !== "dyncap" && cmd !== "probe" && cmd !== "room" && cmd !== "share" && cmd !== "channel" && cmd !== "script" && cmd !== "persist" && cmd !== "rhoqu" && cmd !== "macro" && cmd !== "macros" && cmd !== "rholang" && cmd !== "estimate" && cmd !== "facil" && cmd !== "facilitator" && cmd !== "scribe" && cmd !== "skeptic" && cmd !== "greeter" && cmd !== "password" && cmd !== "login" && cmd !== "name" && cmd !== "render" && cmd !== "animate" && cmd !== "record" && cmd !== "ice" && cmd !== "conn" && cmd !== "search" && cmd !== "solve" && cmd !== "reset" && cmd !== "ctp") {
       qpeer.broadcast({ kind: "qlf", cmd, arg, lines });
     }
     return;
@@ -9621,7 +10026,9 @@ async function init(): Promise<void> {
   loadPolls();
   loadGroups();
   loadMacros();
+  loadCtpBridges();
   loadRetracted();
+  loadCtpReceipts();
 
   // Restore any rooms the user had joined in previous sessions (besides the
   // URL-hash one we already initialised). State for each is loaded from
