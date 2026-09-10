@@ -21,12 +21,15 @@
 // path — distinct per-shard keys + a secp256k1 attestation quorum, or an M-of-N
 // multisig escrow — is Tier 2, built when a bridge's value justifies it.
 //
-// NOT YET VERIFIED against a live rnode. The shape is checked by the selftest
-// (balanced, verb names, arg positions, ≥2 params, no quoted names). An
-// exploratory-deploy pass on scripts/localnet, the way locker.js was verified,
-// is a tracked follow-up on issue #173.
-//
-//   node packages/browser/src/ctp-escrow.js --selftest
+// Two levels of check:
+//   * shape — `node packages/browser/src/ctp-escrow.js --selftest` (in CI):
+//     balanced, verb names, arg positions, ≥2 params, no quoted names.
+//   * behaviour — `node scripts/localnet/ctp-escrow-check.mjs` against a live
+//     rnode: the contract parses and reduces, and every verb returns what its
+//     help says (with `revVault` stubbed to succeed). Verified on bin/rnode
+//     0.1.0. What still needs a signed, genesis-funded deploy: real
+//     `rho:rchain:revVault` semantics (a funded transfer, a failed transfer's
+//     reply). Tracked on issue #173.
 
 /**
  * The escrow contract. Deployed once per shard; its uri is then the address the

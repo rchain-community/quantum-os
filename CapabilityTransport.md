@@ -8,8 +8,10 @@ chains later — with a [quantum-os](README.md) room as the venue.
 Status: **design + Phases 1–2 landed.** Phase 1 —
 [`ctp.ts`](packages/browser/src/ctp.ts), bridge identity and the derived room.
 Phase 2 — [`ctp-escrow.js`](packages/browser/src/ctp-escrow.js), the rholang
-escrow contract and its deploy programs (shape-checked; live-node verification
-is a tracked follow-up). The `/ctp` wire protocol, the helper daemon, and group
+escrow contract and its deploy programs (shape-checked in CI; behaviour
+verified against a live rnode by
+[`ctp-escrow-check.mjs`](scripts/localnet/ctp-escrow-check.mjs), bar real
+`revVault` semantics). The `/ctp` wire protocol, the helper daemon, and group
 policy are specified here and tracked in
 [issue #173](https://github.com/rchain-community/quantum-os/issues/173).
 
@@ -267,10 +269,12 @@ stays undetectable; a transfer that goes through a shard does not.
   see "On custody" above. A self-service timeout refund needs block height in
   the contract and is deferred; Tier 2 removes the trust rather than softening
   it.
-- **The escrow rholang is not yet live-verified.** `ctp-escrow.js` is
-  shape-checked (balanced, verb names, arg positions, ≥2 params, no quoted
-  names) the way `locker.js` was before its exploratory-deploy pass; the same
-  pass for this contract is a follow-up on #173.
+- **The escrow rholang runs, but its `revVault` legs aren't fully live-tested.**
+  `scripts/localnet/ctp-escrow-check.mjs` deploys the contract to a live rnode
+  (bin/rnode 0.1.0) with `revVault` stubbed and drives every verb — parsing,
+  the 6-tuple `match`, the owner gate, nonce idempotency, the counterpart check
+  and refund all behave. What still needs a signed, genesis-funded deploy: real
+  `rho:rchain:revVault` semantics. Tracked on #173.
 - **Revocation binds only those who check** ([issue #107](https://github.com/rchain-community/quantum-os/issues/107)).
   A capability transported as a proxy can be switched off by its owner
   (a dyncap anchor, or a ⅔ group) via a `proxy-set` envelope and a `revoke`
