@@ -85,10 +85,21 @@ single-closure composition would be Layer 2, and is deliberately out of rnode.
 
 ### Exchange support — a contract on Layer 1
 
-A bilateral exchange-rate escrow for fungible *non-REV* tokens: an escrow on
-each side, pre-funded, with an exchange rate. A send adds to the local escrow
-and consumes from the remote one through a remote invoke, conservation held
-per escrow. (`qucalc/examples/shard_exchange.rho` in rchain-rust#34.)
+Two shapes, both built:
+
+- **Bilateral escrow** (`qucalc/examples/shard_exchange.rho`, rchain-rust#34):
+  an escrow on each shard, pre-funded, fixed rate; a send `deposit`s locally and
+  `consume`s the remote one through a remote invoke.
+- **Pooled exchange** (`packages/browser/src/rholang-exchange.js`, quantum-os;
+  `$xopen` / `$xprovide` / `$xdeposit` / `$xquote` / `$xswap` / `$xwithdraw`):
+  a pool trades one token pair at an owner-set rate; `$xlink` / `$xroute`
+  federate it — `route` swaps locally, then returns a
+  `("$at", shard, uri, "swap", …)` descriptor the client runs as a cross-shard
+  remote deploy. Verified end to end against localnet. A quantum-os `/note`
+  currency reaches a pool as its token contract's URI.
+
+Both: conservation held per pool/escrow, and the transport is a remote deploy —
+so a multi-shard route is **not atomic**.
 
 **Capability security is the proof.** The escrow contract exposes no method that
 pays the operator, holds no capability that drains it outside the rate, and

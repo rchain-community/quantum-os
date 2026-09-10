@@ -18,6 +18,18 @@
 // It lives under packages/browser/src because the browser tsconfig sets
 // rootDir there; the agent reaches it by relative path, which node does not
 // restrict.
+//
+// The one sibling import is `rholang-exchange.js` — also plain JS, no imports,
+// pure string builders — for the `$x*` exchange macros, so the exchange
+// call-site shape has a single source (`rholang-exchange.js` + its selftest).
+
+import {
+  openProgram as xOpenProgram, provideProgram as xProvideProgram,
+  depositProgram as xDepositProgram, quoteProgram as xQuoteProgram,
+  swapProgram as xSwapProgram, withdrawProgram as xWithdrawProgram,
+  linkProgram as xLinkProgram, routeProgram as xRouteProgram,
+  inspectProgram as xInspectProgram,
+} from "./rholang-exchange.js";
 
 /**
  * @typedef {object} ZfaKernel
@@ -473,6 +485,67 @@ ${seats.join(" |\n")} |
   ${sink}
 }`;
     },
+  },
+
+  // --- pooled token exchange (rholang-exchange.js) ---------------------
+  // Trade a token pair at an owner-set rate; federate across shards via a
+  // remote signed deploy. `$xopen` a pool, `$xprovide` reserve, `$xdeposit`
+  // your token in, `$xswap` at the rate, `$xwithdraw` out. `token` args are the
+  // tokens' own contract URIs — a quantum-os `/note` currency reaches here as
+  // that URI once a token contract is deployed for it. Never touches revVault.
+  xopen: {
+    help: "Open an exchange pool for a token pair. Args: exchangeUri, poolId, tokenA-uri, tokenB-uri, rate (B per A, ×1e6).",
+    write: true,
+    argSpec: [["exchange", "cap"], ["pool", "string"], ["tokenA", "cap"], ["tokenB", "cap"], ["rate", "int"]],
+    expand: (a) => xOpenProgram(a.exchange, a.pool, a.tokenA, a.tokenB, a.rate),
+  },
+  xprovide: {
+    help: "Owner seeds pool liquidity. Args: exchangeUri, poolId, side (A|B), amount.",
+    write: true,
+    argSpec: [["exchange", "cap"], ["pool", "string"], ["side", "string"], ["amount", "int"]],
+    expand: (a) => xProvideProgram(a.exchange, a.pool, a.side, a.amount),
+  },
+  xdeposit: {
+    help: "Credit your in-pool balance (you moved the token in). Args: exchangeUri, poolId, side, amount.",
+    write: true,
+    argSpec: [["exchange", "cap"], ["pool", "string"], ["side", "string"], ["amount", "int"]],
+    expand: (a) => xDepositProgram(a.exchange, a.pool, a.side, a.amount),
+  },
+  xquote: {
+    help: "What `amount` of `fromSide` buys of the other side. Args: exchangeUri, poolId, fromSide, amount.",
+    write: false,
+    argSpec: [["exchange", "cap"], ["pool", "string"], ["from", "string"], ["amount", "int"]],
+    expand: (a) => xQuoteProgram(a.exchange, a.pool, a.from, a.amount),
+  },
+  xswap: {
+    help: "Swap from your in-pool balance at the rate. Args: exchangeUri, poolId, fromSide, amount.",
+    write: true,
+    argSpec: [["exchange", "cap"], ["pool", "string"], ["from", "string"], ["amount", "int"]],
+    expand: (a) => xSwapProgram(a.exchange, a.pool, a.from, a.amount),
+  },
+  xwithdraw: {
+    help: "Debit your in-pool balance (then move the token out yourself). Args: exchangeUri, poolId, side, amount.",
+    write: true,
+    argSpec: [["exchange", "cap"], ["pool", "string"], ["side", "string"], ["amount", "int"]],
+    expand: (a) => xWithdrawProgram(a.exchange, a.pool, a.side, a.amount),
+  },
+  xlink: {
+    help: "Owner records a peer exchange on another shard. Args: exchangeUri, poolId, name, remote-exchangeUri, remote-shard-url.",
+    write: true,
+    argSpec: [["exchange", "cap"], ["pool", "string"], ["name", "string"], ["remote", "cap"], ["shard", "string"]],
+    expand: (a) => xLinkProgram(a.exchange, a.pool, a.name, a.remote, a.shard),
+  },
+  xroute: {
+    help: "Swap here, then describe the remote leg (a $at cross-shard deploy). Args: exchangeUri, poolId, fromSide, amount, linkName, remotePoolId.",
+    write: true,
+    argSpec: [["exchange", "cap"], ["pool", "string"], ["from", "string"], ["amount", "int"], ["link", "string"], ["remotePool", "string"]],
+    expand: (a) => xRouteProgram(a.exchange, a.pool, a.from, a.amount, a.link, a.remotePool),
+  },
+  xinspect: {
+    help: "Read a pool (rate, reserves, links). Args: exchangeUri, poolId.",
+    write: false,
+    argSpec: [["exchange", "cap"], ["pool", "string"]],
+    expand: (a) => xInspectProgram(a.exchange, a.pool),
   },
 };
 
