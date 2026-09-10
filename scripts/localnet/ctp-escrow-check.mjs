@@ -48,9 +48,9 @@ const DRIVER = `
   new s1, s2, s3, s4, s5, s6, s7, s8, s9 in {
     doRegister!("OWNER", "shard-B", *s1) |
     for (@r1 <- s1) {
-    doLock!("SUBJ", 30, "1111bob", "n1", *s2) |
+    doLock!("OWNER", "1111subj", 30, "1111bob", "n1", *s2) |
     for (@r2 <- s2) {
-    doLock!("SUBJ", 30, "1111bob", "n1", *s3) |
+    doLock!("OWNER", "1111subj", 30, "1111bob", "n1", *s3) |
     for (@r3 <- s3) {
     doLockOf!("n1", *s4) |
     for (@r4 <- s4) {
@@ -130,5 +130,5 @@ want("non-owner mint denied", "denied");
 want("refund of a real lock", "refunded");
 
 console.log(`\n${fail ? "SOME CHECKS FAILED" : "all structural checks passed"} — ${pass}/${pass + fail}`);
-console.log("(real revVault semantics still need a signed, funded deploy — see #173)");
+console.log("(real funded transfers across two nodes: scripts/localnet/ctp-e2e.mjs)");
 process.exit(fail ? 1 : 0);

@@ -141,51 +141,47 @@ export function deriveBridgeRoom(owner: BridgeOwner, shardA: string, shardB: str
 // ---------------------------------------------------------------------------
 
 export interface BridgeSpec {
-  owner: BridgeOwner;
-  /// Normalized shard refs (rnode base URLs), as passed to `deriveBridgeRoom`.
+  /// Normalized rnode base URLs — one node per side.
   shardA: string;
   shardB: string;
-  /// The derived private room capability. Cached; recomputable from the above.
-  roomCap: string;
-  /// Registry URIs of the `ctpEscrow` contract deployed on each shard, once
-  /// known (`/ctp setup` fills these in). `rho:id:…`.
+  /// The shard id stamped into each side's burn/mint receipts and checked
+  /// against the counterpart list. Taken from the node's own `/api/status`
+  /// (disambiguated if both nodes report the same id).
+  idA: string;
+  idB: string;
+  /// Registry URIs of the `ctpEscrow` contract on each side, once `/ctp setup`
+  /// has deployed them. `rho:id:…`.
   escrowA?: string;
   escrowB?: string;
-  /// Above this amount a transfer escalates to a `/gov` vote before its mint
-  /// leg (group-owned bridges only; see `CapabilityTransport.md` Phase 4).
-  /// `undefined` ⟹ no auto-execute ceiling recorded yet.
+  /// Phase 4 (group-owned bridges): the owning identity and a derived
+  /// coordination room. `deriveBridgeRoom` computes the room; it is *stable*,
+  /// not secret. Unused by the single-operator flow.
+  owner?: BridgeOwner;
+  roomCap?: string;
+  /// Phase 4: above this amount a transfer escalates to a `/gov` vote.
   autoThreshold?: number;
-  /// When this operator first created / adopted the bridge (epoch ms).
+  /// When this operator created / adopted the bridge (epoch ms).
   at: number;
 }
 
-/// Build a `BridgeSpec`, deriving the room. Pure — callers persist the result.
-export function makeBridgeSpec(
-  owner: BridgeOwner,
-  shardA: string,
-  shardB: string,
-  at: number = Date.now(),
+/// Build a `BridgeSpec` from two rnode URLs and their shard ids. Pure — the
+/// caller persists the result. Throws if a URL is unparseable or the two sides
+/// resolve to the same node.
+export function makeBridge(
+  shardA: string, shardB: string, idA: string, idB: string, at: number = Date.now(),
 ): BridgeSpec {
   const a = normalizeShardRef(shardA);
   const b = normalizeShardRef(shardB);
-  if (!a || !b) throw new Error("makeBridgeSpec: unparseable shard ref");
-  return {
-    owner,
-    shardA: a,
-    shardB: b,
-    roomCap: deriveBridgeRoom(owner, a, b),
-    at,
-  };
+  if (!a || !b) throw new Error("makeBridge: unparseable shard ref");
+  if (a === b) throw new Error("makeBridge: a bridge needs two distinct rnode URLs");
+  return { shardA: a, shardB: b, idA: idA || "shard-a", idB: idB || "shard-b", at };
 }
 
-/// Re-derive and check a stored spec's `roomCap` — a spec whose room does not
-/// match its inputs was tampered with or was written by an incompatible build.
+/// A stored spec is usable iff its URLs still parse and still differ.
 export function bridgeSpecIsConsistent(spec: BridgeSpec): boolean {
-  try {
-    return deriveBridgeRoom(spec.owner, spec.shardA, spec.shardB) === spec.roomCap;
-  } catch {
-    return false;
-  }
+  const a = normalizeShardRef(spec?.shardA ?? "");
+  const b = normalizeShardRef(spec?.shardB ?? "");
+  return !!a && !!b && a !== b && !!spec.idA && !!spec.idB;
 }
 
 // ---------------------------------------------------------------------------
@@ -427,19 +423,18 @@ export function burnReceiptFromWire(x: unknown): CtpBurnReceipt | null {
   if (!x || typeof x !== "object") return null;
   const b = x as Record<string, unknown>;
   if (b.tag !== "ctp-burn") return null;
-  const srcShard = normalizeShardRef(String(b.srcShard ?? ""));
-  if (!srcShard || !isStr(b.subject) || !isAmount(b.amount) || !isStr(b.nonce) || !isStr(b.destAddr)) return null;
-  return { tag: "ctp-burn", srcShard, subject: b.subject, amount: String(b.amount), nonce: b.nonce, destAddr: b.destAddr };
+  // srcShard here is the shard *id* the contract stamped (opaque), not a URL.
+  if (!isStr(b.srcShard) || !isStr(b.subject) || !isAmount(b.amount) || !isStr(b.nonce) || !isStr(b.destAddr)) return null;
+  return { tag: "ctp-burn", srcShard: b.srcShard, subject: b.subject, amount: String(b.amount), nonce: b.nonce, destAddr: b.destAddr };
 }
 
 export function mintReceiptFromWire(x: unknown): CtpMintReceipt | null {
   if (!x || typeof x !== "object") return null;
   const m = x as Record<string, unknown>;
   if (m.tag !== "ctp-mint") return null;
-  const dstShard = normalizeShardRef(String(m.dstShard ?? ""));
-  const srcShard = normalizeShardRef(String(m.srcShard ?? ""));
-  if (!dstShard || !srcShard || !isStr(m.destAddr) || !isAmount(m.amount) || !isStr(m.nonce)) return null;
-  return { tag: "ctp-mint", dstShard, srcShard, destAddr: m.destAddr, amount: String(m.amount), nonce: m.nonce };
+  // dstShard / srcShard are shard *ids* the contracts stamped, not URLs.
+  if (!isStr(m.dstShard) || !isStr(m.srcShard) || !isStr(m.destAddr) || !isAmount(m.amount) || !isStr(m.nonce)) return null;
+  return { tag: "ctp-mint", dstShard: m.dstShard, srcShard: m.srcShard, destAddr: m.destAddr, amount: String(m.amount), nonce: m.nonce };
 }
 
 export function ctpReceiptFromWire(x: unknown): CtpReceipt | null {
@@ -474,8 +469,7 @@ export function burnReceiptFromTuple(s: string): CtpBurnReceipt | null {
   const unq = (x: string) => {
     try { return JSON.parse(x) as string; } catch { return null; }
   };
-  const srcRaw = unq(m[1]), subject = unq(m[2]), nonce = unq(m[4]), destAddr = unq(m[5]);
-  if (srcRaw == null || subject == null || nonce == null || destAddr == null) return null;
-  const srcShard = normalizeShardRef(srcRaw) ?? srcRaw;
+  const srcShard = unq(m[1]), subject = unq(m[2]), nonce = unq(m[4]), destAddr = unq(m[5]);
+  if (srcShard == null || subject == null || nonce == null || destAddr == null) return null;
   return { tag: "ctp-burn", srcShard, subject, amount: m[3], nonce, destAddr };
 }
