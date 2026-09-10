@@ -60,7 +60,7 @@ routes the message. Two routes:
   *ret)` + a link table) sends the invocation node-to-node with no peer
   relaying it. Charged to the link's account; no new consensus — message
   passing, not shared state; the security is the link registration (which caps
-  each shard exposes to which link). See the companion rchain-rust issue.
+  each shard exposes to which link). [rchain-community/rchain-rust#33](https://github.com/rchain-community/rchain-rust/issues/33).
 
 ### Full CapTP promise semantics
 
@@ -111,7 +111,7 @@ contract enforces whatever it enforces.
 2. Full promise pipelining.
 3. Three-party handoff + revocation (#107).
 4. OCapN wire conformance — interop with Agoric / Spritely endpoints.
-5. Linked shards — the rchain-rust `rho:shard:invoke` extension.
+5. Linked shards — the rchain-rust `rho:shard:invoke` extension ([rchain-rust#33](https://github.com/rchain-community/rchain-rust/issues/33)).
 6. The proven-uncorruptable bilateral exchange-rate escrow (QLF).
 
 ---
