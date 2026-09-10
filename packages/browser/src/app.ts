@@ -60,7 +60,8 @@ import { loadConfig as loadNodeConfig, saveConfig as saveNodeConfig, describeCon
          generateKey as generateDeployKey, revAddressOf, nodeStatus, evalTerm, deployTerm,
          readResultsFresh, readName, deployFate, wrapProgram, powerboxNames, powerboxSpec,
          registryUriOf, powerboxUsed, DEFAULT_CONFIG as DEFAULT_NODE_CONFIG,
-         readResult, readResultRecord, syncResultNonce, type NodeConfig } from "./rholang.js";
+         readResult, readResultRecord, syncResultNonce, deployToNode, readResultAt,
+         type NodeConfig } from "./rholang.js";
 import { qucalcSearch, qucalcSolve,
          type SearchDone as QucalcSearchDone } from "./qucalc-search.js";
 
@@ -4612,11 +4613,36 @@ function handleCommand(raw: string): string[] {
 
       if (sub === "setup") {
         const s = tks[1] ? bridgeByPair(tks[1]) : bridgeForRoom();
-        if (!s) { sys("usage: /ctp setup <pair>"); break; }
+        if (!s) { sys("usage: /ctp setup <pair> [--deploy]"); break; }
         if (!cfg.key) { sys("✗ no deploy key — the bridge account's key must be set: /rholang key <hex>"); break; }
         const pool = revAddressOf(cfg.key);
         const aId = normalizeShardRef(s.shardA)!, bId = normalizeShardRef(s.shardB)!;
-        sys(`the escrow deploy recipe for bridge ${pkey(s)} — run each block on the named shard:`);
+
+        if (tks.includes("--deploy")) {
+          const setupCtx = activeRoom;
+          const line = (txt: string) => inRoom(setupCtx, () => addMessage("", txt, "system"));
+          sys(`deploying the escrow to both shards of ${pkey(s)}…`);
+          void (async () => {
+            for (const [side, url, id, cpId] of [["A", s.shardA, aId, bId], ["B", s.shardB, bId, aId]] as const) {
+              line(`  … installing escrow on ${url}`);
+              const inst = await deployToNode(cfg, url, ctpEscrowInstallProgram(pool, id)).catch((e) => ({ ok: false, message: String(e), value: undefined as string | undefined }));
+              if (!inst.ok || !inst.value || !/^rho:id:/.test(inst.value.trim())) {
+                line(`  ✗ install on ${url} ${inst.ok ? `returned no uri (${inst.value ?? "nothing"})` : `rejected: ${inst.message}`}`);
+                return;
+              }
+              const uri = inst.value.trim();
+              inRoom(setupCtx, () => { if (side === "A") s.escrowA = uri; else s.escrowB = uri; saveCtpBridges(); });
+              line(`  ✓ escrow ${side} = ${uri}`);
+              line(`  … registering counterpart ${cpId}`);
+              const reg = await deployToNode(cfg, url, ctpEscrowRegisterProgram(uri, cpId)).catch((e) => ({ ok: false, message: String(e), value: undefined as string | undefined }));
+              line(reg.ok ? `  ✓ registered ${cpId} on ${side}` : `  ✗ register on ${side}: ${reg.message}`);
+            }
+            line(`  bridge ${pkey(s)} ready — /ctp send <amount> to <A|B>`);
+          })();
+          break;
+        }
+
+        sys(`the escrow deploy recipe for bridge ${pkey(s)} — run each block on the named shard (or /ctp setup ${pkey(s)} --deploy):`);
         sys("");
         sys(`# on shard A (${s.shardA}) — /rholang rnode ${s.shardA}`);
         sys("```");
@@ -4659,35 +4685,85 @@ function handleCommand(raw: string): string[] {
       }
 
       if (sub === "send") {
-        // /ctp send <amount> to <A|B> [<destAddr>]
-        const amount = tks[1] ?? "";
-        const toIx = tks.indexOf("to");
-        const dstSel = (tks[toIx + 1] ?? "").toUpperCase();
+        // /ctp send <amount> to <A|B> [<destAddr>] [--manual]
+        const manual = tks.includes("--manual");
+        const rest = tks.filter((x) => x !== "--manual");
+        const amount = rest[1] ?? "";
+        const toIx = rest.indexOf("to");
+        const dstSel = (rest[toIx + 1] ?? "").toUpperCase();
         if (!/^\d{1,40}$/.test(amount) || toIx < 0 || (dstSel !== "A" && dstSel !== "B")) {
-          sys("usage: /ctp send <amount> to <A|B> [<destAddr>]"); break;
+          sys("usage: /ctp send <amount> to <A|B> [<destAddr>] [--manual]"); break;
         }
         const dstShard = dstSel === "A" ? spec!.shardA : spec!.shardB;
         const srcShard = dstSel === "A" ? spec!.shardB : spec!.shardA;
-        const destAddr = tks[toIx + 2] ?? (cfg.key ? revAddressOf(cfg.key) : "");
+        const destAddr = rest[toIx + 2] ?? (cfg.key ? revAddressOf(cfg.key) : "");
         if (!destAddr) { sys("no destination address — /ctp send <amount> to <A|B> <destAddr>"); break; }
+        const escrowSrc = srcShard === spec!.shardA ? spec!.escrowA : spec!.escrowB;
+        const escrowDst = dstShard === spec!.shardA ? spec!.escrowA : spec!.escrowB;
+        const subjectAddr = cfg.key ? revAddressOf(cfg.key) : "<your-rev-address>";
         const id = newTransferId();
+        const nonce = transferNonce(id);
         const now = Date.now();
         const offer: CtpOffer = {
           id, pair: pkey(spec!), srcShard, dstShard, what: "value", amount, destAddr,
           by: qpeer?.peerId ?? "local", at: now, expiresAt: now + 3600_000,
         };
-        const tr: CtpTransfer = { offer, status: "offered", updatedAt: now };
-        ctpTransfers.set(id, tr);
+        ctpTransfers.set(id, { offer, status: "offered", updatedAt: now });
         signedBroadcast({ kind: "ctp-offer", ...offer });
-        sys(`✓ transfer ${id} offered — ${amount} REV  ${srcShard} → ${dstShard}  for ${destAddr}`);
-        sys(`  nonce ${transferNonce(id)}`);
-        const escrowSrc = srcShard === spec!.shardA ? spec!.escrowA : spec!.escrowB;
-        if (!escrowSrc) { sys(`  ✗ no escrow recorded for the source shard — /ctp setup ${pkey(spec!)}`); break; }
-        sys(`  1. /rholang rnode ${srcShard}   then deploy:`);
-        sys("  ```");
-        sys("  " + ctpLockProgram(escrowSrc, amount, destAddr, transferNonce(id)).replace(/\n/g, "\n  "));
-        sys("  ```");
-        sys(`  2. /ctp lock ${id}      (records the burn receipt + tells the room)`);
+        sys(`✓ transfer ${id} offered — ${amount} REV  ${srcShard} → ${dstShard}  for ${destAddr}  (nonce ${nonce})`);
+
+        if (!escrowSrc || !escrowDst) {
+          sys(`  ✗ escrow not set for ${!escrowSrc ? "the source" : "the destination"} shard — /ctp setup ${pkey(spec!)}`);
+          break;
+        }
+        if (manual || !cfg.key) {
+          if (!cfg.key) sys("  (no deploy key — printing the recipe; set one with /rholang key <hex> to automate)");
+          sys(`  1. /rholang rnode ${srcShard}  then deploy:`);
+          sys("  ```"); sys("  " + ctpLockProgram(escrowSrc, subjectAddr, amount, destAddr, nonce).replace(/\n/g, "\n  ")); sys("  ```");
+          sys(`  2. /ctp lock ${id} "<the ctp-burn tuple it returned>"`);
+          sys(`  3. /rholang rnode ${dstShard}  then deploy the mint  ·  4. /ctp mint ${id}`);
+          break;
+        }
+
+        // Automated: deploy both legs with the bridge key, per-node nonce.
+        const sendCtx = activeRoom;
+        const line = (txt: string) => inRoom(sendCtx, () => addMessage("", txt, "system"));
+        void (async () => {
+          line(`  … deploying lock on ${srcShard}`);
+          const lockOut = await deployToNode(cfg, srcShard, ctpLockProgram(escrowSrc, subjectAddr, amount, destAddr, nonce)).catch((e) => ({ ok: false, message: String(e), value: undefined }));
+          if (!lockOut.ok) { line(`  ✗ lock deploy rejected: ${lockOut.message}`); return; }
+          const burn = lockOut.value ? burnReceiptFromTuple(lockOut.value) : null;
+          if (!burn) {
+            line(`  ⚠ lock deployed but no ctp-burn receipt came back${lockOut.value ? ` (got: ${lockOut.value})` : " (a failed transfer sends nothing)"}`);
+            line(`     check with /rholang rnode ${srcShard} then /rholang read, then /ctp lock ${id} "<tuple>"`);
+            return;
+          }
+          inRoom(sendCtx, () => {
+            const tr = ctpTransfers.get(id); if (!tr) return;
+            const nx = ctpAdvance(tr, { k: "lock", burn });
+            if (nx !== tr) { ctpTransfers.set(id, nx); signedBroadcast({ kind: "ctp-lock", id, burn }); }
+          });
+          line(`  ✓ locked on ${srcShard} — burn ${burn.amount} nonce ${burn.nonce}`);
+
+          line(`  … deploying mint on ${dstShard}`);
+          const mintOut = await deployToNode(cfg, dstShard, ctpMintProgram(escrowDst, burnReceiptToTuple(burn))).catch((e) => ({ ok: false, message: String(e), value: undefined }));
+          if (!mintOut.ok) { line(`  ✗ mint deploy rejected: ${mintOut.message} — the lock is refundable (/ctp abort ${id})`); return; }
+          const mint: CtpMintReceipt = {
+            tag: "ctp-mint", dstShard, srcShard: burn.srcShard,
+            destAddr: burn.destAddr, amount: burn.amount, nonce: burn.nonce,
+          };
+          const receipt: CtpReceipt = { id, burn, mint, at: Date.now() };
+          inRoom(sendCtx, () => {
+            let tr = ctpTransfers.get(id); if (!tr) return;
+            tr = ctpAdvance(tr, { k: "mint", mint });
+            tr = ctpAdvance(tr, { k: "receipt", receipt });
+            ctpTransfers.set(id, tr);
+            ctpReceiptStore.set(id, receipt); saveCtpReceipts();
+            signedBroadcast({ kind: "ctp-mint", id, mint });
+            signedBroadcast({ kind: "ctp-receipt", ...receipt });
+          });
+          line(`  ✓ transfer ${id} complete — ${amount} REV to ${destAddr} on ${dstShard}${mintOut.value ? ` (${mintOut.value})` : ""}`);
+        })();
         break;
       }
 

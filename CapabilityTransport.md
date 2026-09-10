@@ -5,17 +5,18 @@ Companion to [`Room_Bridges.md`](Room_Bridges.md) (information across rooms) and
 moving **value and capabilities between shards** — RChain shards now, other
 chains later — with a [quantum-os](README.md) room as the venue.
 
-Status: **design + Phases 1–3b landed.**
-Phase 1 — [`ctp.ts`](packages/browser/src/ctp.ts), bridge identity and the
-derived room. Phase 2 — [`ctp-escrow.js`](packages/browser/src/ctp-escrow.js),
-the escrow contract + deploy programs (shape-checked in CI; behaviour verified
-against a live rnode by
-[`ctp-escrow-check.mjs`](scripts/localnet/ctp-escrow-check.mjs), bar real
-`revVault` semantics). Phase 3 — the `/ctp` command, the `ctp-*` wire kinds and
-the in-flight/receipt stores in `app.ts` (3b); the on-shard `lock`/`mint`
-deploys are still run by the operator through `/rholang` (the recipe is
-printed) until a multi-node deploy path lands (3c). The helper daemon and group
-policy are specified here and tracked in
+Status: **design + Phases 1–3 landed.**
+Phase 1 — [`ctp.ts`](packages/browser/src/ctp.ts), bridge identity + the derived
+room + the transport protocol. Phase 2 —
+[`ctp-escrow.js`](packages/browser/src/ctp-escrow.js), the escrow contract +
+deploy programs (shape-checked in CI; **verified end to end against a live rnode
+with real signed, funded deploys** by
+[`ctp-e2e.mjs`](scripts/localnet/ctp-e2e.mjs)). Phase 3 — the `/ctp` command,
+the `ctp-*` wire kinds, the in-flight/receipt stores (3b), and
+[`deployToNode`](packages/browser/src/rholang.ts) — a per-node deploy so
+`/ctp send` and `/ctp setup --deploy` drive both shards' legs themselves (3c),
+with the printed-recipe path kept as a `--manual` fallback. The helper daemon
+and group policy are specified here and tracked in
 [issue #173](https://github.com/rchain-community/quantum-os/issues/173).
 
 ---
@@ -272,12 +273,15 @@ stays undetectable; a transfer that goes through a shard does not.
   see "On custody" above. A self-service timeout refund needs block height in
   the contract and is deferred; Tier 2 removes the trust rather than softening
   it.
-- **The escrow rholang runs, but its `revVault` legs aren't fully live-tested.**
-  `scripts/localnet/ctp-escrow-check.mjs` deploys the contract to a live rnode
-  (bin/rnode 0.1.0) with `revVault` stubbed and drives every verb — parsing,
-  the 6-tuple `match`, the owner gate, nonce idempotency, the counterpart check
-  and refund all behave. What still needs a signed, genesis-funded deploy: real
-  `rho:rchain:revVault` semantics. Tracked on #173.
+- **The escrow rholang is verified end to end.**
+  `scripts/localnet/ctp-escrow-check.mjs` drives every verb on a live rnode
+  (`revVault` stubbed); `scripts/localnet/ctp-e2e.mjs` does the whole flow with
+  **real signed, genesis-funded deploys** — install both escrows, register,
+  a funded `lock` and `mint` — and asserts the recipient's REV balance moved by
+  the transfer amount. Both pass on bin/rnode 0.1.0. What is *not* yet covered:
+  a failed `revVault` transfer's reply shape (the shipped build may not reply at
+  all — CLAUDE.md), and a self-service timeout refund (needs block height in the
+  contract).
 - **Revocation binds only those who check** ([issue #107](https://github.com/rchain-community/quantum-os/issues/107)).
   A capability transported as a proxy can be switched off by its owner
   (a dyncap anchor, or a ⅔ group) via a `proxy-set` envelope and a `revoke`
