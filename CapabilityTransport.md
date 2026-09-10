@@ -12,8 +12,11 @@ command) was built and then removed — it moved the platform token and assumed
 equal value, both of which this design rules out. What is kept:
 [`deployToNode`](packages/browser/src/rholang.ts) (deploy to a specific node,
 per-node result-slot nonce) and this document. Tracked in
-[issue #173](https://github.com/rchain-community/quantum-os/issues/173); the
-proven-uncorruptable escrow is a QLF question (separate issue).
+[quantum-os#173](https://github.com/rchain-community/quantum-os/issues/173)
+(client side) and
+[rchain-rust#33](https://github.com/rchain-community/rchain-rust/issues/33)
+(remote name proxies + exchange support + the `rho:shard:invoke` node
+extension).
 
 ---
 
@@ -60,7 +63,7 @@ routes the message. Two routes:
   *ret)` + a link table) sends the invocation node-to-node with no peer
   relaying it. Charged to the link's account; no new consensus — message
   passing, not shared state; the security is the link registration (which caps
-  each shard exposes to which link). See the companion rchain-rust issue.
+  each shard exposes to which link). [rchain-community/rchain-rust#33](https://github.com/rchain-community/rchain-rust/issues/33).
 
 ### Full CapTP promise semantics
 
@@ -83,24 +86,25 @@ checks the original caller's identity (carried in the envelope).
 
 ---
 
-## The bilateral exchange-rate escrow — the ultimate goal, unsolved
+## Exchange support — bilateral exchange-rate escrow
 
-For fungible *non-REV* tokens, the target is an escrow on each side, pre-funded,
-with an exchange rate: a send **adds to the local escrow and consumes from the
-remote escrow**, and the whole thing is **proven uncorruptable** — the operator
-cannot pay themselves, stall a half-done transfer, or run the escrow dry
-undetected.
+For fungible *non-REV* tokens: an escrow on each side, pre-funded, with an
+exchange rate. A send **adds to the local escrow and consumes from the remote
+escrow** (through a linked-shard `rho:shard:invoke`), conservation held per
+escrow.
 
-"Proven uncorruptable" is the open problem, and it is a QLF question: the
-transfer wants to be **one joint ZFA closure spanning both escrows** (ER=EPR —
-`crates/zfa-core/src/coupling.rs`'s `coupled` verdict), so it either closes
-(both sides move, conservation holds across the cut) or it does not (neither
-side moves). That is a separate design — a QLF extension issue, not this
-document.
+This is **not an open research problem** — capability security is the proof.
+The escrow contract exposes no method that pays the operator, holds no
+capability that drains it outside the rate, and fixes (or governs) the rate at
+deploy. There is nothing to corrupt because there is no ambient authority to
+corrupt with. The joint-ZFA-closure reading (one closure spanning both escrows,
+`crates/zfa-core/src/coupling.rs` `coupled`) is a *check* the contract can run
+with `rho:qucalc:verify` — which rnode already exposes — not a prerequisite.
 
-Until then there is no safe cross-shard *value* transport here — only
-capability *invocation*, where nothing is escrowed and the home shard's own
-contract enforces whatever it enforces.
+**This belongs in rchain-rust** ([rchain-rust#33](https://github.com/rchain-community/rchain-rust/issues/33)),
+alongside the remote-name-proxy support and the QLF primitives it already
+carries. quantum-os is the client: the `$at` macro, the gateway peer, the
+coordination room, revocation, governance.
 
 ---
 
@@ -111,8 +115,8 @@ contract enforces whatever it enforces.
 2. Full promise pipelining.
 3. Three-party handoff + revocation (#107).
 4. OCapN wire conformance — interop with Agoric / Spritely endpoints.
-5. Linked shards — the rchain-rust `rho:shard:invoke` extension.
-6. The proven-uncorruptable bilateral exchange-rate escrow (QLF).
+5. Linked shards — the rchain-rust `rho:shard:invoke` extension ([rchain-rust#33](https://github.com/rchain-community/rchain-rust/issues/33)).
+6. Exchange support — the bilateral exchange-rate escrow (rchain-rust#33).
 
 ---
 
