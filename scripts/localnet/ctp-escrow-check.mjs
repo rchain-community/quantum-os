@@ -130,5 +130,5 @@ want("non-owner mint denied", "denied");
 want("refund of a real lock", "refunded");
 
 console.log(`\n${fail ? "SOME CHECKS FAILED" : "all structural checks passed"} — ${pass}/${pass + fail}`);
-console.log("(real revVault semantics still need a signed, funded deploy — see #173)");
+console.log("(real funded transfers across two nodes: scripts/localnet/ctp-e2e.mjs)");
 process.exit(fail ? 1 : 0);
