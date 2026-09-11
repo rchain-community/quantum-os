@@ -7,12 +7,26 @@
 // reserve, so conservation is held per pool — capability security is the whole
 // proof (no method pays the operator, the pool holds no ambient authority).
 //
-// **Federation.** An exchange records peer exchanges by name (`link`), each on
-// its own shard. `route` swaps locally, then returns the remote leg's call
-// descriptor `("$at", shard, exchangeUri, "swap", toToken, out)` — the client
-// runs it as a cross-shard *remote signed deploy* (rchain-rust#33/#34), so a
-// swap can hop across exchanges on different shards. The two legs are separate
-// transactions and are not atomic across shards (see CapabilityTransport.md).
+// **Federation, atomically.** An exchange records peer exchanges by name
+// (`link`), each on its own shard. A cross-shard trade is a **two-phase
+// commit, client-orchestrated over the Layer-1 remote signed deploy**
+// (rchain-rust#33/#34) — no relay, no new consensus, no coordinator that can
+// lose the decision:
+//   1. `prepare` on the local pool — does the swap now, holds a reversible
+//      tx record.
+//   2. `prepareReceive` on the linked remote pool — credits the local leg's
+//      output as if deposited, swaps it, holds its own reversible record.
+//      Gated to a registered `link`: the federation trusts its own linked
+//      pools, not an unverified cross-shard claim (shard B cannot read
+//      shard A's state directly — that is the reason 2PC exists at all).
+//   3. `commit` both, or `abort` the one leg that succeeded — both idempotent.
+//      `abort` is self-only in this version (see the note on the `abort`
+//      contract below: a permissionless after-expiry path is designed —
+//      `expiryBlock` is recorded — but not implemented, because reading
+//      `rho:block:data` from a signed deploy breaks this rnode build's
+//      return-value readback; verified empirically). A crashed client can
+//      still read `stateOf` on both legs and finish deterministically with
+//      its own key. See `exchange-2pc.ts` and CapabilityTransport.md.
 //
 // **Connecting to quantum-os currencies.** A `/note` currency is a bearer
 // label; here it is that same label. Deploy a token contract for it
@@ -37,13 +51,15 @@ export const RATE_SCALE = 1_000_000;
  *   pools : Map<poolId, { owner, tokenA, tokenB, rate, reserveA, reserveB,
  *                         links: Map<name, {exchangeUri, shard}> }>
  *   bals  : Map<poolId, Map<holder, {a, b}>>   // holder = *deployerId
+ *   txs   : Map<txId, { holder, poolId, fromSide, toSide, amount, out,
+ *                       expiryBlock, status, receive? }>  // the 2PC log
  */
 export const EXCHANGE_RHO = `new
-    Exchange, poolsCh, balsCh,
+    Exchange, poolsCh, balsCh, txCh,
     insertArbitrary(\`rho:registry:insertArbitrary\`),
     deployerId(\`rho:rchain:deployerId\`), ret
 in {
-  poolsCh!({}) | balsCh!({}) |
+  poolsCh!({}) | balsCh!({}) | txCh!({}) |
 
   // open — create a pool for a token pair. deployer = owner; rate is B per A,
   // scaled by RATE_SCALE, changed only via "setRate".
@@ -198,28 +214,209 @@ in {
     }
   } |
 
-  // route — swap here, then describe the remote leg for the client to run as a
-  // cross-shard remote signed deploy (rchain-rust#33). Not atomic across shards.
-  contract Exchange(_id, @"route", @poolId, @fromSide, @amount, @linkName, @remotePoolId, ret) = {
-    for (@pools <<- poolsCh) {
-      match pools.getOrElse(poolId, Nil) {
-        Nil => { ret!(("exchange-error", "no such pool")) }
-        p => {
-          match p.get("links").getOrElse(linkName, Nil) {
-            Nil => { ret!(("exchange-error", "no such link")) }
-            lk => {
-              new sret in {
-                Exchange!(*_id, "swap", poolId, fromSide, amount, *sret) |
-                for (@sr <- sret) {
-                  match sr {
-                    {"got": out, "toSide": toSide} => { ret!({"local": sr, "remote": ("$at", lk.get("shard"), lk.get("exchangeUri"), "swap", remotePoolId, toSide, out)}) }
-                    _ => { ret!(sr) }
+  // prepare — do the swap now (reserves + balance adjusted, identical math to
+  // "swap"), and hold a reversible tx record so a cross-shard trade can
+  // commit or abort as a unit. duplicate txId is refused (check stateOf
+  // before retrying).
+  contract Exchange(_id, @"prepare", @poolId, @txId, @fromSide, @amount, @expiryBlock, ret) = {
+    for (@pools <- poolsCh; @bals <- balsCh; @txs <- txCh) {
+      match txs.getOrElse(txId, Nil) {
+        Nil => {
+          match pools.getOrElse(poolId, Nil) {
+            Nil => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "no such pool")) }
+            p => {
+              let @h <- bals.getOrElse(poolId, {}).getOrElse(*_id, {"a": 0, "b": 0}) in {
+                match [fromSide, amount >= 0] {
+                  ["A", true] => {
+                    let @out <- amount * p.get("rate") / 1000000 in {
+                      match [h.get("a") >= amount, p.get("reserveB") >= out] {
+                        [true, true] => {
+                          poolsCh!(pools.set(poolId, p.set("reserveA", p.get("reserveA") + amount).set("reserveB", p.get("reserveB") - out))) |
+                          balsCh!(bals.set(poolId, bals.getOrElse(poolId, {}).set(*_id, h.set("a", h.get("a") - amount).set("b", h.get("b") + out)))) |
+                          txCh!(txs.set(txId, {"holder": *_id, "poolId": poolId, "fromSide": "A", "toSide": "B", "amount": amount, "out": out, "expiryBlock": expiryBlock, "status": "prepared"})) |
+                          ret!(("prepared", txId, out, "B", expiryBlock))
+                        }
+                        [false, _] => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "insufficient balance")) }
+                        _          => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "insufficient reserve")) }
+                      }
+                    }
+                  }
+                  ["B", true] => {
+                    let @out <- amount * 1000000 / p.get("rate") in {
+                      match [h.get("b") >= amount, p.get("reserveA") >= out] {
+                        [true, true] => {
+                          poolsCh!(pools.set(poolId, p.set("reserveB", p.get("reserveB") + amount).set("reserveA", p.get("reserveA") - out))) |
+                          balsCh!(bals.set(poolId, bals.getOrElse(poolId, {}).set(*_id, h.set("b", h.get("b") - amount).set("a", h.get("a") + out)))) |
+                          txCh!(txs.set(txId, {"holder": *_id, "poolId": poolId, "fromSide": "B", "toSide": "A", "amount": amount, "out": out, "expiryBlock": expiryBlock, "status": "prepared"})) |
+                          ret!(("prepared", txId, out, "A", expiryBlock))
+                        }
+                        [false, _] => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "insufficient balance")) }
+                        _          => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "insufficient reserve")) }
+                      }
+                    }
+                  }
+                  _ => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "bad prepare")) }
+                }
+              }
+            }
+          }
+        }
+        _ => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "duplicate txId")) }
+      }
+    }
+  } |
+
+  // prepareReceive — the linked pool's receiving leg: credit "amount" of
+  // "side" as if deposited, then swap it here, holding a reversible record.
+  // Gated to a registered link — the federation trusts its own linked pools,
+  // not an unverified cross-shard claim.
+  contract Exchange(_id, @"prepareReceive", @poolId, @txId, @side, @amount, @expiryBlock, @linkName, ret) = {
+    for (@pools <- poolsCh; @bals <- balsCh; @txs <- txCh) {
+      match txs.getOrElse(txId, Nil) {
+        Nil => {
+          match pools.getOrElse(poolId, Nil) {
+            Nil => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "no such pool")) }
+            p => {
+              match p.get("links").getOrElse(linkName, Nil) {
+                Nil => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "no such link")) }
+                lk => {
+                  let @h <- bals.getOrElse(poolId, {}).getOrElse(*_id, {"a": 0, "b": 0}) in {
+                    match [side, amount >= 0] {
+                      ["A", true] => {
+                        let @out <- amount * p.get("rate") / 1000000 in {
+                          match p.get("reserveB") >= out {
+                            true  => {
+                              poolsCh!(pools.set(poolId, p.set("reserveB", p.get("reserveB") - out))) |
+                              balsCh!(bals.set(poolId, bals.getOrElse(poolId, {}).set(*_id, h.set("b", h.get("b") + out)))) |
+                              txCh!(txs.set(txId, {"holder": *_id, "poolId": poolId, "fromSide": "A", "toSide": "B", "amount": amount, "out": out, "expiryBlock": expiryBlock, "status": "prepared", "receive": true, "link": linkName})) |
+                              ret!(("prepared", txId, out, "B", expiryBlock))
+                            }
+                            false => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "insufficient reserve")) }
+                          }
+                        }
+                      }
+                      ["B", true] => {
+                        let @out <- amount * 1000000 / p.get("rate") in {
+                          match p.get("reserveA") >= out {
+                            true  => {
+                              poolsCh!(pools.set(poolId, p.set("reserveA", p.get("reserveA") - out))) |
+                              balsCh!(bals.set(poolId, bals.getOrElse(poolId, {}).set(*_id, h.set("a", h.get("a") + out)))) |
+                              txCh!(txs.set(txId, {"holder": *_id, "poolId": poolId, "fromSide": "B", "toSide": "A", "amount": amount, "out": out, "expiryBlock": expiryBlock, "status": "prepared", "receive": true, "link": linkName})) |
+                              ret!(("prepared", txId, out, "A", expiryBlock))
+                            }
+                            false => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "insufficient reserve")) }
+                          }
+                        }
+                      }
+                      _ => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "bad prepareReceive")) }
+                    }
                   }
                 }
               }
             }
           }
         }
+        _ => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "duplicate txId")) }
+      }
+    }
+  } |
+
+  // commit — the effect already happened at prepare/prepareReceive time;
+  // this only makes the decision durable and readable via stateOf.
+  // Idempotent; only the tx's own holder may commit it.
+  contract Exchange(_id, @"commit", @txId, ret) = {
+    for (@txs <- txCh) {
+      match txs.getOrElse(txId, Nil) {
+        Nil => { txCh!(txs) | ret!(("exchange-error", "unknown tx")) }
+        e => {
+          match [e.get("holder") == *_id, e.get("status")] {
+            [false, _]           => { txCh!(txs) | ret!(("exchange-error", "not holder")) }
+            [true, "aborted"]    => { txCh!(txs) | ret!(("exchange-error", "already aborted")) }
+            [true, "committed"]  => { txCh!(txs) | ret!(("committed", txId, e.get("out"), e.get("toSide"))) }
+            [true, "prepared"]   => { txCh!(txs.set(txId, e.set("status", "committed"))) | ret!(("committed", txId, e.get("out"), e.get("toSide"))) }
+            _                    => { txCh!(txs) | ret!(("exchange-error", "bad tx state")) }
+          }
+        }
+      }
+    }
+  } |
+
+  // abort — self-abort only (v1: see the rho:block:data note below). Reverses
+  // the swap/credit exactly. Idempotent; refuses to abort an already-
+  // committed tx.
+  //
+  // Design note — permissionless-after-expiry is NOT implemented here.
+  // expiryBlock is recorded for a future version and for off-chain recovery
+  // tooling, but abort does not read rho:block:data to enforce it: verified
+  // empirically (2026-09-11, against bin/rnode 0.1.0) that a signed deploy
+  // reading rho:block:data never gets its return!'d value through
+  // wrapProgram's registry-readback forwarder — reproduced down to the
+  // simplest possible program (a bare block-data read + return!), with no
+  // rholang error reported (a clean "Success!", cost well under phloLimit)
+  // and no state change either. Exploratory (unsigned) reads of
+  // rho:block:data work fine; it is specifically the signed-deploy path that
+  // breaks. Until that is root-caused (or validAfterBlockNumber turns out to
+  // give a usable, trustable lower bound), a "prepare"d tx whose holder never
+  // returns stays prepared — locked, not lost, recoverable by the holder's
+  // own key reappearing. Tracked in CapabilityTransport.md.
+  contract Exchange(_id, @"abort", @poolId, @txId, ret) = {
+    for (@pools <- poolsCh; @bals <- balsCh; @txs <- txCh) {
+      match txs.getOrElse(txId, Nil) {
+        Nil => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "unknown tx")) }
+        e => {
+          match [e.get("status"), e.get("holder") == *_id] {
+            ["aborted", _]      => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("aborted", txId)) }
+            ["committed", _]    => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "already committed")) }
+            ["prepared", false] => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "not holder")) }
+            ["prepared", true]  => {
+              match pools.get(poolId) {
+                p => {
+                  match [e.get("receive"), e.get("toSide")] {
+                    [true, "B"] => {
+                      let @h <- bals.getOrElse(poolId, {}).getOrElse(e.get("holder"), {"a": 0, "b": 0}) in {
+                        poolsCh!(pools.set(poolId, p.set("reserveB", p.get("reserveB") + e.get("out")))) |
+                        balsCh!(bals.set(poolId, bals.getOrElse(poolId, {}).set(e.get("holder"), h.set("b", h.get("b") - e.get("out")))))
+                      }
+                    }
+                    [true, "A"] => {
+                      let @h <- bals.getOrElse(poolId, {}).getOrElse(e.get("holder"), {"a": 0, "b": 0}) in {
+                        poolsCh!(pools.set(poolId, p.set("reserveA", p.get("reserveA") + e.get("out")))) |
+                        balsCh!(bals.set(poolId, bals.getOrElse(poolId, {}).set(e.get("holder"), h.set("a", h.get("a") - e.get("out")))))
+                      }
+                    }
+                    [_, "B"] => {
+                      let @h <- bals.getOrElse(poolId, {}).getOrElse(e.get("holder"), {"a": 0, "b": 0}) in {
+                        poolsCh!(pools.set(poolId, p.set("reserveA", p.get("reserveA") - e.get("amount")).set("reserveB", p.get("reserveB") + e.get("out")))) |
+                        balsCh!(bals.set(poolId, bals.getOrElse(poolId, {}).set(e.get("holder"), h.set("a", h.get("a") + e.get("amount")).set("b", h.get("b") - e.get("out")))))
+                      }
+                    }
+                    [_, "A"] => {
+                      let @h <- bals.getOrElse(poolId, {}).getOrElse(e.get("holder"), {"a": 0, "b": 0}) in {
+                        poolsCh!(pools.set(poolId, p.set("reserveB", p.get("reserveB") - e.get("amount")).set("reserveA", p.get("reserveA") + e.get("out")))) |
+                        balsCh!(bals.set(poolId, bals.getOrElse(poolId, {}).set(e.get("holder"), h.set("b", h.get("b") + e.get("amount")).set("a", h.get("a") - e.get("out")))))
+                      }
+                    }
+                  } |
+                  txCh!(txs.set(txId, e.set("status", "aborted"))) |
+                  ret!(("aborted", txId))
+                }
+              }
+            }
+            _ => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "bad tx state")) }
+          }
+        }
+      }
+    }
+  } |
+
+  // stateOf — read-only; the recovery primitive. A crashed client (or anyone)
+  // reads this on both legs and finishes deterministically. rchain-rust#33
+  // remote reads need no signature, so this is cheap to poll.
+  contract Exchange(_id, @"stateOf", @txId, ret) = {
+    for (@txs <<- txCh) {
+      match txs.getOrElse(txId, Nil) {
+        Nil => { ret!(("unknown", txId)) }
+        e   => { ret!(e) }
       }
     }
   } |
@@ -259,8 +456,11 @@ const FACETS = `{
     "open":     bundle+{*Exchange}, "provide":  bundle+{*Exchange},
     "deposit":  bundle+{*Exchange}, "quote":    bundle+{*Exchange},
     "swap":     bundle+{*Exchange}, "withdraw": bundle+{*Exchange},
-    "link":     bundle+{*Exchange}, "route":    bundle+{*Exchange},
-    "setRate":  bundle+{*Exchange}, "inspect":  bundle+{*Exchange}
+    "link":     bundle+{*Exchange}, "setRate":  bundle+{*Exchange},
+    "inspect":  bundle+{*Exchange},
+    "prepare":        bundle+{*Exchange}, "prepareReceive": bundle+{*Exchange},
+    "commit":         bundle+{*Exchange}, "abort":          bundle+{*Exchange},
+    "stateOf":        bundle+{*Exchange}
   }`;
 
 const q = (s) => JSON.stringify(String(s));
@@ -302,9 +502,17 @@ export const quoteProgram   = (uri, poolId, fromSide, amount) => exchangeCall(ur
 export const swapProgram    = (uri, poolId, fromSide, amount) => exchangeCall(uri, "swap", [q(poolId), q(fromSide.toUpperCase()), int(amount)]);
 export const withdrawProgram= (uri, poolId, side, amount) => exchangeCall(uri, "withdraw", [q(poolId), q(side.toUpperCase()), int(amount)]);
 export const linkProgram    = (uri, poolId, name, remoteUri, shard) => exchangeCall(uri, "link", [q(poolId), q(name), q(remoteUri), q(shard)]);
-export const routeProgram   = (uri, poolId, fromSide, amount, linkName, remotePoolId) => exchangeCall(uri, "route", [q(poolId), q(fromSide.toUpperCase()), int(amount), q(linkName), q(remotePoolId)]);
 export const setRateProgram = (uri, poolId, rate) => exchangeCall(uri, "setRate", [q(poolId), int(rate)]);
 export const inspectProgram = (uri, poolId) => exchangeCall(uri, "inspect", [q(poolId)]);
+
+// --- two-phase commit: the atomic cross-shard federation primitive --------
+export const prepareProgram = (uri, poolId, txId, fromSide, amount, expiryBlock) =>
+  exchangeCall(uri, "prepare", [q(poolId), q(txId), q(fromSide.toUpperCase()), int(amount), int(expiryBlock)]);
+export const prepareReceiveProgram = (uri, poolId, txId, side, amount, expiryBlock, linkName) =>
+  exchangeCall(uri, "prepareReceive", [q(poolId), q(txId), q(side.toUpperCase()), int(amount), int(expiryBlock), q(linkName)]);
+export const commitProgram  = (uri, txId) => exchangeCall(uri, "commit", [q(txId)]);
+export const abortProgram   = (uri, poolId, txId) => exchangeCall(uri, "abort", [q(poolId), q(txId)]);
+export const stateOfProgram = (uri, txId) => exchangeCall(uri, "stateOf", [q(txId)]);
 
 // ---------------------------------------------------------------------------
 // Selftest — node packages/browser/src/rholang-exchange.js --selftest
@@ -328,22 +536,32 @@ export function selftest() {
   };
   const URI = "rho:id:abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqr";
 
+  const VERBS = ["open","provide","deposit","quote","swap","withdraw","link","setRate","inspect",
+                 "prepare","prepareReceive","commit","abort","stateOf"];
+
   ok("contract template is balanced", balanced(EXCHANGE_RHO));
-  ok("no quoted name", !/@"[a-z]/.test(EXCHANGE_RHO.replace(/@"(open|provide|deposit|quote|swap|withdraw|link|route|setRate|inspect)"/g, "")), "@\"…\"");
+  ok("no quoted name", !/@"[a-z]/.test(EXCHANGE_RHO.replace(new RegExp(`@"(${VERBS.join("|")})"`, "g"), "")), "@\"…\"");
   ok("every verb dispatch keeps ≥2 params",
      [...EXCHANGE_RHO.matchAll(/contract Exchange\(([^)]*)\)/g)].every((m) => m[1].split(",").filter((x) => x.trim()).length >= 3),
      "@\"verb\" + arg + ret");
-  // Mutating verbs consume `poolsCh` with `<-` and must restore it; read-only
-  // verbs (route/inspect) peek with `<<-`. Check every consuming block restores.
-  ok("every `<- poolsCh` block restores poolsCh",
-     [...EXCHANGE_RHO.split("contract Exchange(")].slice(1).every((blk) => {
-       const consumes = /@pools <- poolsCh/.test(blk);
-       return !consumes || (blk.match(/poolsCh!\(/g) || []).length >= 1;
-     }));
+  // Mutating verbs consume the state cells with `<-` and must restore them;
+  // read-only verbs (inspect/stateOf) peek with `<<-`. Check every consuming
+  // block restores what it consumed — a leaked cell deadlocks the contract.
+  const restores = (chVar, chName) =>
+    [...EXCHANGE_RHO.split("contract Exchange(")].slice(1).every((blk) => {
+      const consumes = new RegExp(`@${chVar} <- ${chName}`).test(blk);
+      return !consumes || (blk.match(new RegExp(`${chName}!\\(`, "g")) || []).length >= 1;
+    });
+  ok("every `<- poolsCh` block restores poolsCh", restores("pools", "poolsCh"));
+  ok("every `<- balsCh` block restores balsCh", restores("bals", "balsCh"));
+  ok("every `<- txCh` block restores txCh", restores("txs", "txCh"));
   ok("never touches revVault", !/revVault|rho:rchain:revVault/.test(EXCHANGE_RHO));
-  ok("all ten verbs defined",
-     ["open","provide","deposit","quote","swap","withdraw","link","route","setRate","inspect"]
-       .every((v) => EXCHANGE_RHO.includes(`@"${v}"`)));
+  ok("all fourteen verbs defined", VERBS.every((v) => EXCHANGE_RHO.includes(`@"${v}"`)));
+  // The doc comment above `abort` explains the gap in prose; the check is
+  // that nothing actually *binds* the URN (a backtick-quoted powerbox name).
+  ok("never binds rho:block:data (verified broken on this rnode build's signed-deploy path)",
+     !EXCHANGE_RHO.includes("\\`rho:block:data\\`"));
+  ok("abort is holder-gated", /"abort", @poolId, @txId, ret\) = \{[\s\S]*?e\.get\("holder"\) == \*_id/.test(EXCHANGE_RHO));
 
   const inst = installProgram();
   ok("install is balanced", balanced(inst));
@@ -358,14 +576,28 @@ export function selftest() {
   const swap = swapProgram(URI, "USD-EUR", "a", 100n);
   ok("swap upper-cases the side and passes the amount", /@verb!\(\*deployerId, "swap", "USD-EUR", "A", 100, \*ret\)/.test(swap), swap.slice(-200));
 
-  const route = routeProgram(URI, "USD-EUR", "B", 50, "paris", "EUR-GBP");
-  ok("route carries link + remote pool", /@verb!\(\*deployerId, "route", "USD-EUR", "B", 50, "paris", "EUR-GBP", \*ret\)/.test(route), route.slice(-240));
-
   const link = linkProgram(URI, "USD-EUR", "paris", "rho:id:paris", "https://shard-b.example");
   ok("link carries name, uri, shard", /"paris", "rho:id:paris", "https:\/\/shard-b.example"/.test(link));
 
+  const prep = prepareProgram(URI, "USD-EUR", "tx1", "a", 100, 999);
+  ok("prepare carries txId, side, amount, expiry", /@verb!\(\*deployerId, "prepare", "USD-EUR", "tx1", "A", 100, 999, \*ret\)/.test(prep), prep.slice(-220));
+
+  const recv = prepareReceiveProgram(URI, "EUR-GBP", "tx1", "b", 92, 999, "shardA");
+  ok("prepareReceive carries txId, side, amount, expiry, link", /@verb!\(\*deployerId, "prepareReceive", "EUR-GBP", "tx1", "B", 92, 999, "shardA", \*ret\)/.test(recv), recv.slice(-260));
+
+  const commit = commitProgram(URI, "tx1");
+  ok("commit carries only txId", /@verb!\(\*deployerId, "commit", "tx1", \*ret\)/.test(commit));
+
+  const abort = abortProgram(URI, "USD-EUR", "tx1");
+  ok("abort carries poolId + txId", /@verb!\(\*deployerId, "abort", "USD-EUR", "tx1", \*ret\)/.test(abort));
+
+  const stateOf = stateOfProgram(URI, "tx1");
+  ok("stateOf carries only txId", /@verb!\(\*deployerId, "stateOf", "tx1", \*ret\)/.test(stateOf));
+
   ok("a non-integer amount is rejected",
      (() => { try { swapProgram(URI, "p", "A", "1.5"); return false; } catch { return true; } })());
+  ok("a non-integer expiryBlock is rejected",
+     (() => { try { prepareProgram(URI, "p", "tx", "A", 1, "soon"); return false; } catch { return true; } })());
 
   const nasty = openProgram(URI, 'x", *evil) | @"stolen"!("', "rho:id:a", "rho:id:b", 1);
   ok("a hostile pool id stays inside its literal",

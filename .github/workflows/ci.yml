@@ -82,10 +82,22 @@ jobs:
       - name: Locker selftest
         run: node packages/browser/src/locker.js --selftest
 
-      # The pooled token exchange contract + its `$x*` macro call-site shape.
-      # Shape only; live-node behaviour is verified manually against localnet.
+      # The pooled token exchange contract (open/provide/swap/… + the atomic
+      # cross-shard 2PC verbs) and its `$x*` macro call-site shape. Shape
+      # only; live-node behaviour is verified manually against localnet.
       - name: Exchange selftest
         run: node packages/browser/src/rholang-exchange.js --selftest
+
+      # The wrapped-native-token contract + $wrap/$unwrap/$wrelease macro
+      # call-site shape. Same scope as the exchange selftest above.
+      - name: Wrapped token selftest
+        run: node packages/browser/src/wrapped-token.js --selftest
+
+      # The cross-shard trade recovery decision table (exchange-2pc.ts) —
+      # pure, so this is exhaustive over every reachable (local, remote)
+      # status pair, not shape-only.
+      - name: Exchange 2PC recovery test
+        run: node packages/browser/test/exchange-2pc.test.mjs
 
       # Browser behaviour, against stubbed media. Not a rendering test — it
       # asserts which track ends up in the stream a joiner would be given.

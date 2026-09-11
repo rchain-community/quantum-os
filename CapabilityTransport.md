@@ -14,6 +14,10 @@ Two layers, and most uses only need the first:
 Status: **Layer 1 in draft** ([rchain-rust#34](https://github.com/rchain-community/rchain-rust/pull/34):
 `casper::shard_invoke`, the decision record, the exchange contract — CI green,
 and the branch build verified against the local chain). Layer 2 is design.
+On the quantum-os side, the pooled exchange's cross-shard trade is now
+**atomic** — a client-driven two-phase commit, verified end to end against
+localnet, including the wrapped-native-token path (`$wrap`/`$unwrap`) — see
+"Exchange support" and "Wrapped native tokens" below.
 An earlier quantum-os cut (a burn/mint value-transfer escrow, `/captp` command)
 was built and removed — it moved the platform token and assumed equal value,
 both ruled out. What is kept client-side:
@@ -77,39 +81,98 @@ the caller, which the home node cannot do (it holds only the public key).
   your real identity.
 
 **Honest consequence.** A remote deploy is a *separate transaction* on the far
-shard, so it cannot compose into one home-shard closure. A bilateral exchange
-is therefore **client-orchestrated and non-atomic across shards**: each escrow
-is individually conserved, and the joint ZFA closure is a `rho:qucalc:verify`
-*monitor* over committed facts, not a transport guarantee. Atomic
-single-closure composition would be Layer 2, and is deliberately out of rnode.
+shard, so it cannot compose into one home-shard closure — there is no single
+transaction spanning two shards, and never will be without shared consensus.
+What Layer 1 *does* let a contract do is compose a **two-phase commit** across
+that separate-transaction boundary: prepare each leg (durably, readably,
+reversibly), then commit both or abort whichever prepared. That is
+**safety-atomic** — no reachable state loses value or shorts a party — even
+though it is still two transactions, not one. See the pooled exchange below.
 
-### Exchange support — a contract on Layer 1
+### Exchange support — contracts on Layer 1
 
-Two shapes, both built:
+Two shapes:
 
+- **Pooled exchange, atomic** (`packages/browser/src/rholang-exchange.js`,
+  quantum-os) — a pool trades one token pair at an owner-set rate
+  (`$xopen` / `$xprovide` / `$xdeposit` / `$xquote` / `$xswap` / `$xwithdraw`);
+  `$xlink` federates two pools, and a cross-shard trade is **client-driven
+  two-phase commit**: `$xprepare` the local leg (does the swap now, holds a
+  reversible tx record) → `$xreceive` the linked remote pool (over a Layer-1
+  remote signed deploy — credits the local leg's output as if deposited, gated
+  to a registered link so the federation only extends this trust to a shard it
+  has deliberately linked) → `$xcommit` both, or `$xabort` the one leg that
+  prepared. Both are idempotent; `$xstateof` is the durable, readable record a
+  crashed client's own key reconnects to and recovers from
+  (`packages/browser/src/exchange-2pc.ts`'s `decideRecovery` is the pure
+  decision table). **Verified end to end against localnet** — happy path,
+  and the abort path (a rejected `prepareReceive` unwinds the prepared leg
+  exactly). A quantum-os `/note` currency reaches a pool as its token
+  contract's URI; the platform token participates only wrapped (below).
+  - **Known gap:** `abort` is **self-only** in this version. A permissionless
+    after-expiry path is designed — `expiryBlock` is recorded on every tx —
+    but not implemented: verified empirically (2026-09-11, `bin/rnode` 0.1.0)
+    that reading `rho:block:data` from a *signed deploy* breaks this build's
+    `return`/registry-readback mechanism, reproduced down to the simplest
+    possible program (a bare block-data read + `return!`), with a clean
+    "Success!" and no rholang error either. Exploratory (unsigned) reads of
+    `rho:block:data` work fine; it is specifically the deploy path. Until
+    that is root-caused, a trade abandoned by its own key stays `prepared` —
+    locked, not lost, recoverable whenever that key reappears.
 - **Bilateral escrow** (`qucalc/examples/shard_exchange.rho`, rchain-rust#34):
-  an escrow on each shard, pre-funded, fixed rate; a send `deposit`s locally and
-  `consume`s the remote one through a remote invoke.
-- **Pooled exchange** (`packages/browser/src/rholang-exchange.js`, quantum-os;
-  `$xopen` / `$xprovide` / `$xdeposit` / `$xquote` / `$xswap` / `$xwithdraw`):
-  a pool trades one token pair at an owner-set rate; `$xlink` / `$xroute`
-  federate it — `route` swaps locally, then returns a
-  `("$at", shard, uri, "swap", …)` descriptor the client runs as a cross-shard
-  remote deploy. Verified end to end against localnet. A quantum-os `/note`
-  currency reaches a pool as its token contract's URI.
+  an escrow on each shard, pre-funded, fixed rate; a send `deposit`s locally
+  and `consume`s the remote one through a remote invoke. Still
+  client-orchestrated and non-atomic as originally built — the same
+  prepare/commit/abort upgrade above is a natural follow-up there, not done
+  in this pass.
 
-Both: conservation held per pool/escrow, and the transport is a remote deploy —
-so a multi-shard route is **not atomic**.
-
-**Capability security is the proof.** The escrow contract exposes no method that
-pays the operator, holds no capability that drains it outside the rate, and
-fixes or governs the rate at deploy. There is nothing to corrupt because there
-is no ambient authority. The joint-ZFA-closure reading — one closure spanning
-both escrows (`crates/zfa-core/src/coupling.rs` `coupled`) — is a *check* the
-contract runs with `rho:qucalc:verify`, which rnode already exposes, not a
-prerequisite. Because the two legs are separate deploys, the joint check is a
-**monitor** over committed facts, not a precondition of one atomic move.
+**Capability security is the proof.** Neither contract exposes a method that
+pays the operator, holds a capability that drains it outside the rate, or
+governs the rate at anything but deploy time. There is nothing to corrupt
+because there is no ambient authority — `prepare`/`prepareReceive` never pay
+out more than their own reserve, the same check `swap` already makes, so a
+bad-faith trader can at worst strand one leg (bounded by `expiryBlock`, never
+a loss to the pool). The joint-ZFA-closure reading — one closure spanning
+both legs (`crates/zfa-core/src/coupling.rs` `coupled`) — is a *check* a
+contract can run with `rho:qucalc:verify`, which rnode already exposes, not a
+prerequisite; for the pooled exchange the preimage-reveal-style single
+triggering event is now the `commit` pair itself, not a post-hoc monitor.
 rchain-rust already carries the QLF primitives, so the escrow lives there.
+
+### Wrapped native tokens — the platform token, without touching `revVault`
+
+"Any token to any token" includes a shard's own native token (REV, or any
+chain's base token) — but the hard constraint stands: **the exchange never
+touches `revVault`.** A native token trades only as a **wrapped**
+representation (`packages/browser/src/wrapped-token.js`) — a token contract
+an issuer backs 1:1 with their own holdings, mint/burn-gated to that issuer
+(mint/burn is fine — REV is the one token this constraint singles out).
+
+- **`$wrap`** is the *only* macro in this design that touches `revVault`, and
+  only because it is the issuer's own sanctioned deploy: `revVault!("transfer",
+  …)` to the wrapper's recorded backing address, then `mint`, chained in one
+  program. **`$unwrap`** is the holder's own `burn` (self-identified on-chain
+  via `rho:rev:address "fromDeployerId"`, never a caller-supplied string, so
+  nobody can name someone else's balance) — it records a permanent redemption
+  claim. **`$wrelease`** is the issuer's separate step, honoring that claim:
+  their own `revVault!("transfer", …)` to the holder, chained with marking the
+  claim released. Two macros because they are two different parties' actions,
+  possibly at different times.
+- **Trust:** a wrapped token is worth par only if the issuer honors
+  `$wrelease` — the same assumption as any `/note` currency. `$winfo` reports
+  the issuer, backing address, base currency and supply, so anyone can
+  `$balance(backingAddr)` and compare it against supply — public
+  verifiability, not enforcement. If an issuer stiffs a redemption, the
+  `claims` entry is permanent on-chain evidence for `/gov censure`;
+  making the issuer a `/gov` group rather than a person is the mitigation for
+  anything beyond small value. The machinery cannot force a `revVault`
+  transfer — that is the honest cost of never touching it.
+- **Fungibility:** `w<BASE>~<issuer8>` — non-fungible across issuers, the same
+  shape as a terms-stamped note series (`notes.ts` `termsHash8`).
+- **The full path**, native REV (shard A) → native FOO (shard B): `$wrap` on
+  A (local, edge) → `$xprepare`/`$xreceive`/`$xcommit` across the linked pools
+  (the atomic part) → `$unwrap` on B (local, edge). Verified end to end
+  against localnet, including wrap → burn → release. See `ExchangeDemo.md`.
 
 ---
 
@@ -161,8 +224,12 @@ its stale view until it re-syncs; *revoked* is shown as distinct from *gone*.
 
 1. **Layer 1** — the client-side `$at` → remote signed deploy + reply-channel
    listen (rchain-rust#33 / #34: `casper::shard_invoke`).
-2. Exchange support — the bilateral escrow contract
-   (`qucalc/examples/shard_exchange.rho`, rchain-rust#34).
+2. Exchange support — **done**: the pooled exchange's atomic two-phase-commit
+   federation (`prepare`/`prepareReceive`/`commit`/`abort`/`stateOf`) and
+   wrapped native tokens (`wrapped-token.js`, `$wrap`/`$unwrap`/`$wrelease`),
+   both quantum-os-side and verified against localnet. The bilateral escrow
+   (`qucalc/examples/shard_exchange.rho`, rchain-rust#34) is unchanged —
+   the same upgrade there is a follow-up, not required.
 3. **Layer 2** — `$proxy` + the gateway peer + `captp-export` / `captp-invoke`
    / `captp-result` / `captp-revoke`; synchronous invocation.
 4. Promise pipelining.
@@ -173,7 +240,7 @@ its stale view until it re-syncs; *revoked* is shown as distinct from *gone*.
 
 ## Related
 
-- [`ExchangeDemo.md`](ExchangeDemo.md) — end-user walkthrough of the pooled token exchange and its `link`/`route` cross-shard federation over Layer 1.
+- [`ExchangeDemo.md`](ExchangeDemo.md) — end-user walkthrough of the pooled token exchange and its atomic `link`/`prepare`/`receive`/`commit`/`abort` cross-shard federation over Layer 1, plus wrapped native tokens.
 - [`Room_Bridges.md`](Room_Bridges.md) — a peer in two rooms is the shared closure (the gateway is that, between a room and a shard).
 - [`Governance.md`](Governance.md) — group ownership of a gateway; delegation- and trust-weighted decisions; censure.
 - [quantum-os#173](https://github.com/rchain-community/quantum-os/issues/173) (Layer 2) · [rchain-rust#33](https://github.com/rchain-community/rchain-rust/issues/33) (Layer 1) · [#138](https://github.com/rchain-community/quantum-os/issues/138) · [#107](https://github.com/rchain-community/quantum-os/issues/107).

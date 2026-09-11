@@ -2,8 +2,8 @@
 
 A walkthrough of the pooled token exchange in [quantum-os](README.md): deploy a
 pool, seed it, trade against it, and **federate** two exchanges across shards so
-a trade can hop between them. Actors: **Alice** runs an exchange, **Bob**
-trades, and later a **Paris** exchange on a second shard.
+a trade can hop between them — atomically. Actors: **Alice** runs an exchange
+on shard A, **Bob** trades, and a **Paris** exchange runs on shard B.
 
 The contract is [`packages/browser/src/rholang-exchange.js`](packages/browser/src/rholang-exchange.js)
 (`EXCHANGE_RHO` + the `*Program` call-site builders, `--selftest` in CI). The
@@ -11,9 +11,12 @@ The contract is [`packages/browser/src/rholang-exchange.js`](packages/browser/sr
 [`rholang-macros.js`](packages/browser/src/rholang-macros.js) and run through the
 ordinary `$name(…)` dispatch — no `/` command of their own.
 
-> **No platform token.** The exchange never touches `rho:rchain:revVault`. It
-> trades tokens by their *own contract URIs*; REV cannot be pooled. This is the
-> same rule as the rest of `CapabilityTransport.md`.
+> **No platform token, directly.** The exchange never touches
+> `rho:rchain:revVault`. It trades tokens by their *own contract URIs*; REV
+> cannot be pooled or moved by this machinery. REV (or any chain's native
+> token) still trades — **wrapped** (§6) — which is where the one sanctioned
+> `revVault` touch in this whole design lives, at the edge, in the issuer's
+> own deploy. This is the same rule as the rest of `CapabilityTransport.md`.
 
 ---
 
@@ -57,11 +60,16 @@ the operator, the pool holds no ambient authority, the rate is fixed at deploy
 | `setRate(rate)` | owner | change the rate |
 | `inspect()` | anyone (read) | rate, reserves, links |
 | `link(name, exchangeUri, shard)` | owner | record a peer exchange on another shard |
-| `route(fromSide, amount, link, remotePool)` | anyone | swap here, then hand the client the remote leg |
+| `prepare(txId, fromSide, amount, expiryBlock)` | anyone | **local leg** of a cross-shard trade: swap now, hold a reversible tx record |
+| `prepareReceive(txId, side, amount, expiryBlock, link)` | anyone | **remote leg**: credit `amount` as if deposited, swap it, hold a reversible record — gated to a registered `link` |
+| `commit(txId)` | the tx's own holder | finalize a prepared tx (idempotent) |
+| `abort(txId)` | the tx's own holder | reverse a prepared tx exactly (idempotent; self-only — see §5) |
+| `stateOf(txId)` | anyone (read) | a tx's status — the recovery primitive |
 
-Nine of these have a `$x*` macro (`$xopen` `$xprovide` `$xdeposit` `$xquote`
-`$xswap` `$xwithdraw` `$xlink` `$xroute` `$xinspect`); `setRate` is called
-through the raw `setRateProgram` builder or a hand-written `/rholang deploy`.
+Twelve of these have a `$x*` macro (`$xopen` `$xprovide` `$xdeposit` `$xquote`
+`$xswap` `$xwithdraw` `$xlink` `$xinspect` `$xprepare` `$xreceive` `$xcommit`
+`$xabort` `$xstateof`); `setRate` is called through the raw `setRateProgram`
+builder or a hand-written `/rholang deploy`.
 
 ---
 
@@ -93,8 +101,8 @@ Alice ▸ $xopen(rho:id:9xm7c…, "USD-EUR", rho:id:usd, rho:id:eur, 920000)
 ```
 
 `rho:id:usd` and `rho:id:eur` are the two currencies' **own token contracts**
-(see §6 for how a quantum-os `/note` currency gets one). The rate `920000` is
-0.92 EUR per USD.
+(see §7 for how a quantum-os `/note` currency gets one; §6 for a native token
+like REV). The rate `920000` is 0.92 EUR per USD.
 
 ---
 
@@ -146,43 +154,178 @@ the token contracts do the actual moving.
 
 ---
 
-## 5. Federation — a trade that hops shards
+## 5. Federation — a trade that hops shards, atomically
 
 Alice's exchange is on shard A. A **Paris** exchange runs on shard B with an
-EUR–GBP pool. Alice links it:
+EUR–GBP pool. The two federate by recording each other, **on both sides**:
 
 ```
-Alice ▸ $xlink(rho:id:9xm7c…, "USD-EUR", "paris", rho:id:paris…, https://shard-b.example)
-        ✓ → ["linked", "paris"]
+Alice ▸ $xlink(rho:id:9xm7c…, "USD-EUR", "toParis", rho:id:paris…, "shard-B")
+        ✓ → ["linked", "toParis"]
+
+Paris  ▸ $xlink(rho:id:paris…, "EUR-GBP", "toAlice", rho:id:9xm7c…, "shard-A")
+        ✓ → ["linked", "toAlice"]
 ```
 
-Now Bob can swap USD→EUR here **and** EUR→GBP there in one call. `route` does
-the local leg and hands him the remote one:
+Each side declares its own trust — `prepareReceive` only extends credit
+against a link the *receiving* pool itself recorded (§"Why prepareReceive
+trusts a link" below), so this is deliberate, not automatic.
+
+Now Bob wants USD (shard A) → GBP (shard B) in one atomic trade. This is a
+**client-driven two-phase commit** — every call below uses Bob's own key
+(a `deployerId` is shard-independent, so the Paris pool sees Bob's real
+identity — [`CapabilityTransport.md`](CapabilityTransport.md) Layer 1):
 
 ```
-Bob ▸ $xroute(rho:id:9xm7c…, "USD-EUR", A, 100, "paris", "EUR-GBP")
-      ✓ → {
-            "local":  {"gave": 100, "got": 92, "toSide": "B"},
-            "remote": ("$at", "https://shard-b.example", "rho:id:paris…", "swap", "EUR-GBP", "A", 92)
-          }
+Bob ▸ txId = a fresh random id, say "t42"
+
+Bob ▸ $xprepare(rho:id:9xm7c…, "USD-EUR", "t42", A, 100, 999999)
+      ✓ → ("prepared", "t42", 92, "B", 999999)
+      (shard A: Bob's balance and reserves already moved, as a "swap" would —
+       but held as a reversible tx record, not yet final)
+
+Bob ▸ $xreceive(rho:id:paris…, "EUR-GBP", "t42", A, 92, 999999, "toAlice")
+      ✓ → ("prepared", "t42", 78, "B", 999999)
+      (shard B, over a remote signed deploy — Paris credits 92 EUR "as if
+       deposited" and swaps it to 78 GBP, held the same reversible way)
+
+Bob ▸ $xcommit(rho:id:9xm7c…, "t42")
+      ✓ → ("committed", "t42", 92, "B")
+Bob ▸ $xcommit(rho:id:paris…, "t42")
+      ✓ → ("committed", "t42", 78, "B")
 ```
 
-The `remote` tuple is a **call descriptor**. Bob's client runs it as a
-cross-shard **remote signed deploy** — `$at(shard, uri)!("swap", "EUR-GBP", "A",
-92)` — signed with Bob's own key, so the Paris exchange sees Bob's real
-`*deployerId` (identity is shard-independent — see
-[`CapabilityTransport.md`](CapabilityTransport.md) Layer 1). The Paris pool
-credits Bob's balance there in GBP.
+Bob now holds 78 GBP in his Paris balance, withdrawable like any other.
 
-> **Not atomic.** The two legs are separate transactions on two shards. If the
-> remote leg fails, the local swap has still happened — Bob holds EUR he can
-> withdraw or swap back. Each pool stays individually conserved; there is no
-> cross-shard rollback. Atomic multi-leg routing would be Layer 2
-> (`quantum-os#173`), out of the exchange.
+**If the remote leg refuses** (no such link, insufficient reserve, or Bob
+never gets to call it — a lost connection, a crash) — nothing has moved:
+
+```
+Bob ▸ $xabort(rho:id:9xm7c…, "USD-EUR", "t42")
+      ✓ → ("aborted", "t42")
+      (shard A: reserves and Bob's balance revert exactly to pre-prepare)
+```
+
+Verified end to end against localnet, both the happy path and this abort
+path, across two separate exchange deployments (a real simulation of two
+shards, not one contract standing in for both).
+
+**Recovery, if Bob's client crashes mid-flight.** Both legs are gated to
+*Bob's own key* throughout, so recovery needs no counterparty — Bob (or his
+client, reconnecting) reads `$xstateof` on both legs and follows
+`packages/browser/src/exchange-2pc.ts`'s `decideRecovery` table: both
+`prepared` → finish committing both; one `prepared`, the other never
+happened → abort the one that ran; either side already `committed` → finish
+the other (idempotent). This is why **`commit`/`abort` are gated to the tx's
+own holder** rather than open to anyone — the same identity drives both legs
+and can always finish the job.
+
+> **Known gap — `abort` is self-only in this version.** A permissionless
+> after-expiry path is designed (`expiryBlock` is recorded on every tx) but
+> not implemented: verified empirically that reading `rho:block:data` from a
+> *signed deploy* breaks this rnode build's return-value readback — even for
+> the simplest possible program, with no rholang error either. So a trade
+> abandoned by its own key (lost seed, browser gone for good) stays
+> `prepared` — locked, not lost, recoverable only by that same key
+> reappearing. See `CapabilityTransport.md`.
+
+**Why `prepareReceive` trusts a link, not a proof.** Shard B cannot read
+shard A's state directly — that is the reason two-phase commit exists at
+all, not a gap in it. `prepareReceive` checks only that *this* pool has a
+`link` entry by the name given; it does not (cannot) verify the matching
+`prepare` on the far shard is real. This is sound because linked pools share
+an operator — the federation is trusting its own two pools, not a stranger's
+claim. Each pool still never pays out more than its own reserve, so the
+worst a bad-faith caller can do is strand one leg until it's `abort`ed —
+never drain a pool.
 
 ---
 
-## 6. Connecting a quantum-os `/note` currency
+## 6. Wrapped native tokens — trading REV itself
+
+The exchange never touches `revVault` (top of this doc) — so REV participates
+only as a **wrapped** token, `packages/browser/src/wrapped-token.js`. Alice
+issues one:
+
+```
+Alice ▸ /rholang deploy
+        ┌────────────────────────────────────────────────────┐
+        │  <installWrappedProgram(myRevAddr, "REV")>         │
+        └────────────────────────────────────────────────────┘
+        ✓ Success!  → rho:id:wrap7…      (the wrapper URI; Alice is the issuer)
+```
+
+**`$wrap` — the one macro in this whole design that touches `revVault`,**
+because it's Alice's own sanctioned deploy: a real REV transfer to the
+wrapper's backing address, then mint — chained in one program, so there is
+no window where REV moved but nothing was minted (or vice versa):
+
+```
+Alice ▸ $wrap(rho:id:wrap7…, myRevAddr, 10, myRevAddr)
+        ✓ → ("minted", 10, "myRevAddr…", 10)
+```
+
+Now `rho:id:wrap7…` is a token like any other — `$xopen` a `wREV-wFOO` pool
+with it, `$xprepare`/`$xreceive`/`$xcommit` a cross-shard trade through it,
+exactly as in §5.
+
+**`$unwrap`** is the holder's own step — burn, self-identified on-chain (via
+`rho:rev:address`, never a caller-supplied string, so nobody can name someone
+else's balance), recording a permanent redemption claim:
+
+```
+Alice ▸ $unwrap(rho:id:wrap7…, 3, "claim1")
+        ✓ → ("burned", "claim1", 3)
+```
+
+**`$wrelease`** is the issuer's separate redemption step, honoring that
+claim — Alice's own `revVault` transfer to the holder, chained with marking
+the claim released:
+
+```
+Alice ▸ $wrelease(rho:id:wrap7…, "claim1", myRevAddr, 3)
+        ✓ → ("released", "claim1", 3, "myRevAddr…")
+```
+
+Two macros because they're two different parties' actions, possibly at
+different times — burning doesn't force the issuer's hand, and the issuer
+can't release a claim that wasn't made.
+
+**Trust.** A wrapped token is worth par only if the issuer honors
+`$wrelease` — the same assumption as any `/note` currency. `$winfo` reports
+the issuer, backing address, base currency and supply, so anyone can
+`$balance(backingAddr)` and compare it against supply themselves — public
+verifiability, not enforcement:
+
+```
+▸ $winfo(rho:id:wrap7…)
+  → {"issuer": …, "backingAddr": "myRevAddr…", "baseCurrency": "REV", "supply": 7}
+```
+
+If an issuer stiffs a redemption, the `claims` record is permanent on-chain
+evidence for `/gov censure`; making the issuer a `/gov` group rather than a
+person is the mitigation for anything beyond small value. The machinery
+cannot force a `revVault` transfer — that is the honest cost of never
+touching it. **Fungibility:** `w<BASE>~<issuer8>` — non-fungible across
+issuers, the same shape as a terms-stamped `/note` series.
+
+**The full path, native REV (shard A) → native FOO (shard B):**
+
+```
+$wrap  10 REV          → 10 wREV~a         (shard A, Alice's issuer, edge)
+$xprepare / $xreceive  → cross-shard 2PC   (the atomic part, §5)
+$xcommit × 2            → 78 wFOO~b landed on shard B
+$unwrap 78 wFOO~b       → 78 FOO            (shard B, Paris's issuer, edge)
+```
+
+Only the middle step is the cross-shard atomic part; wrap/unwrap are
+single-shard and never leave their shard. Verified end to end against
+localnet: wrap → mint → burn → release, and the full round trip through a
+2PC trade.
+
+---
+
+## 7. Connecting a quantum-os `/note` currency
 
 A `/note` currency (`cap:token-USD:…` / `cap:note-USD:…`) is a **bearer label**
 with no chain presence — it lives entirely in the room. To trade it on the
@@ -204,15 +347,26 @@ exchange itself is agnostic: it moves messages to whatever `token` URI you name.
 - **Fixed rate, not an AMM.** The rate is set by the owner and changes only
   with `setRate`. No constant-product curve, no slippage, no impermanent loss —
   and no automatic price discovery. An owner who mis-prices a pool can be
-  arbitraged until a reserve empties (then `swap` returns `insufficient
-  reserve`, not a bad fill).
+  arbitraged until a reserve empties (then `swap`/`prepare` return
+  `insufficient reserve`, not a bad fill).
 - **Capability security is the proof.** The contract exposes no method that
   pays the operator and holds no capability that drains a pool outside the
   rate. There is nothing to corrupt because there is no ambient authority.
 - **The exchange is an accountant.** It tracks balances and reserves; the token
   contracts move the actual tokens. A `deposit` you never funded, or a
   `withdraw` you never move out, is your own inconsistency to reconcile.
-- **Multi-shard routes are not atomic** (§5).
+- **Cross-shard trades are safety-atomic, not instant-atomic.** Two-phase
+  commit means either both legs settle or the prepared one reverts exactly —
+  never a state where value is lost or a party is shorted — but it is still
+  two transactions with a window between them, not one.
+- **`abort` is self-only in this version** — no on-chain permissionless
+  timeout (§5's known gap). A trade abandoned by its own key stays locked,
+  not lost, until that key returns.
+- **`prepareReceive` trusts a `link`, not a cryptographic proof** — sound
+  because linked pools share an operator, not because it's verified (§5).
+- **A wrapped token is only as good as its issuer's `$wrelease`** — the same
+  trust as any `/note` currency; `$winfo` makes the backing publicly
+  checkable, it doesn't enforce it.
 - **The rholang is shape-checked in CI and verified end to end against
   localnet**, not formally proven.
 
@@ -220,8 +374,8 @@ exchange itself is agnostic: it moves messages to whatever `token` URI you name.
 
 ## Related
 
-- [`CapabilityTransport.md`](CapabilityTransport.md) — Layer 1 (the cross-shard remote signed deploy `route` uses) and Layer 2.
+- [`CapabilityTransport.md`](CapabilityTransport.md) — Layer 1 (the cross-shard remote signed deploy `prepareReceive` uses) and Layer 2.
 - [`PromissoryNoteDemo.md`](PromissoryNoteDemo.md) — quantum-os `/note` currencies (the bearer side).
 - [`AtomicSwapDemo.md`](AtomicSwapDemo.md) — `/rdv swap`, the in-room atomic 2-party trade (no rholang, no rate).
 - [`MacRhoLang.md`](MacRhoLang.md) — the `$` macro layer.
-- rchain-community/rchain-rust#33 — the linked-invoke primitive `route` builds on.
+- rchain-community/rchain-rust#33 — the linked-invoke primitive `prepareReceive` builds on.
