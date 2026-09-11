@@ -415,6 +415,11 @@ agnostic: it moves messages to whatever `token` URI you name.
 - **The exchange is an accountant.** It tracks balances and reserves; the token
   contracts move the actual tokens. A `deposit` you never funded, or a
   `withdraw` you never move out, is your own inconsistency to reconcile.
+- **In-pool balances have no holder-to-holder transfer** — unlike the token
+  itself (`$wtransfer`, §1), moving value to someone else *inside* a pool
+  today means `withdraw` → `$wtransfer` → they `deposit` again, three
+  transactions where one would do
+  ([#202](https://github.com/rchain-community/quantum-os/issues/202)).
 - **Cross-shard trades are safety-atomic, not instant-atomic.** Two-phase
   commit means either both legs settle or the prepared one reverts exactly —
   never a state where value is lost or a party is shorted — but it is still
@@ -445,7 +450,9 @@ agnostic: it moves messages to whatever `token` URI you name.
 ## Found a gap, or want a new capability?
 
 Multi-hop routing past two pools, an AMM-style rate curve, a
-`KnownCurrency` field so a `/note` currency remembers where it trades, the
+`KnownCurrency` field so a `/note` currency remembers where it trades,
+holder-to-holder transfer of in-pool balances (already tracked,
+[#202](https://github.com/rchain-community/quantum-os/issues/202)), the
 on-chain permissionless-after-expiry `abort` (§7's known gap —
 [already tracked, #198](https://github.com/rchain-community/quantum-os/issues/198)) —
 none of this is closed. **[Open an issue →](https://github.com/rchain-community/quantum-os/issues/new)**
