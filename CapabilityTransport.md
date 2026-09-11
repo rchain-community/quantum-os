@@ -109,7 +109,8 @@ Two shapes:
   and the abort path (a rejected `prepareReceive` unwinds the prepared leg
   exactly). A quantum-os `/note` currency reaches a pool as its token
   contract's URI; the platform token participates only wrapped (below).
-  - **Known gap:** `abort` is **self-only** in this version. A permissionless
+  - **Known gap** ([quantum-os#198](https://github.com/rchain-community/quantum-os/issues/198)):
+    `abort` is **self-only** in this version. A permissionless
     after-expiry path is designed — `expiryBlock` is recorded on every tx —
     but not implemented: verified empirically (2026-09-11, `bin/rnode` 0.1.0)
     that reading `rho:block:data` from a *signed deploy* breaks this build's
