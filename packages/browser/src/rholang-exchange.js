@@ -345,7 +345,8 @@ in {
   // the swap/credit exactly. Idempotent; refuses to abort an already-
   // committed tx.
   //
-  // Design note — permissionless-after-expiry is NOT implemented here.
+  // Design note — permissionless-after-expiry is NOT implemented here
+  // (quantum-os#198).
   // expiryBlock is recorded for a future version and for off-chain recovery
   // tooling, but abort does not read rho:block:data to enforce it: verified
   // empirically (2026-09-11, against bin/rnode 0.1.0) that a signed deploy

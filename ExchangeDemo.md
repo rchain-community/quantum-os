@@ -222,7 +222,7 @@ the other (idempotent). This is why **`commit`/`abort` are gated to the tx's
 own holder** rather than open to anyone — the same identity drives both legs
 and can always finish the job.
 
-> **Known gap — `abort` is self-only in this version.** A permissionless
+> **Known gap — `abort` is self-only in this version** ([#198](https://github.com/rchain-community/quantum-os/issues/198)). A permissionless
 > after-expiry path is designed (`expiryBlock` is recorded on every tx) but
 > not implemented: verified empirically that reading `rho:block:data` from a
 > *signed deploy* breaks this rnode build's return-value readback — even for
@@ -384,7 +384,8 @@ exchange itself is agnostic: it moves messages to whatever `token` URI you name.
 
 Multi-hop routing past two pools, an AMM-style rate curve, a `KnownCurrency`
 field so a `/note` currency remembers where it trades, the on-chain
-permissionless-after-expiry `abort` (§5's known gap) — none of this is
-closed. **[Open an issue →](https://github.com/rchain-community/quantum-os/issues/new)**
+permissionless-after-expiry `abort` (§5's known gap —
+[already tracked, #198](https://github.com/rchain-community/quantum-os/issues/198)) —
+none of this is closed. **[Open an issue →](https://github.com/rchain-community/quantum-os/issues/new)**
 and say what you hit or what you'd want; that's exactly how this exchange
 went from a single pool to atomic federation and wrapped native tokens.
