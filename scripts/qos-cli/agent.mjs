@@ -33,6 +33,8 @@ import { newDynCapState, signEnvelope, serializeState, deserializeState } from "
 import { makeAdvisor } from "./facilitator-advisor.mjs";
 import { ROLES, DEFAULT_ROLE, resolveRole, dutiesOf } from "./agent-roles.mjs";
 import { trustLevels, discreditedMembers, isMember, groupHasRatings, normalizeGroup, TRUST_MAX } from "./gov.mjs";
+import { MACROS } from "./rholang-macros.mjs";
+import { DEFAULT_CONFIG as REV_DEFAULT_CONFIG, revAddressOf, deployTerm as revDeployTerm } from "./rholang-client.mjs";
 
 const DEFAULT_SIGNAL = "wss://quantum-os-signaling.onrender.com";
 // "name" is always signed. When this agent carries the room's memory
@@ -72,6 +74,12 @@ Options:
                      Turn on only if this agent must span a NAT boundary itself.
   --ai-model <m>     Model. api default: claude-haiku-4-5-20251001;
                      claude-code default: the CLI's configured model.
+  --key <hex>        TEST-SYSTEM ONLY: a secp256k1 REV deploy key (64 hex
+                     chars). Activates \`/<role> faucet [address]\`, which
+                     sends a fixed amount of TEST REV to a REV address on
+                     request. This agent then HOLDS A SIGNING KEY IN MEMORY —
+                     a deliberate exception to "an agent never holds a key"
+                     (see rholang-agent.mjs). Never use a key with real value.
   --verbose          Log every inbound message + suppressed nudges.
   --help, -h         Show this help.
 
@@ -101,6 +109,7 @@ export function parseArgs(argv) {
     else if (x === "--ai-model") a.aiModel = argv[++i];
     else if (x === "--about") a.about = argv[++i];
     else if (x === "--turn") a.turn = true;
+    else if (x === "--key") a.key = argv[++i];
     else if (x === "--verbose") a.verbose = true;
     else if (x === "--help" || x === "-h") a.help = true;
   }
@@ -149,6 +158,7 @@ export async function run(args) {
   const askStripRe = new RegExp(`^/{1,2}(?:${aliasAlt})\\s+ask\\b\\s*`, "i");
   const optStripRe = new RegExp(`^/{1,2}(?:${aliasAlt})\\s+(?:optimize|opt)\\b\\s*`, "i");
   const chairStripRe = new RegExp(`^/{1,2}(?:${aliasAlt})\\s+(?:chair|deliberate)\\b\\s*`, "i");
+  const faucetStripRe = new RegExp(`^/{1,2}(?:${aliasAlt})\\s+faucet\\b\\s*`, "i");
   const bareNameRe = new RegExp(`^(?:${aliasAlt})\\??$`, "i");
   const anyoneHereRe = new RegExp(`\\b(any\\s?(one|body)|${aliasAlt})\\b[^?]*\\b(here|there|around|online|present|listening)\\b\\??`, "i");
   const greetingRe = /^(hi|hello|hey|hiya|yo|howdy|gm|good\s+(morning|afternoon|evening))[\s!,.]*(all|everyone|folks|there|y'?all)?[\s!,.]*$/;
@@ -181,7 +191,23 @@ export async function run(args) {
   const TICK_MS = 30_000;
   const LULL_MS = Math.round(2 * 60_000 * scale);
   const CHAT_RETAIN_MS = 15 * 60_000;
-  const advisor = makeAdvisor({ ai: args.ai, backend: args.aiBackend, model: args.aiModel, persona: role.persona, roleName: role.name, cmd: CMD, log: console.log });
+
+  // ---- TEST REV faucet (opt-in via --key; see rholang-client.mjs's TRUST NOTE) ----
+  // A fixed amount, no rate limit (test systems only, by design — see CLAUDE.md).
+  // Bad hex is rejected loudly at startup (like numOpt above): a faucet that
+  // silently never sends because the key never parsed would just look broken.
+  const FAUCET_AMOUNT = 10n;
+  let facilKey = null, facilAddr = null;
+  if (args.key) {
+    const k = String(args.key).trim().replace(/^0x/, "");
+    if (!/^[0-9a-fA-F]{64}$/.test(k)) { console.error(`${TAG} --key needs 64 hex chars (a secp256k1 private key), got ${k.length}`); process.exit(1); }
+    try { facilAddr = revAddressOf(k); } catch (e) { console.error(`${TAG} --key is not a valid secp256k1 key: ${e?.message ?? e}`); process.exit(1); }
+    facilKey = k;
+    console.log(`${TAG} TEST REV FAUCET ACTIVE — funding address ${facilAddr}. Fund it via scripts/localnet's genesis wallet, or a transfer; never point --key at a key holding real value.`);
+  }
+  const revCfg = () => ({ ...REV_DEFAULT_CONFIG, key: facilKey });
+
+  const advisor = makeAdvisor({ ai: args.ai, backend: args.aiBackend, model: args.aiModel, persona: role.persona, roleName: role.name, cmd: CMD, faucetActive: !!facilKey, log: console.log });
 
   // ---- identity (stable across restarts), mirroring qos-daemon.mjs ----
   const stateDir = args.state ?? "./.qos-agent";
@@ -365,8 +391,22 @@ export async function run(args) {
     return true;
   }
 
+  // A 1:1 answer to one asker (like presenceReply/listReply below) — for
+  // results that name the asker's own address/balance and don't belong
+  // broadcast to the room. Falls back to a broadcast if there's no direct
+  // route yet.
+  function directReply(fromId, text) {
+    if (fromId && peer.send(fromId, { kind: "chat", text })) {
+      postLog.push(Date.now()); lastPostAt = Date.now();
+      console.log(`${TAG} ↩ ${text}`);
+    } else {
+      reply(text, null, 0);
+    }
+  }
+
   const askHint = advisor.enabled ? "" : " (needs --ai)";
-  const helpText = () => `I'm ${myName}, ${role.blurb} Commands: \`/${CMD}\` (am I here?) · \`/${CMD} help\` · \`/${CMD} ask <question>\`${askHint} · \`/${CMD} optimize <problem>\`${askHint} (facilitate an annealing-style optimization round) · \`/${CMD} chair <topic>\`${askHint} (chair a structured deliberation → define · alternatives · evaluate · disagreements · agreements · closure, then record the decision; \`/${CMD} next\`/\`back\`/\`close\`/\`cancel\` to steer) · \`/${CMD} list [n]\` (the room's screen history, oldest→newest — default 25, max 500) · \`/${CMD} trust\` (my standing) · \`/${CMD} health\` (uptime, peers, budget, CPU) · \`/${CMD} off\` / \`/${CMD} on\` (mute/unmute). I'm a full member — \`/gov trust\` me up or \`/gov censure\` me down. About this room (and how to make your own): ${ABOUT_URL}`;
+  const faucetHint = facilKey ? ` · \`/${CMD} faucet [address]\` (sends ${FAUCET_AMOUNT} TEST REV to a REV address — test systems only)` : "";
+  const helpText = () => `I'm ${myName}, ${role.blurb} Commands: \`/${CMD}\` (am I here?) · \`/${CMD} help\` · \`/${CMD} ask <question>\`${askHint} · \`/${CMD} optimize <problem>\`${askHint} (facilitate an annealing-style optimization round) · \`/${CMD} chair <topic>\`${askHint} (chair a structured deliberation → define · alternatives · evaluate · disagreements · agreements · closure, then record the decision; \`/${CMD} next\`/\`back\`/\`close\`/\`cancel\` to steer) · \`/${CMD} list [n]\` (the room's screen history, oldest→newest — default 25, max 500) · \`/${CMD} trust\` (my standing) · \`/${CMD} health\` (uptime, peers, budget, CPU) · \`/${CMD} off\` / \`/${CMD} on\` (mute/unmute)${faucetHint}. I'm a full member — \`/gov trust\` me up or \`/gov censure\` me down. About this room (and how to make your own): ${ABOUT_URL}`;
   const statusText = () => `👋 Yes, I'm here — ${myName} (${role.name})${muted ? ` — currently muted (\`/${CMD} on\` to wake me)` : ""}.${standing.governed ? ` Trust ${standing.level}${standing.discredited ? " — stood down" : ` (≤${standing.budget}/5min)`}.` : ""} \`/${CMD} help\` · \`/${CMD} trust\`.`;
   const introText = () => `Hi — I'm ${myName}, ${role.blurb} Say \`/${CMD}\` or \`/${CMD} help\` to reach me${advisor.enabled ? `, or \`/${CMD} ask <q>\` to ask me anything` : ""}. I'm a full room member — \`/gov trust\`/\`/gov censure\` me; \`/${CMD} trust\` shows my standing. About this room: ${ABOUT_URL}`;
   // Self-introduce to a newly-identified human peer, once per peer per run (direct
@@ -377,8 +417,57 @@ export async function run(args) {
     if (!leadGate("intro", true)) { introduced.add(id); return; }   // a co-role agent leads
     if (peer.send(id, { kind: "chat", text: introText() })) { introduced.add(id); console.log(`${TAG} ↪ intro → ${nameOf(id)}`); }
   }
-  async function handleAsk(q) {
+  // Test-system REV faucet (opt-in --key). A DETERMINISTIC action, never an
+  // LLM-authorized one: both the dedicated `/<cmd> faucet` subcommand and the
+  // NL "give me test rev" intercept in handleAsk below call this one function
+  // — the advisor never gets a say in whether or how much REV moves. No rate
+  // limit (by design, for a test system); the recipient address is either
+  // given explicitly or recalled from `known[fromId].revAddress` (recorded the
+  // first time it's given, so a later bare `/<cmd> faucet` just works).
+  const REV_ADDR_RE = /^[1-9A-HJ-NP-Za-km-z]{20,60}$/;   // base58 shape sanity check only
+  async function handleFaucet(argText, fromId) {
+    if (!facilKey) { directReply(fromId, `The test-REV faucet isn't configured on this agent (needs --key at startup) — ask whoever's running me.`); return; }
+    const explicit = String(argText ?? "").trim().split(/\s+/)[0] ?? "";
+    // A malformed EXPLICIT address is always an error — never silently fall
+    // back to a stale address on file, which would look like the new one was
+    // accepted when it was actually just ignored.
+    if (explicit && !REV_ADDR_RE.test(explicit)) {
+      directReply(fromId, `That doesn't look like a REV address — \`/${CMD} faucet <address>\` (find yours via \`/rholang key show\` in your browser).`);
+      return;
+    }
+    const addr = explicit || (known[fromId]?.revAddress ?? "");
+    if (!addr) {
+      directReply(fromId, `I can send ${FAUCET_AMOUNT} test REV — what's your REV address? \`/${CMD} faucet <address>\` (find yours via \`/rholang key show\`).`);
+      return;
+    }
+    if (explicit && known[fromId]?.revAddress !== explicit) {
+      (known[fromId] ??= { firstSeen: Date.now() }).revAddress = explicit;
+      saveKnown();
+    }
+    directReply(fromId, `Sending ${FAUCET_AMOUNT} test REV to ${addr}… (may take a few seconds to confirm)`);
+    try {
+      const term = MACROS.transfer.expand({ amount: FAUCET_AMOUNT, to: addr });
+      const out = await revDeployTerm(revCfg(), term);
+      if (!out.ok) { directReply(fromId, `Deploy failed: ${String(out.message).slice(0, 300)}`); return; }
+      const v = String(out.value ?? "");
+      if (/transfer ok/i.test(v)) directReply(fromId, `✅ Sent ${FAUCET_AMOUNT} test REV to ${addr}.`);
+      else if (v) directReply(fromId, `⚠️ Deploy landed but the transfer didn't confirm: ${v.slice(0, 300)}`);
+      else directReply(fromId, `Deploy accepted, but I couldn't confirm the transfer within the wait window — check your balance (\`/rholang eval\`, \`$balance(me)\`) in a bit.`);
+    } catch (e) { directReply(fromId, `Faucet error: ${e?.message ?? e}`); }
+  }
+  // Intent phrases an ask-mode question routes here on, BEFORE the LLM ever
+  // sees it — deterministic parsing, not an LLM deciding to move funds. An
+  // address embedded in the question (e.g. "give me test rev to 1111abc…")
+  // is pulled out the same way the dedicated command takes one.
+  const FAUCET_INTENT_RE = /\b(test\s*rev|some\s+rev|free\s+rev|rev\s+faucet|faucet)\b/i;
+  const REV_ADDR_IN_TEXT_RE = /\b[1-9A-HJ-NP-Za-km-z]{20,60}\b/;
+  async function handleAsk(q, fromId) {
     if (!q) { reply(`Ask me anything about the room, my role, or decisions — \`/${CMD} ask <question>\`.`, "askhelp", 12_000); return; }
+    if (FAUCET_INTENT_RE.test(q)) {
+      const addrMatch = q.match(REV_ADDR_IN_TEXT_RE);
+      await handleFaucet(addrMatch ? addrMatch[0] : "", fromId);
+      return;
+    }
     if (!advisor.enabled) { reply(`I'd need AI mode for that — start me with \`--ai\` (\`--ai-backend claude-code\` to use a Claude subscription, or set \`ANTHROPIC_API_KEY\`). For now, \`/${CMD} help\` lists what I do.`, "asknoai", 20_000); return; }
     if (!cooled("ask", 6_000)) return;
     cooldown.set("ask", Date.now());
@@ -593,7 +682,8 @@ export async function run(args) {
       if (sub === "trust" || sub === "standing") { reply(standingText(), "agtrust", 15_000); return true; }
       if (sub === "health" || sub === "diag" || sub === "diagnostics") { reply(healthText(), "aghealth", 15_000); return true; }
       if (sub === "list" || sub === "log" || sub === "history" || sub === "transcript") { listReply(); return true; }
-      if (sub === "ask") { bg(handleAsk(raw.replace(askStripRe, "").trim()), "ask"); return true; }
+      if (sub === "ask") { bg(handleAsk(raw.replace(askStripRe, "").trim(), fromId), "ask"); return true; }
+      if (sub === "faucet" || sub === "testrev") { bg(handleFaucet(raw.replace(faucetStripRe, "").trim(), fromId), "faucet"); return true; }
       if (sub === "optimize" || sub === "opt") { bg(handleOptimize(raw.replace(optStripRe, "").trim()), "optimize"); return true; }
       if (sub === "chair" || sub === "deliberate") { bg(handleChair(raw.replace(chairStripRe, "").trim()), "chair"); return true; }
       if (sub === "next" || sub === "advance") { bg(advanceChair(), "chair next"); return true; }

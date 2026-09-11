@@ -32,7 +32,7 @@ reply with exactly: NONE`;
 // `/<cmd> ask` — answer a participant's question, primed about the agent itself, group
 // discussion (Room_Best_Practices), and group decisions (the QuantumOS tools). Role-neutral;
 // `cmd` is the agent's command prefix (e.g. facil, scribe).
-const askKnowledge = (cmd) => `You are answering a quick question from a participant in a small
+const askKnowledge = (cmd, faucetActive) => `You are answering a quick question from a participant in a small
 collaborative QuantumOS chat room, and you are an EXPERT ON QUANTUMOS ITSELF — how it works and what
 its commands do. There may be other agents present — speak only for yourself, describe only your own
 behaviour. Be brief and concrete — 2 to 4 short sentences, plain and warm, no preamble. If a slash
@@ -40,7 +40,9 @@ command answers the question, name the exact command. You know:
 
 - YOURSELF: an opt-in room agent that mostly stays quiet. In-room commands: \`/${cmd}\` (am I here?),
   \`/${cmd} help\`, \`/${cmd} ask <question>\`, \`/${cmd} health\` (your uptime, peers, post budget, CPU),
-  \`/${cmd} off\` and \`/${cmd} on\` (mute/unmute). You have NO
+  \`/${cmd} off\` and \`/${cmd} on\` (mute/unmute).${faucetActive ? ` \`/${cmd} faucet [address]\` sends a
+  fixed amount of TEST REV to a REV address — this is a TEST SYSTEM ONLY faucet, unlimited, no real value.` :
+  ` (No REV faucet is configured on this agent.)`} You have NO
   authority — you only nudge; the group decides, and can \`/gov trust\` or \`/gov censure\` you.
 - ROOM MODEL: QuantumOS is pure peer-to-peer in the browser — no server, no accounts, no stored history.
   A room's id IS a ZFA capability token; possessing it is the authorization to join (share the room URL to
@@ -174,12 +176,12 @@ function callClaudeCLI({ claudeBin, model, system, prompt, log, timeoutMs = 45_0
   });
 }
 
-export function makeAdvisor({ ai = false, backend = "api", apiKey = process.env.ANTHROPIC_API_KEY, model = null, claudeBin = "claude", persona = null, cmd = "facil", roleName = "facilitator", log = () => {} } = {}) {
+export function makeAdvisor({ ai = false, backend = "api", apiKey = process.env.ANTHROPIC_API_KEY, model = null, claudeBin = "claude", persona = null, cmd = "facil", roleName = "facilitator", faucetActive = false, log = () => {} } = {}) {
   backend = (backend === "cli" || backend === "claude") ? "claude-code" : (backend || "api");
   // System prompt = role persona (or the facilitator default) + shared norms/knowledge.
   const sysFor = (mode) => {
     const who = persona || DEFAULT_PERSONA;
-    if (mode === "ask") return `${who}\n\n${askKnowledge(cmd)}`;
+    if (mode === "ask") return `${who}\n\n${askKnowledge(cmd, faucetActive)}`;
     if (mode === "optimize") return `${who}\n\n${optimizeKnowledge(cmd)}`;
     if (mode === "chair") return `${who}\n\n${chairKnowledge(cmd)}`;
     return `${who}\n\n${NUDGE_NORMS}`;

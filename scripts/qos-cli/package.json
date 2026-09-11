@@ -13,7 +13,9 @@
   },
   "dependencies": {
     "ws": "^8.18.0",
-    "werift": "^0.20.0"
+    "werift": "^0.20.0",
+    "@noble/curves": "^2.3.0",
+    "@noble/hashes": "^2.3.0"
   },
   "engines": { "node": ">=18" }
 }
