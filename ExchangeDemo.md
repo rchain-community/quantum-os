@@ -5,11 +5,14 @@ pool, seed it, trade against it, and **federate** two exchanges across shards so
 a trade can hop between them — atomically. Actors: **Alice** runs an exchange
 on shard A, **Bob** trades, and a **Paris** exchange runs on shard B.
 
-The contract is [`packages/browser/src/rholang-exchange.js`](packages/browser/src/rholang-exchange.js)
-(`EXCHANGE_RHO` + the `*Program` call-site builders, `--selftest` in CI). The
-`$x*` macros are registered in
-[`rholang-macros.js`](packages/browser/src/rholang-macros.js) and run through the
-ordinary `$name(…)` dispatch — no `/` command of their own.
+Everything below is one line each, typed into a [quantum-os](README.md) room
+after `/rholang key generate` (or an existing funded key) — `$xinstall()`
+deploys a fresh exchange, and the rest are ordinary `$name(…)` macro calls,
+no `/` command of their own. (For the curious: the contract itself is
+[`rholang-exchange.js`](https://github.com/rchain-community/quantum-os/blob/main/packages/browser/src/rholang-exchange.js),
+the macros are registered in
+[`rholang-macros.js`](https://github.com/rchain-community/quantum-os/blob/main/packages/browser/src/rholang-macros.js) —
+neither needs reading to follow this walkthrough.)
 
 > **No platform token, directly.** The exchange never touches
 > `rho:rchain:revVault`. It trades tokens by their *own contract URIs*; REV
@@ -66,24 +69,22 @@ the operator, the pool holds no ambient authority, the rate is fixed at deploy
 | `abort(txId)` | the tx's own holder | reverse a prepared tx exactly (idempotent; self-only — see §5) |
 | `stateOf(txId)` | anyone (read) | a tx's status — the recovery primitive |
 
-Twelve of these have a `$x*` macro (`$xopen` `$xprovide` `$xdeposit` `$xquote`
-`$xswap` `$xwithdraw` `$xlink` `$xinspect` `$xprepare` `$xreceive` `$xcommit`
-`$xabort` `$xstateof`); `setRate` is called through the raw `setRateProgram`
-builder or a hand-written `/rholang deploy`.
+Thirteen of these fourteen have a `$x*` macro (`$xopen` `$xprovide`
+`$xdeposit` `$xquote` `$xswap` `$xwithdraw` `$xlink` `$xinspect` `$xprepare`
+`$xreceive` `$xcommit` `$xabort` `$xstateof`), plus `$xinstall()` to deploy
+the exchange itself in the first place; `setRate` is called through the raw
+`setRateProgram` builder or a hand-written `/rholang deploy`.
 
 ---
 
 ## 1. Alice deploys an exchange
 
 Alice needs a signing key with REV for phlo (`/rholang key generate`, funded on
-her shard). One deploy installs the contract; its answer is the exchange URI
+her shard). One macro installs the contract; its answer is the exchange URI
 every later call resolves through.
 
 ```
-Alice ▸ /rholang deploy
-        ┌─────────────────────────────────────────────┐
-        │  <the EXCHANGE_RHO install program>         │
-        └─────────────────────────────────────────────┘
+Alice ▸ $xinstall()
         ✓ Success!  → rho:id:9xm7c…iwwjuio
 ```
 
@@ -212,8 +213,9 @@ shards, not one contract standing in for both).
 
 **Recovery, if Bob's client crashes mid-flight.** Both legs are gated to
 *Bob's own key* throughout, so recovery needs no counterparty — Bob (or his
-client, reconnecting) reads `$xstateof` on both legs and follows
-`packages/browser/src/exchange-2pc.ts`'s `decideRecovery` table: both
+client, reconnecting) reads `$xstateof` on both legs and follows a fixed
+recovery table ([`exchange-2pc.ts`](https://github.com/rchain-community/quantum-os/blob/main/packages/browser/src/exchange-2pc.ts)
+for the curious): both
 `prepared` → finish committing both; one `prepared`, the other never
 happened → abort the one that ran; either side already `committed` → finish
 the other (idempotent). This is why **`commit`/`abort` are gated to the tx's
@@ -244,14 +246,10 @@ never drain a pool.
 ## 6. Wrapped native tokens — trading REV itself
 
 The exchange never touches `revVault` (top of this doc) — so REV participates
-only as a **wrapped** token, `packages/browser/src/wrapped-token.js`. Alice
-issues one:
+only as a **wrapped** token. Alice issues one:
 
 ```
-Alice ▸ /rholang deploy
-        ┌────────────────────────────────────────────────────┐
-        │  <installWrappedProgram(myRevAddr, "REV")>         │
-        └────────────────────────────────────────────────────┘
+Alice ▸ $winstall(myRevAddr, "REV")
         ✓ Success!  → rho:id:wrap7…      (the wrapper URI; Alice is the issuer)
 ```
 
@@ -379,3 +377,14 @@ exchange itself is agnostic: it moves messages to whatever `token` URI you name.
 - [`AtomicSwapDemo.md`](AtomicSwapDemo.md) — `/rdv swap`, the in-room atomic 2-party trade (no rholang, no rate).
 - [`MacRhoLang.md`](MacRhoLang.md) — the `$` macro layer.
 - rchain-community/rchain-rust#33 — the linked-invoke primitive `prepareReceive` builds on.
+
+---
+
+## Found a gap, or want a new capability?
+
+Multi-hop routing past two pools, an AMM-style rate curve, a `KnownCurrency`
+field so a `/note` currency remembers where it trades, the on-chain
+permissionless-after-expiry `abort` (§5's known gap) — none of this is
+closed. **[Open an issue →](https://github.com/rchain-community/quantum-os/issues/new)**
+and say what you hit or what you'd want; that's exactly how this exchange
+went from a single pool to atomic federation and wrapped native tokens.
