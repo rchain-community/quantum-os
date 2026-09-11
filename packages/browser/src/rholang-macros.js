@@ -35,7 +35,7 @@ import {
   stateOfProgram as xStateOfProgram,
 } from "./rholang-exchange.js";
 import {
-  installWrappedProgram as wInstallProgram,
+  installWrappedProgram as wInstallProgram, mintProgram as wMintProgram,
   burnProgram as wBurnProgram, balanceOfProgram as wBalanceOfProgram,
   infoProgram as wInfoProgram,
 } from "./wrapped-token.js";
@@ -598,22 +598,31 @@ ${seats.join(" |\n")} |
     expand: (a) => xStateOfProgram(a.exchange, a.tx),
   },
 
-  // --- wrapped native tokens (wrapped-token.js) --------------------------
-  // A native platform token (REV, or any chain's own token) trades on the
-  // exchange only wrapped — the exchange never touches revVault. $winstall
-  // deploys a fresh wrapper (you become its issuer). $wrap is the ONE macro
-  // here that touches revVault: it is the issuer's own sanctioned deploy,
-  // chaining a real revVault transfer to the wrapper's backing address with
-  // the mint call, in one program. $unwrap is the holder's burn; $wrelease
-  // is the issuer's separate redemption step (their own revVault transfer,
-  // chained with release) — two macros because they are two different
-  // parties' actions, possibly at different times. See wrapped-token.js and
+  // --- issuer-backed tokens (wrapped-token.js) ---------------------------
+  // An issuer-backed token contract — mint/burn/balanceOf, issuer-gated.
+  // Two uses: a **personal currency** ($winstall + $mint — issue on your
+  // own word, no revVault involved, the on-chain analog of a /note currency
+  // — see ExchangeDemo.md), or a **wrapped native token** ($winstall + $wrap
+  // — REV, or any chain's own token, backed 1:1). Either way it never
+  // touches revVault itself; $wrap is the ONE macro here that does, because
+  // it's the issuer's own sanctioned deploy, chaining a real revVault
+  // transfer to the wrapper's backing address with the mint call, in one
+  // program. $unwrap is the holder's burn; $wrelease is the issuer's
+  // separate redemption step (their own revVault transfer, chained with
+  // release) — two macros because they are two different parties' actions,
+  // possibly at different times. See wrapped-token.js and
   // CapabilityTransport.md.
   winstall: {
-    help: "Deploy a fresh wrapped-token contract; you become its issuer. Args: backingAddr, baseCurrency.",
+    help: "Deploy a fresh issuer-backed token contract; you become its issuer. Args: backingAddr, baseCurrency. For a personal currency with no real-world backing, backingAddr can just be your own address.",
     write: true,
     argSpec: [["backing", "string"], ["currency", "string"]],
     expand: (a) => wInstallProgram(a.backing, a.currency),
+  },
+  mint: {
+    help: "Issuer credits a holder directly — no revVault. For a personal currency (issue on your own word); for a wrapped native token, use $wrap instead so a real transfer always backs the mint. Args: wrapperUri, amount, holder.",
+    write: true,
+    argSpec: [["wrapper", "cap"], ["amount", "int"], ["holder", "string"]],
+    expand: (a) => wMintProgram(a.wrapper, a.amount, a.holder),
   },
   wrap: {
     help: "Issuer wraps their own REV: transfer to the wrapper's backing address, then mint. Args: wrapperUri, backingAddr, amount, holder.",
