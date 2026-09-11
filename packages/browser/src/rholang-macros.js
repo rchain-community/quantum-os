@@ -36,8 +36,8 @@ import {
 } from "./rholang-exchange.js";
 import {
   installWrappedProgram as wInstallProgram, mintProgram as wMintProgram,
-  burnProgram as wBurnProgram, balanceOfProgram as wBalanceOfProgram,
-  infoProgram as wInfoProgram,
+  burnProgram as wBurnProgram, transferProgram as wTransferProgram,
+  balanceOfProgram as wBalanceOfProgram, infoProgram as wInfoProgram,
 } from "./wrapped-token.js";
 
 /**
@@ -599,12 +599,17 @@ ${seats.join(" |\n")} |
   },
 
   // --- issuer-backed tokens (wrapped-token.js) ---------------------------
-  // An issuer-backed token contract — mint/burn/balanceOf, issuer-gated.
-  // Two uses: a **personal currency** ($winstall + $mint — issue on your
-  // own word, no revVault involved, the on-chain analog of a /note currency
-  // — see ExchangeDemo.md), or a **wrapped native token** ($winstall + $wrap
-  // — REV, or any chain's own token, backed 1:1). Either way it never
-  // touches revVault itself; $wrap is the ONE macro here that does, because
+  // An issuer-backed token contract — mint/burn/transfer/balanceOf,
+  // mint issuer-gated, transfer and burn self-service (both self-identify
+  // the caller on-chain via rho:rev:address, never a caller-supplied
+  // string). Two uses: a **personal currency** ($winstall + $mint — issue
+  // on your own word, no revVault involved, the on-chain analog of a /note
+  // currency — see ExchangeDemo.md), or a **wrapped native token**
+  // ($winstall + $wrap — REV, or any chain's own token, backed 1:1).
+  // $wtransfer works the same for either — an ordinary peer-to-peer
+  // transfer, the same shape as REV's own $transfer and a minimal ERC20's.
+  // Neither $winstall/$mint/$wtransfer/$burn/$balanceOf touches revVault
+  // itself; $wrap is the ONE macro here that does, because
   // it's the issuer's own sanctioned deploy, chaining a real revVault
   // transfer to the wrapper's backing address with the mint call, in one
   // program. $unwrap is the holder's burn; $wrelease is the issuer's
@@ -623,6 +628,12 @@ ${seats.join(" |\n")} |
     write: true,
     argSpec: [["wrapper", "cap"], ["amount", "int"], ["holder", "string"]],
     expand: (a) => wMintProgram(a.wrapper, a.amount, a.holder),
+  },
+  wtransfer: {
+    help: "Ordinary peer-to-peer transfer of your own balance — same shape as $transfer (REV) and a minimal ERC20's. Works the same whether the balance came from $mint (a personal currency) or $wrap (a wrapped native token). Args: wrapperUri, to, amount.",
+    write: true,
+    argSpec: [["wrapper", "cap"], ["to", "string"], ["amount", "int"]],
+    expand: (a) => wTransferProgram(a.wrapper, a.to, a.amount),
   },
   wrap: {
     help: "Issuer wraps their own REV: transfer to the wrapper's backing address, then mint. Args: wrapperUri, backingAddr, amount, holder.",

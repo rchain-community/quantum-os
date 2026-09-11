@@ -96,6 +96,34 @@ in {
     }
   } |
 
+  // transfer — ordinary peer-to-peer transfer between holders, the same
+  // shape as REV's own transfer and a minimal ERC20's: debit the
+  // caller's own balance (self-identified via rho:rev:address, same as
+  // "burn" — never a caller-supplied string), credit "to". Works
+  // identically whether the balance came from mint (a personal currency) or
+  // wrap (a wrapped native token) — same ledger either way. Self-transfer
+  // is refused outright rather than risked: "to" and the caller's derived
+  // address are different map keys in the success case, so the debit and
+  // credit never alias.
+  contract Wrapped(_id, @"transfer", @to, @amount, ret) = {
+    new aret in {
+      revAddr!("fromDeployerId", *_id, *aret) |
+      for (@myAddr <- aret) {
+        for (@bals <- balsCh) {
+          match [myAddr == to, bals.getOrElse(myAddr, 0) >= amount, amount >= 0] {
+            [true, _, _]        => { balsCh!(bals) | ret!(("exchange-error", "cannot transfer to yourself")) }
+            [false, true, true] => {
+              balsCh!(bals.set(myAddr, bals.getOrElse(myAddr, 0) - amount).set(to, bals.getOrElse(to, 0) + amount)) |
+              ret!(("transferred", amount, myAddr, to))
+            }
+            [false, false, _]   => { balsCh!(bals) | ret!(("exchange-error", "insufficient balance")) }
+            _                   => { balsCh!(bals) | ret!(("exchange-error", "bad transfer")) }
+          }
+        }
+      }
+    }
+  } |
+
   // release — issuer only; bookkeeping. Does not and cannot move REV itself
   // — that is the issuer's own $wrelease deploy, chained around this call.
   contract Wrapped(_id, @"release", @claimId, ret) = {
@@ -137,6 +165,7 @@ in {
 /** The verbs published behind write bundles. */
 const FACETS = `{
     "mint":       bundle+{*Wrapped}, "burn":       bundle+{*Wrapped},
+    "transfer":   bundle+{*Wrapped},
     "release":    bundle+{*Wrapped}, "balanceOf":  bundle+{*Wrapped},
     "claimOf":    bundle+{*Wrapped}, "info":       bundle+{*Wrapped}
   }`;
@@ -182,6 +211,7 @@ export function wrappedCall(wrapperUri, verb, args = []) {
 
 export const mintProgram      = (uri, amount, holder) => wrappedCall(uri, "mint", [int(amount), q(holder)]);
 export const burnProgram      = (uri, amount, claimId) => wrappedCall(uri, "burn", [int(amount), q(claimId)]);
+export const transferProgram  = (uri, to, amount) => wrappedCall(uri, "transfer", [q(to), int(amount)]);
 export const releaseProgram   = (uri, claimId) => wrappedCall(uri, "release", [q(claimId)]);
 export const balanceOfProgram = (uri, holder) => wrappedCall(uri, "balanceOf", [q(holder)]);
 export const claimOfProgram   = (uri, claimId) => wrappedCall(uri, "claimOf", [q(claimId)]);
@@ -208,7 +238,7 @@ export function selftest() {
     return st.length === 0;
   };
   const URI = "rho:id:abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqr";
-  const VERBS = ["mint", "burn", "release", "balanceOf", "claimOf", "info"];
+  const VERBS = ["mint", "burn", "transfer", "release", "balanceOf", "claimOf", "info"];
 
   ok("contract template is balanced", balanced(WRAPPED_TOKEN_RHO));
   ok("no quoted name", !/@"[a-z]/.test(WRAPPED_TOKEN_RHO.replace(new RegExp(`@"(${VERBS.join("|")})"`, "g"), "")), "@\"…\"");
@@ -224,7 +254,10 @@ export function selftest() {
   ok("every `<- claimsCh` block restores claimsCh", restores("claims", "claimsCh"));
   ok("every `<- supplyCh` block restores supplyCh", restores("supply", "supplyCh"));
   ok("the contract never mentions revVault", !/revVault|rho:rchain:revVault/.test(WRAPPED_TOKEN_RHO));
-  ok("all six verbs defined", VERBS.every((v) => WRAPPED_TOKEN_RHO.includes(`@"${v}"`)));
+  ok("all seven verbs defined", VERBS.every((v) => WRAPPED_TOKEN_RHO.includes(`@"${v}"`)));
+  ok("transfer self-identifies via rho:rev:address, never a caller-supplied address",
+     /contract Wrapped\(_id, @"transfer"[\s\S]*?revAddr!\("fromDeployerId", \*_id/.test(WRAPPED_TOKEN_RHO));
+  ok("transfer refuses to alias self as \"to\"", /myAddr == to/.test(WRAPPED_TOKEN_RHO));
   ok("issuer is bound at install, not a runtime arg", !/@"mint", @amount, @holder, @issuer/.test(WRAPPED_TOKEN_RHO));
 
   const inst = installWrappedProgram("1111backingAddr", "REV");
@@ -238,6 +271,9 @@ export function selftest() {
 
   const burn = burnProgram(URI, 10, "claim1");
   ok("burn carries amount, claimId in order", /@verb!\(\*deployerId, "burn", 10, "claim1", \*ret\)/.test(burn));
+
+  const transfer = transferProgram(URI, "1111holder", 10);
+  ok("transfer carries to, amount in order", /@verb!\(\*deployerId, "transfer", "1111holder", 10, \*ret\)/.test(transfer), transfer.slice(-200));
 
   const release = releaseProgram(URI, "claim1");
   ok("release carries only claimId", /@verb!\(\*deployerId, "release", "claim1", \*ret\)/.test(release));
