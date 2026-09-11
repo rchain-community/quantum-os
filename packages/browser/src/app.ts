@@ -7916,6 +7916,13 @@ function send(): void {
   discardPending();
   pushHistory(text);
   msgInput.value = "";
+  // The box is empty now, so any open completion/usage menu is stale.
+  // Assigning .value fires no "input" event, so it will not close itself —
+  // same fix as holdLine() above, applied here too: without it, a usage hint
+  // painted while typing a command (e.g. "/facil ") is left on screen after
+  // Enter sends the line, sitting over the transcript until something else
+  // happens to touch the palette.
+  palette.hide();
   if (text.startsWith("//")) {
     const escaped = text.slice(1);
     qpeer.broadcast({ kind: "chat", text: escaped });
