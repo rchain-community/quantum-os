@@ -19,17 +19,24 @@
 // rootDir there; the agent reaches it by relative path, which node does not
 // restrict.
 //
-// The one sibling import is `rholang-exchange.js` — also plain JS, no imports,
-// pure string builders — for the `$x*` exchange macros, so the exchange
-// call-site shape has a single source (`rholang-exchange.js` + its selftest).
+// Two sibling imports — also plain JS, no imports, pure string builders — for
+// the `$x*` exchange macros and the `$wrap`/`$unwrap` wrapped-native-token
+// macros, so each call-site shape has a single source (the module + its
+// selftest).
 
 import {
   openProgram as xOpenProgram, provideProgram as xProvideProgram,
   depositProgram as xDepositProgram, quoteProgram as xQuoteProgram,
   swapProgram as xSwapProgram, withdrawProgram as xWithdrawProgram,
-  linkProgram as xLinkProgram, routeProgram as xRouteProgram,
-  inspectProgram as xInspectProgram,
+  linkProgram as xLinkProgram, inspectProgram as xInspectProgram,
+  prepareProgram as xPrepareProgram, prepareReceiveProgram as xPrepareReceiveProgram,
+  commitProgram as xCommitProgram, abortProgram as xAbortProgram,
+  stateOfProgram as xStateOfProgram,
 } from "./rholang-exchange.js";
+import {
+  burnProgram as wBurnProgram, balanceOfProgram as wBalanceOfProgram,
+  infoProgram as wInfoProgram,
+} from "./wrapped-token.js";
 
 /**
  * @typedef {object} ZfaKernel
@@ -535,17 +542,140 @@ ${seats.join(" |\n")} |
     argSpec: [["exchange", "cap"], ["pool", "string"], ["name", "string"], ["remote", "cap"], ["shard", "string"]],
     expand: (a) => xLinkProgram(a.exchange, a.pool, a.name, a.remote, a.shard),
   },
-  xroute: {
-    help: "Swap here, then describe the remote leg (a $at cross-shard deploy). Args: exchangeUri, poolId, fromSide, amount, linkName, remotePoolId.",
-    write: true,
-    argSpec: [["exchange", "cap"], ["pool", "string"], ["from", "string"], ["amount", "int"], ["link", "string"], ["remotePool", "string"]],
-    expand: (a) => xRouteProgram(a.exchange, a.pool, a.from, a.amount, a.link, a.remotePool),
-  },
   xinspect: {
     help: "Read a pool (rate, reserves, links). Args: exchangeUri, poolId.",
     write: false,
     argSpec: [["exchange", "cap"], ["pool", "string"]],
     expand: (a) => xInspectProgram(a.exchange, a.pool),
+  },
+
+  // --- two-phase commit: the atomic cross-shard trade -------------------
+  // A cross-shard trade is prepare (local) + prepareReceive (the linked
+  // remote pool, over a Layer-1 remote signed deploy) + commit both, or
+  // abort the one leg that ran. See rholang-exchange.js's header comment and
+  // CapabilityTransport.md for the protocol and its one known gap: abort is
+  // self-only in this version (the on-chain permissionless-after-expiry path
+  // is designed — expiryBlock is recorded — but not implemented, because
+  // rho:block:data does not compose with a signed deploy's return-value
+  // readback on this rnode build, verified empirically).
+  xprepare: {
+    help: "Local leg of a cross-shard trade: swap now, hold a reversible tx record. Args: exchangeUri, poolId, txId, fromSide, amount, expiryBlock.",
+    write: true,
+    argSpec: [["exchange", "cap"], ["pool", "string"], ["tx", "string"], ["from", "string"], ["amount", "int"], ["expiry", "int"]],
+    expand: (a) => xPrepareProgram(a.exchange, a.pool, a.tx, a.from, a.amount, a.expiry),
+  },
+  xreceive: {
+    help: "Remote leg on a linked pool: credit \"amount\" of \"side\" as if deposited, swap it, hold a reversible tx record. Gated to a registered link. Args: exchangeUri, poolId, txId, side, amount, expiryBlock, linkName.",
+    write: true,
+    argSpec: [["exchange", "cap"], ["pool", "string"], ["tx", "string"], ["side", "string"], ["amount", "int"], ["expiry", "int"], ["link", "string"]],
+    expand: (a) => xPrepareReceiveProgram(a.exchange, a.pool, a.tx, a.side, a.amount, a.expiry, a.link),
+  },
+  xcommit: {
+    help: "Finalize a prepared tx (idempotent; only its own holder may commit it). Args: exchangeUri, txId.",
+    write: true,
+    argSpec: [["exchange", "cap"], ["tx", "string"]],
+    expand: (a) => xCommitProgram(a.exchange, a.tx),
+  },
+  xabort: {
+    help: "Reverse a prepared tx exactly (idempotent; self only in this version — see help text on prepare/receive). Args: exchangeUri, poolId, txId.",
+    write: true,
+    argSpec: [["exchange", "cap"], ["pool", "string"], ["tx", "string"]],
+    expand: (a) => xAbortProgram(a.exchange, a.pool, a.tx),
+  },
+  xstateof: {
+    help: "Read a tx's status — the recovery primitive for a crashed client. Args: exchangeUri, txId.",
+    write: false,
+    argSpec: [["exchange", "cap"], ["tx", "string"]],
+    expand: (a) => xStateOfProgram(a.exchange, a.tx),
+  },
+
+  // --- wrapped native tokens (wrapped-token.js) --------------------------
+  // A native platform token (REV, or any chain's own token) trades on the
+  // exchange only wrapped — the exchange never touches revVault. $wrap is
+  // the ONE macro here that does: it is the issuer's own sanctioned deploy,
+  // chaining a real revVault transfer to the wrapper's backing address with
+  // the mint call, in one program. $unwrap is the holder's burn; $wrelease
+  // is the issuer's separate redemption step (their own revVault transfer,
+  // chained with release) — two macros because they are two different
+  // parties' actions, possibly at different times. See wrapped-token.js and
+  // CapabilityTransport.md.
+  wrap: {
+    help: "Issuer wraps their own REV: transfer to the wrapper's backing address, then mint. Args: wrapperUri, backingAddr, amount, holder.",
+    write: true,
+    argSpec: [["wrapper", "cap"], ["backing", "string"], ["amount", "int"], ["holder", "string"]],
+    expand(a) {
+      return `new revVault(\`rho:rchain:revVault\`), deployerId(\`rho:rchain:deployerId\`),
+    lookup(\`rho:registry:lookup\`), tret, stored, mret in {
+  revVault!("transfer", *deployerId, ${q(a.backing)}, ${a.amount}, *tret) |
+  for (@tr <- tret) {
+    match tr {
+      Nil => {
+        lookup!(\`${a.wrapper}\`, *stored) |
+        for (@record <- stored) {
+          match record {
+            (_, caps) => {
+              match caps.get("mint") {
+                Nil  => { return!((Nil, ["no mint verb"])) }
+                verb => { @verb!(*deployerId, "mint", ${a.amount}, ${q(a.holder)}, *mret) | for (@m <- mret) { return!((m, Nil)) } }
+              }
+            }
+            _ => { return!((Nil, ["no wrapper at", ${q(a.wrapper)}])) }
+          }
+        }
+      }
+      _ => { return!((Nil, tr)) }
+    }
+  }
+}`;
+    },
+  },
+  unwrap: {
+    help: "Holder burns their own wrapped balance, recording a redemption claim the issuer honors with $wrelease. Args: wrapperUri, amount, claimId.",
+    write: true,
+    argSpec: [["wrapper", "cap"], ["amount", "int"], ["claim", "string"]],
+    expand: (a) => wBurnProgram(a.wrapper, a.amount, a.claim),
+  },
+  wrelease: {
+    help: "Issuer's redemption step: transfer real REV to the holder, then mark the claim released. Args: wrapperUri, claimId, holder, amount.",
+    write: true,
+    argSpec: [["wrapper", "cap"], ["claim", "string"], ["holder", "string"], ["amount", "int"]],
+    expand(a) {
+      return `new revVault(\`rho:rchain:revVault\`), deployerId(\`rho:rchain:deployerId\`),
+    lookup(\`rho:registry:lookup\`), tret, stored, rret in {
+  revVault!("transfer", *deployerId, ${q(a.holder)}, ${a.amount}, *tret) |
+  for (@tr <- tret) {
+    match tr {
+      Nil => {
+        lookup!(\`${a.wrapper}\`, *stored) |
+        for (@record <- stored) {
+          match record {
+            (_, caps) => {
+              match caps.get("release") {
+                Nil  => { return!((Nil, ["no release verb"])) }
+                verb => { @verb!(*deployerId, "release", ${q(a.claim)}, *rret) | for (@r <- rret) { return!((r, Nil)) } }
+              }
+            }
+            _ => { return!((Nil, ["no wrapper at", ${q(a.wrapper)}])) }
+          }
+        }
+      }
+      _ => { return!((Nil, tr)) }
+    }
+  }
+}`;
+    },
+  },
+  wbalance: {
+    help: "Read a wrapped-token balance. Args: wrapperUri, holderAddr.",
+    write: false,
+    argSpec: [["wrapper", "cap"], ["holder", "string"]],
+    expand: (a) => wBalanceOfProgram(a.wrapper, a.holder),
+  },
+  winfo: {
+    help: "Read a wrapped token's issuer, backing address, base currency, and supply — compare supply against $wbalance/$balance(backingAddr) yourself.",
+    write: false,
+    argSpec: [["wrapper", "cap"]],
+    expand: (a) => wInfoProgram(a.wrapper),
   },
 };
 
