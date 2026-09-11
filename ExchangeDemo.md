@@ -17,6 +17,13 @@ the macros are registered in
 neither needs reading to follow this walkthrough.) Native platform tokens
 (REV, or any chain's own) trade too — **wrapped**, never directly; see §6.
 
+## Try it now
+
+Don't have a room or a funded key yet? **[Open My Room](MyRoom.md)** — join the live room,
+`/rholang key generate` for a deploy key, then fund it with test REV (`/facil faucet`, or plain
+English via `/facil ask give me some test rev`) and follow along below. See MyRoom.md's
+"Get a test REV address" section for the full walkthrough.
+
 ---
 
 ## 1. Create and persist a personal currency

@@ -249,7 +249,7 @@ the room, not hard-coded.
 ```bash
 node agent.mjs --room <cap:room:… | room-URL> [--role facilitator] [--name <s>] \
   [--budget 4] [--silent-min 6] [--quiet | --active] \
-  [--ai] [--ai-backend api|claude-code] [--state ./.qos-agent]
+  [--ai] [--ai-backend api|claude-code] [--state ./.qos-agent] [--key <hex>]
 ```
 
 **Run the persistent room** (detached, on a Claude subscription): `bash run-agents.sh`
@@ -373,6 +373,27 @@ for a peer whose own browser can't scroll back far enough or who joined late (th
 agent's own `/facil …` control chatter is left out); `/facil off` /
 `/facil on` mute and unmute it at runtime. These replies *answer a request*, so they're responsive
 (rate-limited only by a short per-command cooldown) and work even while muted.
+
+**Test REV faucet (`--key <hex>`, TEST SYSTEMS ONLY).** Pass a secp256k1 deploy
+key and the agent will hold it in memory and answer `/facil faucet [address]`
+by signing and deploying a fixed-amount (10) REV transfer to that address, via
+`rholang-client.mjs` — a hand port of the browser's `rholang.ts` deploy-signing
+path (verified byte-identical against `scripts/localnet/keys.mjs`'s REV-address
+derivation) and the *same* `$transfer` macro (`rholang-macros.mjs`'s
+`MACROS.transfer`) the browser's `/rholang` uses. `/facil ask give me some test
+rev` routes to the identical function through a deterministic regex match —
+never an LLM decision to move funds. The address is given explicitly the first
+time (`/facil faucet <address>`) and remembered per-peer after that
+(`known[peerId].revAddress`, alongside the agent's existing per-peer state); a
+bare `/facil faucet` with no address on file asks for one. No rate limit — a
+faucet on a test system is meant to be asked repeatedly. Absent `--key`, the
+subcommand and the NL intercept both just say so; nothing else about the agent
+changes. **Holding a signing key in a headless agent is a deliberate, narrow
+exception to this repo's "an agent never holds a key" invariant** (contrast
+`rholang-agent.mjs`, which only ever previews a program for a human to sign
+client-side) — never pass `--key` for anything holding real value. Fund the
+facilitator's own address (logged at startup) via `scripts/localnet`'s genesis
+wallet or a transfer from an already-funded key.
 
 **Chaired deliberation (`/facil chair <topic>`, needs `--ai`).** The facilitator
 becomes the room's **single neutral chair** and walks the group through six phases —

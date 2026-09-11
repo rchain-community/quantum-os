@@ -42,6 +42,27 @@ bound to the shared room closure, plus your closures (lemmas) and groups. Not su
 does? Ask a room agent: **`/facil ask "how do I …"`** — it knows QuantumOS and will name the command.
 To share information *between* rooms, see [Room Bridges](Room_Bridges.md).
 
+## Get a test REV address (for `/rholang`)
+
+The room's `/rholang` commands reach a real RChain node — but a **test** one, so nothing you
+send or receive there is worth anything. To try it:
+
+1. **`/rholang key generate`** — mints a secp256k1 deploy key in your own browser (it never
+   leaves it) and shows your REV address. `/rholang key show` recalls it later.
+2. **Fund it.** If the room's facilitator is running with a test-REV faucet (opt-in, test
+   systems only — see below), just ask: **`/facil faucet`** or plain English, **`/facil ask
+   give me some test rev`**. It sends a fixed amount to the address from step 1 (give it
+   explicitly the first time: `/facil faucet <address>` — it remembers it after that).
+3. **`/rholang status`** to confirm which node you're pointed at, then try `/rholang eval` or
+   a `$balance(me)` line to see your balance.
+
+No faucet running in this room? Whoever runs its rnode can fund your address directly, or spin
+up your own local test chain — see [`scripts/localnet/README.md`](scripts/localnet/README.md)
+(genesis-funded keys, for developers). A facilitator opts into the faucet with `agent.mjs --key
+<hex>` (see [`scripts/qos-cli/README.md`](scripts/qos-cli/README.md)) — **a deliberate,
+test-system-only exception**: it means that one agent process holds a signing key, so never
+point `--key` at anything holding real value.
+
 ## Learn more / get help
 
 - **What it is & how to use it:** [README](https://github.com/rchain-community/quantum-os) ·
