@@ -6,8 +6,10 @@
 #
 #   bash run-agents.sh [room-cap-or-url] [role ...]
 #
-# Defaults: the public room + facilitator. Stable identity per role under
-# ./.qos-<role>; logs + pids under ./.agents. Stop with ./stop-agents.sh.
+# Defaults: the public room + facilitator, WITH the test-REV faucet active
+# (--key, from scripts/localnet/pk.txt's devnet deployer — FACIL_KEY= to
+# disable). Stable identity per role under ./.qos-<role>; logs + pids under
+# ./.agents. Stop with ./stop-agents.sh.
 #
 # HOW MANY AGENTS
 #
@@ -51,6 +53,17 @@ PERSIST_DIR="${PERSIST_DIR:-./.qos-memory}"
 # Seconds between joins. Override with STAGGER=n for a slower link or a bigger cast.
 STAGGER="${STAGGER:-15}"
 
+# TEST REV faucet (dev shard only — see scripts/qos-cli/README.md's "Test REV
+# faucet" section). The facilitator's --key always deploys against its
+# hardcoded 127.0.0.1:40403 rnode config — there is no way to point it
+# elsewhere — so this is inherently a dev-shard-only key, and defaulting it on
+# here is exactly as safe as scripts/localnet/pk.txt already being committed:
+# genesis-funded, worthless outside that local chain, documented there as
+# throwaway. FACIL_KEY overrides it; FACIL_KEY= (set to empty) disables the
+# faucet without touching this file. Only ever passed to the `facilitator`
+# role — one key in one process, not one per agent.
+FACIL_KEY="${FACIL_KEY-$(grep '^deployer=' ../localnet/pk.txt 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')}"
+
 command -v node >/dev/null || { echo "node not found — install Node 18+."; exit 1; }
 [ -d node_modules ] || { echo "Run 'npm install' in scripts/qos-cli first."; exit 1; }
 command -v claude >/dev/null || echo "warning: 'claude' CLI not on PATH — the claude-code AI backend needs it (agents still run, deterministically)."
@@ -63,10 +76,12 @@ for role in "${ROLES[@]}"; do
   fi
   persist=()
   if [ -z "${NO_MEMORY:-}" ] && [ "$role" = "${ROLES[0]}" ]; then persist=(--persist "$PERSIST_DIR"); fi
+  keyflag=()
+  if [ "$role" = "facilitator" ] && [ -n "$FACIL_KEY" ]; then keyflag=(--key "$FACIL_KEY"); fi
   nohup node agent.mjs --room "$ROOM" --role "$role" --ai --ai-backend claude-code \
-    --state "./.qos-$role" "${persist[@]}" >> ".agents/$role.log" 2>&1 &
+    --state "./.qos-$role" "${persist[@]}" "${keyflag[@]}" >> ".agents/$role.log" 2>&1 &
   echo $! > "$pidf"
-  echo "✓ started $role (pid $!) → scripts/qos-cli/.agents/$role.log"
+  echo "✓ started $role (pid $!)${keyflag[*]:+ [test-REV faucet active]} → scripts/qos-cli/.agents/$role.log"
   sleep "$STAGGER"   # keep joins off each other's heels; see the ceiling note above
 done
 
