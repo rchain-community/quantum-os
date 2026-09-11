@@ -58,11 +58,23 @@ Bob ▸ $mint(rho:id:bux9k7…, 500, aliceAddr)
 
 Two personal currencies, each backed by nothing but their issuer's own word
 — the same trust model as a `/note` currency — now existing on-chain where
-an exchange can reach them. (`mint` is issuer-gated on-chain, so this is
-safe to run as-is; there is no general holder-to-holder transfer yet, only
-an issuer minting to whoever they choose, or a holder burning their own
-balance via `$unwrap` §6 — a plain P2P transfer is a natural follow-up,
-[open an issue](#found-a-gap-or-want-a-new-capability) if you want it.)
+an exchange can reach them.
+
+**Ordinary peer-to-peer transfer** works too, the same shape as REV's own
+`$transfer` and a minimal ERC20's — the sender is self-identified on-chain
+(`rho:rev:address`, never a caller-supplied string), so this needs no
+issuer involvement at all:
+
+```
+Bob ▸ $wtransfer(rho:id:coin4a…, aliceAddr, 20)
+      ✓ → ("transferred", 20, "bobAddr…", "aliceAddr…")
+```
+
+Bob just paid Alice 20 AliceCoin directly, holder to holder — the same
+mechanism works whether the balance came from `$mint` (a personal currency,
+here) or `$wrap` (a wrapped native token, §6), since it's the same ledger
+underneath. `mint` stays issuer-gated; `$wtransfer` and `$unwrap` (burn, for
+redemption) are the holder's own.
 
 ---
 
@@ -392,11 +404,6 @@ agnostic: it moves messages to whatever `token` URI you name.
 
 ## Honest scope
 
-- **A personal currency (§1) has no P2P transfer yet** — the issuer can
-  `$mint` to anyone directly, and a holder can `$unwrap`/burn their own
-  balance, but there is no way to hand a balance to someone else without
-  going through the issuer or the exchange. A general transfer verb is a
-  natural follow-up.
 - **Fixed rate, not an AMM.** The rate is set by the owner and changes only
   with `setRate`. No constant-product curve, no slippage, no impermanent loss —
   and no automatic price discovery. An owner who mis-prices a pool can be
@@ -437,11 +444,11 @@ agnostic: it moves messages to whatever `token` URI you name.
 
 ## Found a gap, or want a new capability?
 
-A P2P transfer for a personal currency (§1's known gap), multi-hop routing
-past two pools, an AMM-style rate curve, a `KnownCurrency` field so a
-`/note` currency remembers where it trades, the on-chain
-permissionless-after-expiry `abort` (§7's known gap —
+Multi-hop routing past two pools, an AMM-style rate curve, a
+`KnownCurrency` field so a `/note` currency remembers where it trades, the
+on-chain permissionless-after-expiry `abort` (§7's known gap —
 [already tracked, #198](https://github.com/rchain-community/quantum-os/issues/198)) —
 none of this is closed. **[Open an issue →](https://github.com/rchain-community/quantum-os/issues/new)**
 and say what you hit or what you'd want; that's exactly how this exchange
-went from a single pool to atomic federation and wrapped native tokens.
+went from a single pool to atomic federation, wrapped native tokens, and
+peer-to-peer transfer.
