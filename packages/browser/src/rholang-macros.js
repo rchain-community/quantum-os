@@ -25,6 +25,7 @@
 // selftest).
 
 import {
+  installProgram as xInstallProgram,
   openProgram as xOpenProgram, provideProgram as xProvideProgram,
   depositProgram as xDepositProgram, quoteProgram as xQuoteProgram,
   swapProgram as xSwapProgram, withdrawProgram as xWithdrawProgram,
@@ -34,6 +35,7 @@ import {
   stateOfProgram as xStateOfProgram,
 } from "./rholang-exchange.js";
 import {
+  installWrappedProgram as wInstallProgram,
   burnProgram as wBurnProgram, balanceOfProgram as wBalanceOfProgram,
   infoProgram as wInfoProgram,
 } from "./wrapped-token.js";
@@ -496,10 +498,17 @@ ${seats.join(" |\n")} |
 
   // --- pooled token exchange (rholang-exchange.js) ---------------------
   // Trade a token pair at an owner-set rate; federate across shards via a
-  // remote signed deploy. `$xopen` a pool, `$xprovide` reserve, `$xdeposit`
-  // your token in, `$xswap` at the rate, `$xwithdraw` out. `token` args are the
-  // tokens' own contract URIs — a quantum-os `/note` currency reaches here as
-  // that URI once a token contract is deployed for it. Never touches revVault.
+  // remote signed deploy. `$xinstall` deploys a fresh exchange, `$xopen` a
+  // pool, `$xprovide` reserve, `$xdeposit` your token in, `$xswap` at the
+  // rate, `$xwithdraw` out. `token` args are the tokens' own contract URIs —
+  // a quantum-os `/note` currency reaches here as that URI once a token
+  // contract is deployed for it. Never touches revVault.
+  xinstall: {
+    help: "Deploy a fresh token exchange. No args — returns the exchange URI every other $x* call takes as its first argument.",
+    write: true,
+    argSpec: [],
+    expand: () => xInstallProgram(),
+  },
   xopen: {
     help: "Open an exchange pool for a token pair. Args: exchangeUri, poolId, tokenA-uri, tokenB-uri, rate (B per A, ×1e6).",
     write: true,
@@ -591,14 +600,21 @@ ${seats.join(" |\n")} |
 
   // --- wrapped native tokens (wrapped-token.js) --------------------------
   // A native platform token (REV, or any chain's own token) trades on the
-  // exchange only wrapped — the exchange never touches revVault. $wrap is
-  // the ONE macro here that does: it is the issuer's own sanctioned deploy,
+  // exchange only wrapped — the exchange never touches revVault. $winstall
+  // deploys a fresh wrapper (you become its issuer). $wrap is the ONE macro
+  // here that touches revVault: it is the issuer's own sanctioned deploy,
   // chaining a real revVault transfer to the wrapper's backing address with
   // the mint call, in one program. $unwrap is the holder's burn; $wrelease
   // is the issuer's separate redemption step (their own revVault transfer,
   // chained with release) — two macros because they are two different
   // parties' actions, possibly at different times. See wrapped-token.js and
   // CapabilityTransport.md.
+  winstall: {
+    help: "Deploy a fresh wrapped-token contract; you become its issuer. Args: backingAddr, baseCurrency.",
+    write: true,
+    argSpec: [["backing", "string"], ["currency", "string"]],
+    expand: (a) => wInstallProgram(a.backing, a.currency),
+  },
   wrap: {
     help: "Issuer wraps their own REV: transfer to the wrapper's backing address, then mint. Args: wrapperUri, backingAddr, amount, holder.",
     write: true,
