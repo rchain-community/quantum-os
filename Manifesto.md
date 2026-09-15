@@ -1,5 +1,11 @@
 # Philosophy of [Quantum-OS](README.md)
 
+> **QuantumOS (QOS) is an intelligent gateway to each other and everything. It is the rho ZFA p2p layer, proven secure.** Not a metaphor: a *gateway to each other* — you reach another person through a capability token that is your and their proof of presence, nothing held by a server in between — and a *gateway to everything*, because that same token-and-closure mechanism is what a claim, an agreement, a unit of value, and a vote are made of here. "Proven secure" is meant literally, not as marketing: the ZFA invariant a room enforces is machine-verified in Lean 4 (see [QLF](https://github.com/rchain-community/quantum-logical-framework)), so unauthorized action is not merely forbidden by policy — it is inexpressible in the algebra.
+>
+> The security holds **without a blockchain**, which is what makes the privacy real rather than aspirational: a room, its capability tokens, the claims and value and decisions its peers build together — the closure itself proves them, so nothing needs to be posted to a public ledger for anyone else to trust it. That means most of what a room does costs nothing beyond the peers' own connection and leaves no trace for a third party — regulator, platform, or chain-analyst — to observe or correlate. A chain is available when a group deliberately wants a record that outlives the room or a currency that reaches beyond it; it is never the price of admission for privacy or security here, which is the inversion of how most "web3" systems are built.
+>
+> It is also secure **against a future most cryptography isn't ready for**: identity and value here are built from pure entropy and hashing, not the factoring/discrete-log keypairs a large enough quantum computer breaks outright. Consent doesn't quietly expire when the hardware catches up — see [SECURITY.md § Quantum security](SECURITY.md#quantum-security) for the specifics.
+
 ## Quantum-OS — The Executable Substrate of the Network Nation 2.0
 ### A Consent-Based, Cooperative, Computable Society
 
