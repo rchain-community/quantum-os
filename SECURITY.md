@@ -4,6 +4,8 @@
 
 [quantum-os](README.md) is a peer-to-peer browser application. The security boundary is the **ZFA capability token** — a cryptographically unguessable, algebraically unforgeable identifier. Possessing a token IS the capability to act (Curry-Howard for capabilities). The signaling server is an untrusted relay and is explicitly outside the trust boundary.
 
+**Scope note — off-chain by default.** Every mechanism in this document (capability tokens, dyncap chains, lemma immutability, the discrepancy probe, rendezvous conservation, vault encryption, group/trust governance) is enforced entirely peer-to-peer, with no blockchain, consensus, or third party in the loop. That is deliberate: it is both the privacy property (ordinary room activity — who's here, what was decided, what changed hands — is never written to a public ledger for anyone outside the room to observe) and the resource property (no gas, no block production, no on-chain state to grow). `/rholang` and the on-chain macros (`$x*` pooled exchange, `$w*` wrapped tokens) are an explicit, opt-in extension for the cases that need a durable public record or a currency that outlives a room — they carry rnode's own trust model (see `docs/rholang.md`'s "Known gaps") and do not weaken, or get relied on by, the off-chain guarantees above.
+
 ### What the system defends against
 
 | Threat | Mechanism |
@@ -127,6 +129,50 @@ The ZFA invariant is machine-verified in [Lean 4](https://github.com/rchain-comm
 - `no_magnetic_monopoles` (ZFAEventDynamics.lean) — `∇·B = 0` follows from ZFA closure
 
 Rust source: [`crates/zfa-core/src/capability.rs`](crates/zfa-core/src/capability.rs)
+
+### Quantum security
+
+The core p2p security model — capability tokens, dyncap identity, the
+identity vault — uses **no public-key cryptography whose hardness depends on
+factoring or discrete log**, the class of problem Shor's algorithm breaks. It
+is built entirely from CSPRNG entropy, hashing, and symmetric encryption,
+each of which a quantum computer only attacks with Grover's algorithm — a
+quadratic speedup, not a break:
+
+| Mechanism | Primitive | Quantum exposure |
+|-----------|-----------|-------------------|
+| Capability tokens (peer ID, room ID, lemma/note caps) | `crypto.getRandomValues()` entropy, 128 bits, ZFA-constrained | Grover only: brute-force search over the token space, not a structural attack |
+| Dyncap identity (`anchor`, `witness`) | SHA-256 only, hash chain, no keypair | Grover only: preimage search, not a structural attack |
+| Identity vault (`/password`) | PBKDF2-SHA256 (210k iters) → AES-256-GCM | Grover only: AES-256 keeps a large post-quantum margin |
+
+None of these rely on discrete log or factoring, so there is no known quantum
+algorithm that breaks them structurally the way Shor's algorithm breaks RSA
+or ECDSA — only the same brute-force search a classical attacker faces,
+sped up quadratically. **This is what "off-chain by default" buys beyond
+privacy and cost**: it also keeps the identity and capability layer off of
+classical public-key crypto, by construction, not as a deliberate
+post-quantum design exercise.
+
+Two exceptions, both outside the core p2p model and both inherent to
+interfacing with systems this project does not control, not choices made
+here:
+
+- **`/rholang deploy`** signs with **secp256k1 ECDSA** (`rholang.ts`, via
+  `@noble/curves`) to interoperate with the shipped rnode's existing
+  signature scheme — the same exposure to Shor's algorithm every
+  classical-signature blockchain has today. This path is opt-in and
+  off-chain-by-default (see the scope note above); a broken deploy key
+  compromises that key's on-chain funds/registry slot, not any peer's room
+  identity or capability tokens.
+- **WebRTC/DTLS transport** — the browser's own DTLS handshake typically
+  negotiates ECDHE, outside this project's control. A "harvest now, decrypt
+  later" adversary who records a session's ciphertext today and gains a
+  quantum computer later could in principle recover that session's
+  transport key. This affects only the recorded traffic of that one call,
+  not the algebraic capability/identity layer above it, which is not
+  transported as a secret to begin with — a capability token's *security*
+  is that possessing it is authorization, not that it stays hidden in
+  transit forever.
 
 ### Signaling server trust model
 

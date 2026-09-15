@@ -1,5 +1,7 @@
 # User Guide — collaborating in a [QuantumOS](README.md) room
 
+**QuantumOS is an intelligent gateway to each other and everything — the rho ZFA p2p layer, proven secure.** In practice that means: the link you share *is* the room, holding it *is* your membership, and everything the group builds inside — an agreement, a decision, a shared value — is as verifiably yours as the link itself, with no company or server standing between you and either. It also runs **off-chain by default**, so a normal session — voting, recording a lemma, passing a note — costs nothing and shows up on no public ledger; a blockchain only enters if the group deliberately chooses it (see `/rholang`), never as a precondition for privacy or security. And it's built to stay secure even against a future quantum computer — your identity and capabilities aren't the kind of cryptography that breaks when one arrives.
+
 A QuantumOS room is a serverless, peer-to-peer space where a group **discusses,
 decides, and records** together — no account, no host, no central server. This guide
 is the **map**: what to do at each stage, the one command for it, and where the full

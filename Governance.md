@@ -14,6 +14,15 @@ graph from the signed delegations + ballots it holds — no central counter). Se
 processes and [`Group_Decisions_Demo.md`](https://github.com/rchain-community/quantum-logical-framework/blob/main/Group_Decisions_Demo.md)
 for a worked multi-peer walkthrough.
 
+Membership, delegation, trust, censure, and vote tallying are all **off-chain**
+— a group and its liquid-democracy graph exist entirely as signed state its own
+peers hold and replicate, so who trusts whom and who delegated to whom is never
+public ledger data. Treasury and kudos ride `/note` (also off-chain, bearer
+tokens). The only optional touch of a chain is `/gov uri`/`/gov locker`, where
+an admin *records* (never derives) a URI or directory the group separately
+chose to deploy to — a pointer a group can add later, not a prerequisite for
+governing.
+
 ---
 
 ## Design philosophy — RGOV as a liquid-trust network

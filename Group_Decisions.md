@@ -11,6 +11,13 @@ room reaches a good decision without groupthink — see [`Room_Best_Practices.md
 To chain these tools into an annealing loop and *optimize* (not just decide), see
 [`Collective_Optimization.md`](Collective_Optimization.md).
 
+Every process below — poll, estimate, probe, rendezvous, channel, lemma — is
+**verified peer-to-peer with no blockchain in the loop**: the tally is a pure,
+deterministic function every peer computes locally from the signed envelopes it
+holds. A group's decision is never written to a public ledger and never costs
+gas; a chain only enters if the group deliberately wants an on-chain record of
+the outcome (e.g. `/gov uri`), which is a separate, opt-in step.
+
 ---
 
 ## Why this works without a server
