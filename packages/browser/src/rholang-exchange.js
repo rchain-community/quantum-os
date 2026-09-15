@@ -20,13 +20,12 @@
 //      pools, not an unverified cross-shard claim (shard B cannot read
 //      shard A's state directly — that is the reason 2PC exists at all).
 //   3. `commit` both, or `abort` the one leg that succeeded — both idempotent.
-//      `abort` is self-only in this version (see the note on the `abort`
-//      contract below: a permissionless after-expiry path is designed —
-//      `expiryBlock` is recorded — but not implemented, because reading
-//      `rho:block:data` from a signed deploy breaks this rnode build's
-//      return-value readback; verified empirically). A crashed client can
-//      still read `stateOf` on both legs and finish deterministically with
-//      its own key. See `exchange-2pc.ts` and CapabilityTransport.md.
+//      The tx's own holder may always `abort` a prepared tx; anyone else may
+//      once the current block number passes the tx's recorded `expiryBlock`
+//      (permissionless-after-expiry, quantum-os#198 — see the note on the
+//      `abort` contract below). A crashed client can still read `stateOf` on
+//      both legs and finish deterministically with its own key before that.
+//      See `exchange-2pc.ts` and CapabilityTransport.md.
 //
 // **Connecting to quantum-os currencies.** A `/note` currency is a bearer
 // label; here it is that same label. Deploy a token contract for it
@@ -57,7 +56,7 @@ export const RATE_SCALE = 1_000_000;
 export const EXCHANGE_RHO = `new
     Exchange, poolsCh, balsCh, txCh,
     insertArbitrary(\`rho:registry:insertArbitrary\`),
-    deployerId(\`rho:rchain:deployerId\`), ret
+    deployerId(\`rho:rchain:deployerId\`), blockData(\`rho:block:data\`), ret
 in {
   poolsCh!({}) | balsCh!({}) | txCh!({}) |
 
@@ -341,65 +340,69 @@ in {
     }
   } |
 
-  // abort — self-abort only (v1: see the rho:block:data note below). Reverses
-  // the swap/credit exactly. Idempotent; refuses to abort an already-
-  // committed tx.
+  // abort — the tx's own holder may always abort a prepared tx; anyone else
+  // may abort it once the current block number has passed expiryBlock
+  // (permissionless-after-expiry, quantum-os#198). Reverses the swap/credit
+  // exactly. Idempotent; refuses to abort an already-committed tx.
   //
-  // Design note — permissionless-after-expiry is NOT implemented here
-  // (quantum-os#198).
-  // expiryBlock is recorded for a future version and for off-chain recovery
-  // tooling, but abort does not read rho:block:data to enforce it: verified
-  // empirically (2026-09-11, against bin/rnode 0.1.0) that a signed deploy
-  // reading rho:block:data never gets its return!'d value through
-  // wrapProgram's registry-readback forwarder — reproduced down to the
-  // simplest possible program (a bare block-data read + return!), with no
-  // rholang error reported (a clean "Success!", cost well under phloLimit)
-  // and no state change either. Exploratory (unsigned) reads of
-  // rho:block:data work fine; it is specifically the signed-deploy path that
-  // breaks. Until that is root-caused (or validAfterBlockNumber turns out to
-  // give a usable, trustable lower bound), a "prepare"d tx whose holder never
-  // returns stays prepared — locked, not lost, recoverable by the holder's
-  // own key reappearing. Tracked in CapabilityTransport.md.
+  // rho:block:data reads fine here: the 2026-09-11 finding that a *signed*
+  // deploy reading rho:block:data never got its return!'d value through
+  // wrapProgram's registry-readback forwarder (reproduced down to a bare
+  // block-data read + return!, bin/rnode 0.1.0) does not reproduce on
+  // rchain-rust dev 9e667e203 — re-verified 2026-09-14, twice, against a
+  // fresh devnet: the registry slot resolved on the first poll both times.
+  // Not bisected which upstream change (of #44/#45 block-header timestamp,
+  // dynamic validators, #47 strings, #48 rho:io:http, #49 universal BigInt,
+  // #53 deploy attachments, #54 checked merge diffs) fixed it.
   contract Exchange(_id, @"abort", @poolId, @txId, ret) = {
     for (@pools <- poolsCh; @bals <- balsCh; @txs <- txCh) {
       match txs.getOrElse(txId, Nil) {
         Nil => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "unknown tx")) }
         e => {
-          match [e.get("status"), e.get("holder") == *_id] {
-            ["aborted", _]      => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("aborted", txId)) }
-            ["committed", _]    => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "already committed")) }
-            ["prepared", false] => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "not holder")) }
-            ["prepared", true]  => {
-              match pools.get(poolId) {
-                p => {
-                  match [e.get("receive"), e.get("toSide")] {
-                    [true, "B"] => {
-                      let @h <- bals.getOrElse(poolId, {}).getOrElse(e.get("holder"), {"a": 0, "b": 0}) in {
-                        poolsCh!(pools.set(poolId, p.set("reserveB", p.get("reserveB") + e.get("out")))) |
-                        balsCh!(bals.set(poolId, bals.getOrElse(poolId, {}).set(e.get("holder"), h.set("b", h.get("b") - e.get("out")))))
+          match e.get("status") {
+            "aborted"   => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("aborted", txId)) }
+            "committed" => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "already committed")) }
+            "prepared"  => {
+              new bret in {
+                blockData!(*bret) |
+                for (@bn, @ts, @s <- bret) {
+                  match [e.get("holder") == *_id, bn >= e.get("expiryBlock")] {
+                    [false, false] => { poolsCh!(pools) | balsCh!(bals) | txCh!(txs) | ret!(("exchange-error", "not holder; not yet expired")) }
+                    _ => {
+                      match pools.get(poolId) {
+                        p => {
+                          match [e.get("receive"), e.get("toSide")] {
+                            [true, "B"] => {
+                              let @h <- bals.getOrElse(poolId, {}).getOrElse(e.get("holder"), {"a": 0, "b": 0}) in {
+                                poolsCh!(pools.set(poolId, p.set("reserveB", p.get("reserveB") + e.get("out")))) |
+                                balsCh!(bals.set(poolId, bals.getOrElse(poolId, {}).set(e.get("holder"), h.set("b", h.get("b") - e.get("out")))))
+                              }
+                            }
+                            [true, "A"] => {
+                              let @h <- bals.getOrElse(poolId, {}).getOrElse(e.get("holder"), {"a": 0, "b": 0}) in {
+                                poolsCh!(pools.set(poolId, p.set("reserveA", p.get("reserveA") + e.get("out")))) |
+                                balsCh!(bals.set(poolId, bals.getOrElse(poolId, {}).set(e.get("holder"), h.set("a", h.get("a") - e.get("out")))))
+                              }
+                            }
+                            [_, "B"] => {
+                              let @h <- bals.getOrElse(poolId, {}).getOrElse(e.get("holder"), {"a": 0, "b": 0}) in {
+                                poolsCh!(pools.set(poolId, p.set("reserveA", p.get("reserveA") - e.get("amount")).set("reserveB", p.get("reserveB") + e.get("out")))) |
+                                balsCh!(bals.set(poolId, bals.getOrElse(poolId, {}).set(e.get("holder"), h.set("a", h.get("a") + e.get("amount")).set("b", h.get("b") - e.get("out")))))
+                              }
+                            }
+                            [_, "A"] => {
+                              let @h <- bals.getOrElse(poolId, {}).getOrElse(e.get("holder"), {"a": 0, "b": 0}) in {
+                                poolsCh!(pools.set(poolId, p.set("reserveB", p.get("reserveB") - e.get("amount")).set("reserveA", p.get("reserveA") + e.get("out")))) |
+                                balsCh!(bals.set(poolId, bals.getOrElse(poolId, {}).set(e.get("holder"), h.set("b", h.get("b") + e.get("amount")).set("a", h.get("a") - e.get("out")))))
+                              }
+                            }
+                          } |
+                          txCh!(txs.set(txId, e.set("status", "aborted"))) |
+                          ret!(("aborted", txId))
+                        }
                       }
                     }
-                    [true, "A"] => {
-                      let @h <- bals.getOrElse(poolId, {}).getOrElse(e.get("holder"), {"a": 0, "b": 0}) in {
-                        poolsCh!(pools.set(poolId, p.set("reserveA", p.get("reserveA") + e.get("out")))) |
-                        balsCh!(bals.set(poolId, bals.getOrElse(poolId, {}).set(e.get("holder"), h.set("a", h.get("a") - e.get("out")))))
-                      }
-                    }
-                    [_, "B"] => {
-                      let @h <- bals.getOrElse(poolId, {}).getOrElse(e.get("holder"), {"a": 0, "b": 0}) in {
-                        poolsCh!(pools.set(poolId, p.set("reserveA", p.get("reserveA") - e.get("amount")).set("reserveB", p.get("reserveB") + e.get("out")))) |
-                        balsCh!(bals.set(poolId, bals.getOrElse(poolId, {}).set(e.get("holder"), h.set("a", h.get("a") + e.get("amount")).set("b", h.get("b") - e.get("out")))))
-                      }
-                    }
-                    [_, "A"] => {
-                      let @h <- bals.getOrElse(poolId, {}).getOrElse(e.get("holder"), {"a": 0, "b": 0}) in {
-                        poolsCh!(pools.set(poolId, p.set("reserveB", p.get("reserveB") - e.get("amount")).set("reserveA", p.get("reserveA") + e.get("out")))) |
-                        balsCh!(bals.set(poolId, bals.getOrElse(poolId, {}).set(e.get("holder"), h.set("b", h.get("b") + e.get("amount")).set("a", h.get("a") - e.get("out")))))
-                      }
-                    }
-                  } |
-                  txCh!(txs.set(txId, e.set("status", "aborted"))) |
-                  ret!(("aborted", txId))
+                  }
                 }
               }
             }
@@ -558,11 +561,11 @@ export function selftest() {
   ok("every `<- txCh` block restores txCh", restores("txs", "txCh"));
   ok("never touches revVault", !/revVault|rho:rchain:revVault/.test(EXCHANGE_RHO));
   ok("all fourteen verbs defined", VERBS.every((v) => EXCHANGE_RHO.includes(`@"${v}"`)));
-  // The doc comment above `abort` explains the gap in prose; the check is
-  // that nothing actually *binds* the URN (a backtick-quoted powerbox name).
-  ok("never binds rho:block:data (verified broken on this rnode build's signed-deploy path)",
-     !EXCHANGE_RHO.includes("\\`rho:block:data\\`"));
-  ok("abort is holder-gated", /"abort", @poolId, @txId, ret\) = \{[\s\S]*?e\.get\("holder"\) == \*_id/.test(EXCHANGE_RHO));
+  ok("binds rho:block:data for abort's expiry check", EXCHANGE_RHO.includes("blockData(`rho:block:data`)"));
+  ok("abort is holder-or-expired-gated",
+     /"abort", @poolId, @txId, ret\) = \{[\s\S]*?e\.get\("holder"\) == \*_id, bn >= e\.get\("expiryBlock"\)/.test(EXCHANGE_RHO));
+  ok("abort denies a non-holder before expiry",
+     /\[false, false\] => \{[\s\S]*?"not holder; not yet expired"/.test(EXCHANGE_RHO));
 
   const inst = installProgram();
   ok("install is balanced", balanced(inst));

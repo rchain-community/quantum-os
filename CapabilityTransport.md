@@ -106,20 +106,23 @@ Two shapes:
   crashed client's own key reconnects to and recovers from
   (`packages/browser/src/exchange-2pc.ts`'s `decideRecovery` is the pure
   decision table). **Verified end to end against localnet** — happy path,
-  and the abort path (a rejected `prepareReceive` unwinds the prepared leg
-  exactly). A quantum-os `/note` currency reaches a pool as its token
-  contract's URI; the platform token participates only wrapped (below).
-  - **Known gap** ([quantum-os#198](https://github.com/rchain-community/quantum-os/issues/198)):
-    `abort` is **self-only** in this version. A permissionless
-    after-expiry path is designed — `expiryBlock` is recorded on every tx —
-    but not implemented: verified empirically (2026-09-11, `bin/rnode` 0.1.0)
-    that reading `rho:block:data` from a *signed deploy* breaks this build's
+  the abort path (a rejected `prepareReceive` unwinds the prepared leg
+  exactly), and the permissionless-after-expiry abort below. A quantum-os
+  `/note` currency reaches a pool as its token contract's URI; the platform
+  token participates only wrapped (below).
+  - **`abort` is holder-or-expired-gated**
+    ([quantum-os#198](https://github.com/rchain-community/quantum-os/issues/198),
+    shipped 2026-09-15): the tx's own holder may always abort a prepared tx;
+    anyone else may once the current block number passes the tx's recorded
+    `expiryBlock`, so a trade abandoned by a lost/gone key is not locked
+    forever. The `abort` contract reads `rho:block:data` to check this. That
+    used to be blocked — verified empirically (2026-09-11, `bin/rnode` 0.1.0)
+    that reading `rho:block:data` from a *signed deploy* broke that build's
     `return`/registry-readback mechanism, reproduced down to the simplest
     possible program (a bare block-data read + `return!`), with a clean
-    "Success!" and no rholang error either. Exploratory (unsigned) reads of
-    `rho:block:data` work fine; it is specifically the deploy path. Until
-    that is root-caused, a trade abandoned by its own key stays `prepared` —
-    locked, not lost, recoverable whenever that key reappears.
+    "Success!" and no rholang error either — but does not reproduce as of
+    rchain-rust `dev` `9e667e203` (re-verified 2026-09-14, twice, against a
+    fresh devnet); not bisected which upstream change fixed it.
 - **Bilateral escrow** (`qucalc/examples/shard_exchange.rho`, rchain-rust#34):
   an escrow on each shard, pre-funded, fixed rate; a send `deposit`s locally
   and `consume`s the remote one through a remote invoke. Still

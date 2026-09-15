@@ -16,13 +16,13 @@
 /// needs no counterparty coordination: reconnect with the same key, read
 /// stateOf on both legs, and `decideRecovery` says what is left to do.
 ///
-/// Known gap (quantum-os#198; see rholang-exchange.js and
-/// CapabilityTransport.md): `abort` is self-only in this version — there is
-/// no on-chain permissionless timeout, because reading rho:block:data from
-/// a signed deploy breaks this rnode build's return-value readback
-/// (verified empirically). So a trade abandoned by its own key stays
-/// "prepared" — locked, not lost — until that key reappears and runs the
-/// recovery decision below.
+/// `abort` is holder-or-expired-gated (quantum-os#198, shipped; see
+/// rholang-exchange.js and CapabilityTransport.md): the tx's own holder can
+/// always abort, as `decideRecovery` below drives; ANYONE else can too once
+/// the current block passes the tx's recorded `expiryBlock`, an on-chain
+/// permissionless timeout for a trade whose key is gone for good — reading
+/// rho:block:data from a signed deploy no longer breaks the return-value
+/// readback on the current rnode build.
 
 /** A tx leg's status, as read from `stateOf`. "unknown" covers both a txId
  *  that was never prepared and one whose exchange couldn't be reached. */

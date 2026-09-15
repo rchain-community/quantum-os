@@ -562,11 +562,9 @@ ${seats.join(" |\n")} |
   // A cross-shard trade is prepare (local) + prepareReceive (the linked
   // remote pool, over a Layer-1 remote signed deploy) + commit both, or
   // abort the one leg that ran. See rholang-exchange.js's header comment and
-  // CapabilityTransport.md for the protocol and its one known gap: abort is
-  // self-only in this version (the on-chain permissionless-after-expiry path
-  // is designed — expiryBlock is recorded — but not implemented, because
-  // rho:block:data does not compose with a signed deploy's return-value
-  // readback on this rnode build, verified empirically).
+  // CapabilityTransport.md for the protocol. abort is holder-or-expired-gated
+  // (quantum-os#198, shipped): the tx's own holder can always abort; anyone
+  // else can too once the current block passes expiryBlock.
   xprepare: {
     help: "Local leg of a cross-shard trade: swap now, hold a reversible tx record. Args: exchangeUri, poolId, txId, fromSide, amount, expiryBlock.",
     write: true,
@@ -586,7 +584,7 @@ ${seats.join(" |\n")} |
     expand: (a) => xCommitProgram(a.exchange, a.tx),
   },
   xabort: {
-    help: "Reverse a prepared tx exactly (idempotent; self only in this version — see help text on prepare/receive). Args: exchangeUri, poolId, txId.",
+    help: "Reverse a prepared tx exactly (idempotent). The tx's own holder can always abort; anyone else can once the block passes expiryBlock. Args: exchangeUri, poolId, txId.",
     write: true,
     argSpec: [["exchange", "cap"], ["pool", "string"], ["tx", "string"]],
     expand: (a) => xAbortProgram(a.exchange, a.pool, a.tx),
