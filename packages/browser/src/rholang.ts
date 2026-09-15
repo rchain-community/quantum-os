@@ -752,12 +752,23 @@ export async function deployTerm(cfg: NodeConfig, term: string): Promise<DeployO
   if (!cfg.key) {
     return { ok: false, message: "no deploy key — /rholang key generate, or /rholang key <hex>" };
   }
-  const status = await nodeStatus(cfg).catch(() => ({} as NodeStatus));
+  const [status, priorRecord] = await Promise.all([
+    nodeStatus(cfg).catch(() => ({} as NodeStatus)),
+    readResultRecord(cfg).catch(() => ({ nonce: null as number | null, value: null as string | null })),
+  ]);
   // The answer goes to this key's registry slot, which only this key can write
   // to. The nonce has to advance on every write there, so it is kept beside the
-  // key rather than guessed; a refused insert means it is behind, and
-  // `syncResultNonce` reads the slot to catch it up.
-  const nonce = cfg.resultNonce ?? 1;
+  // key rather than guessed — but the slot is the truth, not the counter: this
+  // same devnet deployer key is meant to be shared (scripts/localnet/README.md),
+  // so another browser or a script deploying between two of your deploys moves
+  // the slot's nonce out from under a purely-local count, without touching it.
+  // A deploy at a nonce the slot has already passed is silently refused — no
+  // rholang error, "Success!" all the same — and readResultsFresh below would
+  // then report whatever is *already* sitting there (someone else's value) as
+  // if this deploy had just written it. Taking the max with the slot's own
+  // nonce+1 (what `/rholang nonce` does by hand) closes that window instead of
+  // requiring it as a manual recovery step.
+  const nonce = Math.max(cfg.resultNonce ?? 1, (priorRecord.nonce ?? 0) + 1);
   // Persist the node's own shard alongside the nonce bump, so a corrected
   // mismatch (below) sticks — the /rholang status warning stops nagging
   // after the first successful deploy instead of every one.
