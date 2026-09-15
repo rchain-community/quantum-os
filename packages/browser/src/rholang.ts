@@ -758,7 +758,10 @@ export async function deployTerm(cfg: NodeConfig, term: string): Promise<DeployO
   // key rather than guessed; a refused insert means it is behind, and
   // `syncResultNonce` reads the slot to catch it up.
   const nonce = cfg.resultNonce ?? 1;
-  saveConfig({ ...cfg, resultNonce: nonce + 1 });
+  // Persist the node's own shard alongside the nonce bump, so a corrected
+  // mismatch (below) sticks — the /rholang status warning stops nagging
+  // after the first successful deploy instead of every one.
+  saveConfig({ ...cfg, resultNonce: nonce + 1, shard: status.shardId || cfg.shard });
   const data: DeployData = {
     term: wrapProgram(term, "deploy", nonce),
     timestamp: Date.now(),
@@ -767,7 +770,12 @@ export async function deployTerm(cfg: NodeConfig, term: string): Promise<DeployO
     // A deploy is valid only after a block rnode already has; the current
     // height is always safe, and 0 (genesis) is the floor.
     validAfterBlockNumber: Math.max(0, (status.latestBlockNumber ?? 0) - 1),
-    shardId: cfg.shard,
+    // The node's own answer wins over the persisted config: a shard's name is
+    // whatever the node currently reports it as (e.g. rnode grew a leading
+    // "/" on shardId between builds), and a stale cfg.shard otherwise gets a
+    // deploy refused outright ("shardId 'root' is not a member of this
+    // node's shards: [/root]") — the same fallback deployToNode already uses.
+    shardId: status.shardId || cfg.shard,
   };
   const { deployer, signature } = signDeployData(data, cfg.key);
   const reply = await postJson(cfg, "/api/deploy", {
