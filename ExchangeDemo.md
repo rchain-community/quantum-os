@@ -128,7 +128,7 @@ the operator, the pool holds no ambient authority, the rate is fixed at deploy
 | `prepare(txId, fromSide, amount, expiryBlock)` | anyone | **local leg** of a cross-shard trade: swap now, hold a reversible tx record |
 | `prepareReceive(txId, side, amount, expiryBlock, link)` | anyone | **remote leg**: credit `amount` as if deposited, swap it, hold a reversible record — gated to a registered `link` |
 | `commit(txId)` | the tx's own holder | finalize a prepared tx (idempotent) |
-| `abort(txId)` | the tx's own holder | reverse a prepared tx exactly (idempotent; self-only — see §7) |
+| `abort(txId)` | the tx's own holder, or anyone once `expiryBlock` has passed | reverse a prepared tx exactly (idempotent — see §7) |
 | `stateOf(txId)` | anyone (read) | a tx's status — the recovery primitive |
 
 Thirteen of these fourteen have a `$x*` macro (`$xopen` `$xprovide`
@@ -365,18 +365,34 @@ recovery table ([`exchange-2pc.ts`](https://github.com/rchain-community/quantum-
 for the curious): both
 `prepared` → finish committing both; one `prepared`, the other never
 happened → abort the one that ran; either side already `committed` → finish
-the other (idempotent). This is why **`commit`/`abort` are gated to the tx's
-own holder** rather than open to anyone — the same identity drives both legs
-and can always finish the job.
+the other (idempotent). This is why **`commit` stays gated to the tx's own
+holder** — only the identity that drove both legs can finish the job.
 
-> **Known gap — `abort` is self-only in this version** ([#198](https://github.com/rchain-community/quantum-os/issues/198)). A permissionless
-> after-expiry path is designed (`expiryBlock` is recorded on every tx) but
-> not implemented: verified empirically that reading `rho:block:data` from a
-> *signed deploy* breaks this rnode build's return-value readback — even for
-> the simplest possible program, with no rholang error either. So a trade
-> abandoned by its own key (lost seed, browser gone for good) stays
-> `prepared` — locked, not lost, recoverable only by that same key
-> reappearing. See `CapabilityTransport.md`.
+**`abort` is holder-or-expired-gated** ([#198](https://github.com/rchain-community/quantum-os/issues/198),
+shipped). Bob can always abort his own prepared tx, as above. But if Bob's
+key is lost or his browser is gone for good, the tx doesn't stay `prepared`
+forever — once the current block number passes the `expiryBlock` Bob himself
+set at `$xprepare` time, *anyone* can abort it:
+
+```
+Carol ▸ $xabort(rho:id:9xm7c…, "ALICE-BOB", "t42")
+        ✓ → ("exchange-error", "not holder; not yet expired")   (before expiry)
+
+        … blocks pass …
+
+Carol ▸ $xabort(rho:id:9xm7c…, "ALICE-BOB", "t42")
+        ✓ → ("aborted", "t42")   (after expiry — reserves and Bob's balance revert exactly)
+```
+
+The `abort` contract reads `rho:block:data` to make this check — the same
+URN that used to silently break signed-deploy readback on the shipped rnode
+build (reproduced down to the simplest possible program: a bare block-data
+read + `return!`, a clean "Success!", no value ever reaching the registry
+slot). That no longer reproduces on rchain-rust `dev` `9e667e203`; not
+bisected which upstream change fixed it. Verified end to end against
+localnet: a non-holder refused before expiry, the same non-holder succeeding
+after it, and reserves landing back exactly where they started. See
+`CapabilityTransport.md`.
 
 **Why `prepareReceive` trusts a link, not a proof.** Shard B cannot read
 shard A's state directly — that is the reason two-phase commit exists at
@@ -431,9 +447,10 @@ agnostic: it moves messages to whatever `token` URI you name.
   commit means either both legs settle or the prepared one reverts exactly —
   never a state where value is lost or a party is shorted — but it is still
   two transactions with a window between them, not one.
-- **`abort` is self-only in this version** — no on-chain permissionless
-  timeout (§7's known gap). A trade abandoned by its own key stays locked,
-  not lost, until that key returns.
+- **`abort` is holder-or-expired-gated** (§7) — the tx's own holder can
+  always abort it; anyone else only once `expiryBlock` has passed. A trade
+  abandoned before its expiry stays locked, not lost, until either the
+  holder returns or that block passes.
 - **`prepareReceive` trusts a `link`, not a cryptographic proof** — sound
   because linked pools share an operator, not because it's verified (§7).
 - **A wrapped token is only as good as its issuer's `$wrelease`** — the same
@@ -459,9 +476,7 @@ agnostic: it moves messages to whatever `token` URI you name.
 Multi-hop routing past two pools, an AMM-style rate curve, a
 `KnownCurrency` field so a `/note` currency remembers where it trades,
 holder-to-holder transfer of in-pool balances (already tracked,
-[#202](https://github.com/rchain-community/quantum-os/issues/202)), the
-on-chain permissionless-after-expiry `abort` (§7's known gap —
-[already tracked, #198](https://github.com/rchain-community/quantum-os/issues/198)) —
+[#202](https://github.com/rchain-community/quantum-os/issues/202)) —
 none of this is closed. **[Open an issue →](https://github.com/rchain-community/quantum-os/issues/new)**
 and say what you hit or what you'd want; that's exactly how this exchange
 went from a single pool to atomic federation, wrapped native tokens, and
