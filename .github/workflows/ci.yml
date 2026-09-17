@@ -110,3 +110,15 @@ jobs:
       # qucalc_search.py so the TS port cannot silently drift.
       - name: QuCalc search test
         run: node packages/browser/test/qucalc-search.test.mjs
+
+  docs:
+    name: Document network
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # The docs are a network with README.md as its hub (quantum-os#116). This
+      # fails on an orphaned root/docs .md, a dead relative link, or a #anchor
+      # that names no heading — seconds, no dependencies.
+      - name: Check the document network
+        run: python3 scripts/doc_network_check.py

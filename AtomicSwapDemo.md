@@ -263,7 +263,7 @@ See [**MultisigDemo.md**](MultisigDemo.md) for a 2-of-2 walkthrough using `/dync
 
 ## Related
 
-- [README § `/rdv`](README.md#rdv-sub-direct) — full command reference
+- [Commands § `/rdv`](docs/commands.md#rdv-sub-direct) — full command reference
 - [`packages/browser/src/rendezvous.ts`](packages/browser/src/rendezvous.ts) — `Proposal`, `Row`, `CommitRow`, `conservationCheck`, `cyclicSwap`, `newProposalId`
 - [`packages/browser/src/app.ts`](packages/browser/src/app.ts) — dispatcher case `rdv`, inbound `rdv-*` handlers, lock/unlock helpers
 - [PromissoryNoteDemo.md](PromissoryNoteDemo.md) — bearer notes as ZFA twist sequences; `/note declare`/`grant`/`pass`/`redeem`

@@ -372,7 +372,7 @@ ARISTOTLE TYPES:  /id
 
 The Dijkstra ordering rule is the *classical* fix for circular wait. It works, and the demo above uses it. But it works by carefully sequencing two unilateral actions — request, then receive — and adding a global ordering rule on top to ensure the sequence cannot form a cycle. The reasoning is operational, not algebraic.
 
-The [rendezvous primitive](README.md#rdv-sub-direct) gives the same problem an algebraic frame:
+The [rendezvous primitive](docs/commands.md#rdv-sub-direct) gives the same problem an algebraic frame:
 
 > Eating is not "acquire fork-L, then acquire fork-R, then put them down." Eating is **a single composite event** over three participants — the philosopher and the two fork-holders — that either commits as a whole or not at all.
 
@@ -479,7 +479,7 @@ The [rendezvous lens (Step 7)](#step-7--the-rendezvous-lens-atomic-acquisition-a
 
 - [SyllogismDemo.md](SyllogismDemo.md) — the same `/lemma` and `/qucalc` system used for logical deduction
 - [PromissoryNoteDemo.md](PromissoryNoteDemo.md) — bearer notes as ZFA twist sequences; `/note declare` → `/note grant` → `/note pass` → `/note redeem` with receipt
-- [README § `/rdv`](README.md#rdv-sub-direct) — n-party atomic rendezvous; current MVP exposes 2-party value swap
+- [Commands § `/rdv`](docs/commands.md#rdv-sub-direct) — n-party atomic rendezvous; current MVP exposes 2-party value swap
 - [`packages/browser/src/rendezvous.ts`](packages/browser/src/rendezvous.ts) — protocol module: `Proposal`, `Row`, `CommitRow`, `conservationCheck`, `cyclicSwap`
 - [SECURITY.md § no consensus](SECURITY.md#the-shared-root-no-consensus) — why best-effort atomicity is the right primary mitigation only in some places, and where a consensus mechanism would be needed instead
 

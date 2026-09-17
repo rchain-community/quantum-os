@@ -58,7 +58,7 @@ quantum-os/
 │   │       └── room.ts     Room — peer membership, broadcast helpers
 │   └── zfa-core-wasm/      wasm-pack output (generated — do not edit)
 ├── scripts/                Utility scripts
-├── docs/                   CLAUDE.md overflow — connection.md, rholang.md
+├── docs/                   architecture.md (engineering parent), commands.md (full slash-command reference), connection.md, rholang.md
 ├── .github/workflows/
 │   ├── ci.yml              Rust tests + WASM build + TS typecheck on every push/PR
 │   └── pages.yml           Build + deploy to GitHub Pages on every push to main
@@ -521,9 +521,32 @@ so the two do not drift.
 On every push/PR to `main`:
 1. `cargo test --workspace` — Rust unit tests
 2. `pnpm build:wasm` + `pnpm build:signaling` + `tsc --noEmit` — WASM build and TS typecheck
+3. the plain-JS `--selftest`s and `packages/browser/test/*.test.mjs` (see the `wasm` job)
+4. `python3 scripts/doc_network_check.py` — the document network (below)
 
 Check CI: `gh run list --limit 5`
 On failure: `gh run view <run-id> --log-failed`
+
+### Documentation PRs
+
+The docs are a **network**, and the root `README.md` is its hub, not its index (quantum-os#116).
+`README.md` routes by intent ("Choose your path") and keeps only what every reader needs;
+the engineering parent is `docs/architecture.md`, the full command reference is
+`docs/commands.md`, and every other doc hangs off one of those, the User Guide, or the
+Developer Guide. `python3 scripts/doc_network_check.py` runs in CI and fails on an orphaned
+root/`docs/` `.md`, a dead relative link, or a `#anchor` that names no heading — so run it
+before pushing a doc change. Then the review questions, for any new or moved page:
+
+- **Does it have a clear parent?** One doc links to it *by intent* (a row in the README's
+  routing table, or a section of the parent that says why you'd read it) — not just a bare
+  mention.
+- **Does it link out to its dependencies?** A claim of a proof or a security property is
+  followed by a hard relative link to the exact `.md` / `.lean` / source file.
+- **Is it running code or a design?** A design that is not implemented goes in the README's
+  *Roadmap* table with its issue, and says so in its own first lines — never in a section
+  that reads as shipped.
+- **Did the README get longer?** It should not. A new feature adds a row to an existing table
+  or a line to a sub-document; the reference material lives in `docs/`.
 
 ---
 
