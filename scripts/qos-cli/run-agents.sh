@@ -6,7 +6,8 @@
 #
 #   bash run-agents.sh [room-cap-or-url] [role ...]
 #
-# Defaults: the public room + facilitator, WITH the test-REV faucet active
+# Defaults: the public test room (the one MyRoom.md links — cap:room:0521…4721,
+# also used by scribe_poll.sh and selftest.mjs) + facilitator, WITH the test-REV faucet active
 # (--key, from scripts/localnet/pk.txt's devnet deployer — FACIL_KEY= to
 # disable). Stable identity per role under ./.qos-<role>; logs + pids under
 # ./.agents. Stop with ./stop-agents.sh.
@@ -22,12 +23,6 @@
 # is worth a peer. `skeptic` is the only role with `verify` (which predicate a
 # history actually passed) — add it explicitly when you need that and accept the
 # CPU cost:  bash run-agents.sh "$ROOM" facilitator skeptic
-#
-# The `/rholang` macro agent is NOT started here — the browser expands locally,
-# so the agent is only worth a peer when you want the expansion posted into chat
-# for the room to read. Start it by hand if you do:
-#   node rholang-agent.mjs --room <cap> --name rholang
-#
 #
 # The `/rholang` macro agent is NOT started here — the browser expands locally,
 # so the agent is only worth a peer when you want the expansion posted into chat
