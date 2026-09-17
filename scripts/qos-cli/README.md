@@ -216,6 +216,11 @@ node observer.e2e.mjs    # `/observer start … stop` — records a game, materi
 None of these are in the repo's CI (`scripts/qos-cli` is outside the pnpm
 workspace) — run the ones touching what you changed before pushing.
 
+What none of them can see — two real browsers on two real networks, the
+signaling rate limit, the TURN relay — is the live matrix in
+[`../../Live_Testing.md`](../../Live_Testing.md): twelve tests, each naming its
+participants, the script that drives it, and what pass is.
+
 `media-reject.selftest.mjs` drives an inbound offer that carries audio + video
 (what a browser sends when someone starts a call) and asserts the agent answers
 with every media m-line rejected — so werift never spins up an RTP receiver and

@@ -97,6 +97,7 @@ node loopback.mjs           # two werift peers + a data channel, no network
 node -e "import('./zfa.mjs').then(z=>console.log(z.generateCapability('room')))"
 ```
 → more: [scripts/qos-cli/README.md](scripts/qos-cli/README.md).
+With a partner on another network: [Live_Testing.md](Live_Testing.md) — the tests that need two people.
 
 ## Security model
 Holding the room cap **is** authorization; the signaling server is an untrusted relay; data
