@@ -42,6 +42,7 @@ shift || true
 # Default role: facilitator alone — it greets, prompts for names, synthesises,
 # chairs, and carries the memory. Pass roles explicitly to add more, e.g.
 #   bash run-agents.sh "$ROOM" facilitator skeptic
+# `observer` records live games (/observer start … stop) and needs no memory of its own.
 ROLES=("$@"); [ ${#ROLES[@]} -eq 0 ] && ROLES=(facilitator)
 
 # The room's memory rides with the FIRST role rather than running as its own

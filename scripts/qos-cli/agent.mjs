@@ -31,6 +31,7 @@ import { generateCapability, validateCapability, parseTwists,
          achievesZfa, achievesZfaPairwise, signedAction, CENSUS_ADMITTED } from "./zfa.mjs";
 import { newDynCapState, signEnvelope, serializeState, deserializeState } from "./dyncap.mjs";
 import { makeAdvisor } from "./facilitator-advisor.mjs";
+import { createGameRecorder, compactForPrompt, trustWeightsFromGroups } from "./game-log.mjs";
 import { ROLES, DEFAULT_ROLE, resolveRole, dutiesOf } from "./agent-roles.mjs";
 import { trustLevels, discreditedMembers, isMember, groupHasRatings, normalizeGroup, TRUST_MAX } from "./gov.mjs";
 import { MACROS } from "./rholang-macros.mjs";
@@ -51,6 +52,9 @@ Usage:
 Options:
   --room <cap|url>   Room capability token or a quantum-os URL (#room=…). (required)
   --role <r>         Agent role: ${Object.keys(ROLES).join(", ")} (default: ${DEFAULT_ROLE}).
+                     \`observer\` records live games: \`/observer start <label> [payoffs a,b,c,d]
+                     [stag=…] [hare=…] [predict: …]\` … \`/observer stop\` → games/<ts>-<label>.json
+                     (+ .events.jsonl raw); \`/observer summarize\` writes the AI summary (--ai).
   --name <s>         Display name (default: the role name).
   --signal <url>     Signaling server (default: ${DEFAULT_SIGNAL}).
   --state <dir>      State directory (default: ./.qos-agent).
@@ -158,6 +162,7 @@ export async function run(args) {
   const askStripRe = new RegExp(`^/{1,2}(?:${aliasAlt})\\s+ask\\b\\s*`, "i");
   const optStripRe = new RegExp(`^/{1,2}(?:${aliasAlt})\\s+(?:optimize|opt)\\b\\s*`, "i");
   const chairStripRe = new RegExp(`^/{1,2}(?:${aliasAlt})\\s+(?:chair|deliberate)\\b\\s*`, "i");
+  const gameStartStripRe = new RegExp(`^/{1,2}(?:${aliasAlt})\\s+(?:start|record|begin)\\b\\s*`, "i");
   const faucetStripRe = new RegExp(`^/{1,2}(?:${aliasAlt})\\s+faucet\\b\\s*`, "i");
   const bareNameRe = new RegExp(`^(?:${aliasAlt})\\??$`, "i");
   const anyoneHereRe = new RegExp(`\\b(any\\s?(one|body)|${aliasAlt})\\b[^?]*\\b(here|there|around|online|present|listening)\\b\\??`, "i");
@@ -212,6 +217,11 @@ export async function run(args) {
   // ---- identity (stable across restarts), mirroring qos-daemon.mjs ----
   const stateDir = args.state ?? "./.qos-agent";
   const roomHex = roomId.replace(/^cap:room:/, "");
+  // ---- game recorder (the observer's instrument; available to every role) ----
+  // Records every inbound envelope between `/<cmd> start` and `/<cmd> stop` to its own
+  // events file — independent of whether any agent carries the room's memory — then
+  // materializes the structured record. See game-log.mjs.
+  let games = null;   // created once identity/peerNames exist (below)
   const identityPath = path.join(stateDir, "identity.json");
   const peersPath = path.join(stateDir, "rooms", roomHex, "peers.json");
   let identity = readJSON(identityPath, null);
@@ -259,6 +269,13 @@ export async function run(args) {
   const realName = (n) => (typeof n === "string" && n.trim()) ? n.trim() : null;   // "" / blank ⇒ no name
   const nameOf = (id) => realName(peerNames.get(id)) ?? realName(known[id]?.name) ?? short(id);
   const hasName = (id) => !!(realName(peerNames.get(id)) ?? realName(known[id]?.name));
+  games = createGameRecorder({
+    stateDir, roomHex, observer: { peerId: identity.peerId, name: myName }, nameOf,
+    // trust weights from the persisted groups.json if this agent (or a co-located
+    // memory carrier under the same state dir) holds one with ratings; else null
+    weightsProvider: () => trustWeightsFromGroups(path.join(args.persist === "" ? stateDir : (args.persist ?? stateDir), "rooms", roomHex, "groups.json"), trustLevels, groupHasRatings),
+    log: (m) => console.log(`${TAG} ${m}`),
+  });
 
   // ---- chaired deliberation (the single-leader `/<cmd> chair` mode) ----
   // The agent becomes the ONE neutral chair of a structured deliberation and walks the
@@ -406,7 +423,7 @@ export async function run(args) {
 
   const askHint = advisor.enabled ? "" : " (needs --ai)";
   const faucetHint = facilKey ? ` · \`/${CMD} faucet [address]\` (sends ${FAUCET_AMOUNT} TEST REV to a REV address — test systems only)` : "";
-  const helpText = () => `I'm ${myName}, ${role.blurb} Commands: \`/${CMD}\` (am I here?) · \`/${CMD} help\` · \`/${CMD} ask <question>\`${askHint} · \`/${CMD} optimize <problem>\`${askHint} (facilitate an annealing-style optimization round) · \`/${CMD} chair <topic>\`${askHint} (chair a structured deliberation → define · alternatives · evaluate · disagreements · agreements · closure, then record the decision; \`/${CMD} next\`/\`back\`/\`close\`/\`cancel\` to steer) · \`/${CMD} list [n]\` (the room's screen history, oldest→newest — default 25, max 500) · \`/${CMD} trust\` (my standing) · \`/${CMD} health\` (uptime, peers, budget, CPU) · \`/${CMD} off\` / \`/${CMD} on\` (mute/unmute)${faucetHint}. I'm a full member — \`/gov trust\` me up or \`/gov censure\` me down. About this room (and how to make your own): ${ABOUT_URL}`;
+  const helpText = () => `I'm ${myName}, ${role.blurb} Commands: \`/${CMD}\` (am I here?) · \`/${CMD} help\` · \`/${CMD} ask <question>\`${askHint} · \`/${CMD} optimize <problem>\`${askHint} (facilitate an annealing-style optimization round) · \`/${CMD} chair <topic>\`${askHint} (chair a structured deliberation → define · alternatives · evaluate · disagreements · agreements · closure, then record the decision; \`/${CMD} next\`/\`back\`/\`close\`/\`cancel\` to steer) · \`/${CMD} start <label> [payoffs a,b,c,d] [stag=…] [hare=…] [predict: …]\` / \`/${CMD} stop\` (record a live game: every poll, estimate, lemma and message, timestamped and signed → a structured record; \`/${CMD} games\`, \`/${CMD} summarize\`${askHint}, \`/${CMD} publish\`) · \`/${CMD} list [n]\` (the room's screen history, oldest→newest — default 25, max 500) · \`/${CMD} trust\` (my standing) · \`/${CMD} health\` (uptime, peers, budget, CPU) · \`/${CMD} off\` / \`/${CMD} on\` (mute/unmute)${faucetHint}. I'm a full member — \`/gov trust\` me up or \`/gov censure\` me down. About this room (and how to make your own): ${ABOUT_URL}`;
   const statusText = () => `👋 Yes, I'm here — ${myName} (${role.name})${muted ? ` — currently muted (\`/${CMD} on\` to wake me)` : ""}.${standing.governed ? ` Trust ${standing.level}${standing.discredited ? " — stood down" : ` (≤${standing.budget}/5min)`}.` : ""} \`/${CMD} help\` · \`/${CMD} trust\`.`;
   const introText = () => `Hi — I'm ${myName}, ${role.blurb} Say \`/${CMD}\` or \`/${CMD} help\` to reach me${advisor.enabled ? `, or \`/${CMD} ask <q>\` to ask me anything` : ""}. I'm a full room member — \`/gov trust\`/\`/gov censure\` me; \`/${CMD} trust\` shows my standing. About this room: ${ABOUT_URL}`;
   // Self-introduce to a newly-identified human peer, once per peer per run (direct
@@ -485,6 +502,67 @@ export async function run(args) {
     cooldown.set("optimize", Date.now());
     const text = await advisor.advise("optimize", { problem, transcript: recentMsgs.slice(-16).map((mm) => ({ name: mm.name, text: mm.text })) });
     reply(text || `Hmm, I couldn't frame that one. Try \`/${CMD} optimize <objective + constraints>\`.`, null, 0);
+  }
+
+  // ---- game recording (`/<cmd> start … | stop | status | summarize | publish | games`) ----
+  // The observer's commands. Recording is its own: every envelope this peer receives is
+  // appended to the game's events file, so the record does not depend on any other agent.
+  let lastSummary = null;   // { path, text, label }
+  function handleGameStart(raw, fromId, fullText) {
+    if (!raw) { reply(`Start recording a game — \`/${CMD} start <label> [payoffs a,b,c,d] [stag=<option text>] [hare=<option text>] [predict: … ; …]\`. What you type is the pre-registration: it is in the room record, timestamped and signed, before any round is played. \`/${CMD} stop\` when done.`, "gamehelp", 8_000); return; }
+    const r = games.start(raw, { peerId: fromId ?? null, name: fromId ? nameOf(fromId) : null });
+    if (!r.ok) { reply(`Not started — ${r.reason}. \`/${CMD} stop\` first.`, "gamebusy", 8_000); return; }
+    // The start command is the pre-registration: make it the record's first event.
+    games.record(fromId ?? "?", { kind: "chat", text: fullText ?? raw, preregistration: true });
+    const sp = r.game.spec;
+    const bits = [];
+    if (sp.payoffs) {
+      const { a, b, c, d } = sp.payoffs;
+      const pd = a > d ? "S" : (d > a ? "H" : "tie"), rd = (a - c) > (d - b) ? "S" : ((d - b) > (a - c) ? "H" : "tie");
+      const pstar = ((a - c) + (d - b)) !== 0 ? ((d - b) / ((a - c) + (d - b))) : null;
+      bits.push(`payoffs a=${a} b=${b} c=${c} d=${d} → payoff-dominant ${pd}, risk-dominant ${rd}` + (pstar !== null ? `, basin threshold p*=${pstar.toFixed(2)}` : ""));
+    }
+    if (sp.stag || sp.hare) bits.push(`options: stag=${sp.stag ?? "?"} hare=${sp.hare ?? "?"}`);
+    if (sp.predictions.length) bits.push(`pre-registered: ${sp.predictions.map((p, i) => `(${i + 1}) ${p}`).join(" ")}`);
+    reply(`🎯 Recording **${sp.label}**${bits.length ? " — " + bits.join("; ") : ""}. I'm only watching: polls, estimates, lemmas and chat go into the record as they happen. \`/${CMD} stop\` to close it.`, null, 0);
+  }
+  function handleGameStop() {
+    const r = games.stop();
+    if (!r.ok) { reply(`Nothing is being recorded. \`/${CMD} start <label>\` to begin.`, "gamenone", 8_000); return; }
+    const rec = r.record;
+    reply(`🛑 Recorded **${rec.label}**: ${rec.events} events, ${rec.polls.length} poll${rec.polls.length === 1 ? "" : "s"}, ${rec.estimates.length} estimate round${rec.estimates.length === 1 ? "" : "s"}, ${rec.lemmas.length} lemma${rec.lemmas.length === 1 ? "" : "s"}, ${Object.keys(rec.participants).length} participants` +
+      (rec.polls.length ? ` — results: ${rec.polls.map((p) => `“${p.question.slice(0, 40)}” → ${p.tally.winners.join(" | ") || "(no ballots)"}${p.tally.weighted && p.tally.winnersWeighted.join("|") !== p.tally.winners.join("|") ? ` (trust-weighted: ${p.tally.winnersWeighted.join(" | ")})` : ""}`).join("; ")}` : "") +
+      `. Record → \`games/${path.basename(r.game.recordPath)}\`${advisor.enabled ? `; \`/${CMD} summarize\` for the summary` : ""}.`, null, 0);
+  }
+  function gameStatusText() {
+    const g = games.current;
+    if (g) return `🎯 Recording **${g.spec.label}** since ${g.startedAt} — ${g.count} events so far. \`/${CMD} stop\` to close it.`;
+    const idx = games.list();
+    return idx.length ? `Not recording. ${idx.length} game${idx.length === 1 ? "" : "s"} on record (latest: **${idx[idx.length - 1].label}**, ${idx[idx.length - 1].events} events). \`/${CMD} games\` to list, \`/${CMD} start <label>\` to record.` : `Not recording, and no games on record yet. \`/${CMD} start <label>\` to begin.`;
+  }
+  function gamesListText() {
+    const idx = games.list();
+    if (!idx.length) return `No games recorded in this room yet.`;
+    return `📚 Games recorded (${idx.length}):\n` + idx.slice(-20).map((e, i) => `${idx.length - Math.min(20, idx.length) + i + 1}. **${e.label}** ${e.startedAt.slice(0, 16).replace("T", " ")} — ${e.events} events, ${e.polls} polls, ${e.estimates} estimates, ${e.lemmas} lemmas → \`${e.file}\``).join("\n");
+  }
+  async function handleGameSummarize() {
+    if (games.current) { reply(`Still recording **${games.current.spec.label}** — \`/${CMD} stop\` first, then summarize.`, "gamesumbusy", 8_000); return; }
+    const latest = games.loadLatest();
+    if (!latest) { reply(`No recorded game to summarize yet.`, "gamesumnone", 8_000); return; }
+    if (!advisor.enabled) { reply(`I'd need AI mode to write the summary — start me with \`--ai\` (\`--ai-backend claude-code\` for a Claude subscription). The structured record is already on disk: \`${latest.entry.file}\`.`, "gamesumnoai", 20_000); return; }
+    if (!cooled("gamesummary", 10_000)) return;
+    cooldown.set("gamesummary", Date.now());
+    reply(`✍️ Summarizing **${latest.record.label}** (${latest.record.events} events)…`, null, 0);
+    const text = await advisor.advise("gamesummary", { record: compactForPrompt(latest.record) });
+    if (!text) { reply(`Hmm, the summary didn't come back. The record is still on disk: \`${latest.entry.file}\`.`, null, 0); return; }
+    const p = games.writeSummary(latest.record, text);
+    lastSummary = { path: p, text, label: latest.record.label };
+    console.log(`${TAG} game: summary → ${p}`);
+    reply(`📝 Summary of **${latest.record.label}** written → \`${path.basename(p)}\` (not posted). \`/${CMD} publish\` to post it here, so the room can \`/lemma\` it if it stands behind it.`, null, 0);
+  }
+  function handleGamePublish() {
+    if (!lastSummary) { reply(`No summary to publish — \`/${CMD} summarize\` first.`, "gamepubnone", 8_000); return; }
+    reply(`📝 **Game summary — ${lastSummary.label}** (by ${myName}; the record it cites is on file, \`${path.basename(lastSummary.path)}\`)\n${lastSummary.text}`, null, 0);
   }
 
   // Begin a chaired deliberation: the agent becomes the single neutral chair (see the
@@ -678,6 +756,7 @@ export async function run(args) {
       const sub = m[1] ?? "";
       if (sub === "off" || sub === "mute" || sub === "quiet") { muted = true; reply(`Muted — I'll stay quiet. Say \`/${CMD} on\` to bring me back.`, "agmute", 0); return true; }
       if (sub === "on" || sub === "unmute" || sub === "wake") { muted = false; reply(`Back on 👋 — \`/${CMD} help\` for what I do.`, "agmute", 0); return true; }
+      if (role.name === "observer" && (sub === "status" || sub === "here" || sub === "ping" || sub === "")) { reply(gameStatusText(), "agstatus", 3_000); return true; }
       if (sub === "" || sub === "status" || sub === "here" || sub === "ping") return presenceReply();
       if (sub === "trust" || sub === "standing") { reply(standingText(), "agtrust", 15_000); return true; }
       if (sub === "health" || sub === "diag" || sub === "diagnostics") { reply(healthText(), "aghealth", 15_000); return true; }
@@ -690,6 +769,11 @@ export async function run(args) {
       if (sub === "back") { backChair(); return true; }
       if (sub === "close" || sub === "decide") { bg(closeChair(), "chair close"); return true; }
       if (sub === "cancel" || sub === "abort") { cancelChair(); return true; }
+      if (sub === "start" || sub === "record" || sub === "begin") { handleGameStart(raw.replace(gameStartStripRe, "").trim(), fromId, raw); return true; }
+      if (sub === "stop" || sub === "end") { handleGameStop(); return true; }
+      if (sub === "games" || sub === "recorded") { reply(gamesListText(), "aggames", 5_000); return true; }
+      if (sub === "summarize" || sub === "summary") { bg(handleGameSummarize(), "game summarize"); return true; }
+      if (sub === "publish") { handleGamePublish(); return true; }
       reply(helpText(), "aghelp", 15_000); return true;   // `/facil help` and any unknown subcommand
     }
     if (bareNameRe.test(lc) || anyoneHereRe.test(lc)) return presenceReply();
@@ -808,6 +892,7 @@ export async function run(args) {
 
   function onMessage(from, d) {
     if (from === identity.peerId || !d || typeof d !== "object") return;
+    games?.record(from, d);
     if (args.verbose) console.log(`${TAG} ⇐ ${short(from)}… ${JSON.stringify(d).slice(0, 160)}`);
     switch (d.kind) {
       case "name":
@@ -994,7 +1079,7 @@ export async function run(args) {
   peer.connect();
   console.log(`${TAG} running as "${myName}" [role=${role.name}]  budget=${MAX_POSTS}/5min  min-gap=${Math.round(MIN_GAP_MS / 1000)}s  silent=${Math.round(SILENT_MS / 60000)}min  AI=${advisor.enabled ? advisor.model : "off"}. Ctrl-C to stop.`);
 
-  const shutdown = () => { console.log(`\n${TAG} shutting down…`); try { clearInterval(timer); saveIdentity(); saveKnown(); mem?.flush(); } catch {} try { peer.disconnect(); } catch {} setTimeout(() => process.exit(0), 200); };
+  const shutdown = () => { console.log(`\n${TAG} shutting down…`); try { if (games?.current) games.stop(); } catch {} try { clearInterval(timer); saveIdentity(); saveKnown(); mem?.flush(); } catch {} try { peer.disconnect(); } catch {} setTimeout(() => process.exit(0), 200); };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 }

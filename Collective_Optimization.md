@@ -105,6 +105,12 @@ machine-verified, no axioms; the runs in
   trust-weighted scoring and step 5's `/lemma` commitments are *for*: Groves-style alignment devices
   that enlarge the cooperative basin. The prediction is a step function — a device works iff it moves
   the basin threshold across ½ — and the group testing session (#137) is where it meets human data.
+- **Collecting the data.** Run an `observer` agent in the room (`node agent.mjs --role observer …`,
+  [Running agents](scripts/qos-cli/README.md#agents-facilitator-scribe-greeter-)) and bracket the
+  game with `/observer start <label> payoffs a,b,c,d predict: …` … `/observer stop`. It records every
+  poll, ballot, estimate, lemma and message — timestamped and signed — into a structured record, with
+  the pre-registration as the first event, and `/observer summarize` writes the AI reading against
+  those predictions. That is how the group testing session (#137) becomes the first human data point.
 - **What the substrate does on its own** is complementarity, not conflict: in the census's own
   first-closure dynamic the best reply to a strand is its conjugate, like-with-like is the worst
   partner, and a population spontaneously agrees on an axis (a basis choice, threshold `1 + a > 2b`).

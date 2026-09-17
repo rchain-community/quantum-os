@@ -316,10 +316,40 @@ needs a certificate of its own there.
 nudges, dis/agreement synthesis), `scribe` (quietly tracks decisions, offers to
 record them as `/lemma`), `greeter` (welcomes newcomers, helps set a name), and
 `skeptic` (surfaces the unexamined assumption and asks for evidence before the group
-closes — the Room Best Practices Skeptic). Each role picks a default name, a command
-prefix (`/facil`, `/scribe`, `/greeter`, `/skeptic`), an AI persona, and which
+closes — the Room Best Practices Skeptic), and `observer` (records a live game —
+see below — and never steers). Each role picks a default name, a command
+prefix (`/facil`, `/scribe`, `/greeter`, `/skeptic`, `/observer`), an AI persona, and which
 proactive duties it performs. `facilitator.mjs` remains as a
 thin back-compat shim (`--role facilitator`, historical `--state ./.qos-facilitator`).
+
+**Recording a live game (`--role observer`).** An observer is a perspective, not a
+participant: it has no proactive duties, posts nothing unprompted, and answers only
+`/observer …`. Between `/observer start <label> [payoffs a,b,c,d] [stag=<option>]
+[hare=<option>] [predict: …; …]` and `/observer stop` it appends **every envelope it
+receives** — polls with every ballot, estimate rounds, lemmas, chat, `/qlf-action`
+proposals — to its own append-only events file, timestamped on receipt with the sender's
+dyncap signature, then materializes a structured record (`game-log.mjs`):
+
+```
+<state>/rooms/<room>/games/<ts>-<label>.events.jsonl   raw {t, from, msg} — the data, never edited
+<state>/rooms/<room>/games/<ts>-<label>.json           the record: polls (every ballot, raw AND
+                                                       trust-weighted tally), estimates, lemmas,
+                                                       chat, participants with anchors
+<state>/rooms/<room>/games/<ts>-<label>.summary.md     the AI reading (`/observer summarize`, needs --ai;
+                                                       cites the exact event range; `/observer publish`
+                                                       posts it so the room can `/lemma` it)
+<state>/rooms/<room>/games.json                        index
+```
+
+The text of `/observer start` **is the pre-registration**: it becomes the record's first
+event, so predictions are on file, signed by whoever typed them, before any round is
+played. `/observer games` lists what's on record; `/observer status` shows a running
+recording. Recording is the observer's own — it does not depend on any agent carrying the
+room's memory (`--persist`), though the trust-weighted tally uses a persisted `groups.json`
+when one is present under the same state dir. Analysis lives in the QLF repo
+(`game_log_analysis.py`), which scores a record against its pre-registered predictions
+([Game_Theory_QLF](https://github.com/rchain-community/quantum-logical-framework/blob/main/Game_Theory_QLF.md) §7).
+`node observer.e2e.mjs` exercises the whole path against an in-process relay.
 
 **Multiple agents in one room.** Run several with different `--role` (and distinct
 `--state` dirs). They tag their `name` envelope with their role, so they recognize
