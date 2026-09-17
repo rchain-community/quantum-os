@@ -75,6 +75,41 @@ See: **[Group Decisions](Group_Decisions.md)** (the decision toolset) · **[Cons
 (`/probe`) · **[Governance](Governance.md)** (trust-weighting) ·
 **[Room Best Practices](Room_Best_Practices.md)** (running the rounds well).
 
+## What relaxation actually selects — and why step 3 scores the shared objective
+
+This is now a theorem-backed statement, not a metaphor
+([Game_Theory_QLF](https://github.com/rchain-community/quantum-logical-framework/blob/main/Game_Theory_QLF.md);
+[QLF_PotentialGames](https://github.com/rchain-community/quantum-logical-framework/blob/main/lean/QLF_PotentialGames.lean),
+[QLF_EvolutionaryGames](https://github.com/rchain-community/quantum-logical-framework/blob/main/lean/QLF_EvolutionaryGames.lean),
+machine-verified, no axioms; the runs in
+[evolutionary_census.py](https://github.com/rchain-community/quantum-logical-framework/blob/main/evolutionary_census.py)):
+
+- **A room's objective is a game only if it is a potential game.** A decision problem has a free-action
+  functional — the thing the loop relaxes on — iff its payoff changes are path-independent
+  (`free_action_iff_four_cycle`). Under it a Nash equilibrium **is** a ZFA closure (`nash_iff_closure`:
+  zero regret = zero free action), the loop cannot cycle (`Descent.eventually_fixed`), and a pure
+  equilibrium exists (`exists_nash_of_potential`). Pure-conflict objectives (matching pennies) have no
+  functional; the loop cycles, which is the substrate reporting that the problem was posed as conflict.
+- **Relaxation is conservative.** In a coordination problem where the safe convention and the better
+  convention differ (a Stag Hunt), *every* potential orders the two by **risk dominance**
+  (`risk_dominance_is_potential_order`), so relaxation converges on the safe one — measured: annealing
+  reaches the better convention in **0 %** of runs, at any schedule. The annealing schedule chooses *how*
+  the room converges, never *what* it converges on: "the ways to a closure are its basin"
+  (`basins_partition`), and the safe convention has the larger basin.
+- **The remedy is the objective, not the temperature.** Pay everyone the *shared* outcome — score
+  candidates by collective value, `/estimate` on the objective itself, not by private gain — and the
+  game becomes common-interest, a potential game whose potential **is** welfare
+  (`welfare_game_potential`); relaxation then finds the welfare-optimal convention (measured
+  **0 % → 100 %**, and a Prisoner's Dilemma becomes 100 % cooperation). That is what step 3's
+  trust-weighted scoring and step 5's `/lemma` commitments are *for*: Groves-style alignment devices
+  that enlarge the cooperative basin. The prediction is a step function — a device works iff it moves
+  the basin threshold across ½ — and the group testing session (#137) is where it meets human data.
+- **What the substrate does on its own** is complementarity, not conflict: in the census's own
+  first-closure dynamic the best reply to a strand is its conjugate, like-with-like is the worst
+  partner, and a population spontaneously agrees on an axis (a basis choice, threshold `1 + a > 2b`).
+  Consensus, read through the substrate, is **agreeing on a basis**, and conflict is something a
+  question brings with it.
+
 ## Worked example — choosing a sprint plan
 
 1. **Frame:** `/lemma Goal: ship the auth rewrite in 2 weeks; constraint: 2 engineers.`
@@ -154,3 +189,9 @@ round, ask a facilitator in your room: **`/facil optimize <objective + constrain
 - Why there is no instant NP solve (generate vs verify):
   [P_vs_NP_QLF](https://github.com/rchain-community/quantum-logical-framework/blob/main/P_vs_NP_QLF.md) ·
   [QLF_InfoSynthesis](https://github.com/rchain-community/quantum-logical-framework/blob/main/lean/QLF_InfoSynthesis.lean).
+- What relaxation selects (risk dominance), why scoring the shared objective fixes it, and the
+  emergent basis-choice game — game theory from QLF, Rung 10 of
+  [Mathematics_From_QLF](https://github.com/rchain-community/quantum-logical-framework/blob/main/Mathematics_From_QLF.md):
+  [Game_Theory_QLF](https://github.com/rchain-community/quantum-logical-framework/blob/main/Game_Theory_QLF.md) ·
+  [QLF_PotentialGames](https://github.com/rchain-community/quantum-logical-framework/blob/main/lean/QLF_PotentialGames.lean) ·
+  [QLF_EvolutionaryGames](https://github.com/rchain-community/quantum-logical-framework/blob/main/lean/QLF_EvolutionaryGames.lean).
