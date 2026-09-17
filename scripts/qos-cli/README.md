@@ -197,11 +197,24 @@ npm install && node loopback.mjs            # werift↔werift WebRTC round-trip 
 node media-reject.selftest.mjs              # a data-only agent rejects a call's audio/video, keeps the data channel
 node turn-relay.selftest.mjs                # the default-relay auto-fetch (GET /turn) merges, falls back, and never overrides an explicit config
 node werift-patched.selftest.mjs            # RTCCertificate.getFingerprints() is memoized (issue #125) and still returns the right value
+node reap-orphans.selftest.mjs              # QOSPeer._reapOrphans closes the connections werift's missing consent timer would leave burning CPU (no network)
 ```
 
 The loopback test spins an in-process signaling relay and two peers that
 connect and exchange a chat — exercising the full handshake + data channel
 locally (needs `ws` + `werift`).
+
+Two end-to-end tests drive the **real `agent.mjs`** the same way — an
+in-process relay, the agent in a role, and one driver peer that talks to it
+and checks the replies (and, for the observer, the files it writes):
+
+```bash
+node list-cmd.e2e.mjs    # `/scribe list N` — the room's screen history
+node observer.e2e.mjs    # `/observer start … stop` — records a game, materializes the qos-game/1 record + index
+```
+
+None of these are in the repo's CI (`scripts/qos-cli` is outside the pnpm
+workspace) — run the ones touching what you changed before pushing.
 
 `media-reject.selftest.mjs` drives an inbound offer that carries audio + video
 (what a browser sends when someone starts a call) and asserts the agent answers
