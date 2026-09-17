@@ -6,7 +6,8 @@
 #
 #   bash run-agents.sh [room-cap-or-url] [role ...]
 #
-# Defaults: the public room + facilitator, WITH the test-REV faucet active
+# Defaults: the public test room (the one MyRoom.md links — cap:room:0521…4721,
+# also used by scribe_poll.sh and selftest.mjs) + facilitator, WITH the test-REV faucet active
 # (--key, from scripts/localnet/pk.txt's devnet deployer — FACIL_KEY= to
 # disable). Stable identity per role under ./.qos-<role>; logs + pids under
 # ./.agents. Stop with ./stop-agents.sh.
@@ -28,12 +29,6 @@
 # for the room to read. Start it by hand if you do:
 #   node rholang-agent.mjs --room <cap> --name rholang
 #
-#
-# The `/rholang` macro agent is NOT started here — the browser expands locally,
-# so the agent is only worth a peer when you want the expansion posted into chat
-# for the room to read. Start it by hand if you do:
-#   node rholang-agent.mjs --room <cap> --name rholang
-#
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -42,6 +37,7 @@ shift || true
 # Default role: facilitator alone — it greets, prompts for names, synthesises,
 # chairs, and carries the memory. Pass roles explicitly to add more, e.g.
 #   bash run-agents.sh "$ROOM" facilitator skeptic
+# `observer` records live games (/observer start … stop) and needs no memory of its own.
 ROLES=("$@"); [ ${#ROLES[@]} -eq 0 ] && ROLES=(facilitator)
 
 # The room's memory rides with the FIRST role rather than running as its own

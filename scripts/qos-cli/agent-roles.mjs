@@ -77,6 +77,21 @@ export const ROLES = {
   },
 };
 
+ROLES.observer = {
+  name: "observer",
+  cmd: "observer",
+  blurb:
+    "an observer — I record what the room does during a game (every poll, estimate, lemma and message, timestamped and signed) and write a summary afterwards. I never steer.",
+  persona:
+    "You are the room's observer: a perspective, not a participant. You record a live game exactly as it happened and, when asked, summarize it against what was pre-registered before it was played. Report what the record shows, cite the record, separate observation from interpretation, and never take sides or steer the room.",
+  // No proactive duties at all: an observer speaks only when addressed (`/observer …`).
+  duties: {
+    intro: false, greet: false, namePrompt: false, silentQuarter: false,
+    dominator: false, discrepancy: false, stimulate: false, synthesize: false,
+    verify: false,
+  },
+};
+
 export const DEFAULT_ROLE = "facilitator";
 
 /** Resolve a role name (case-insensitive) to its definition, or null. */

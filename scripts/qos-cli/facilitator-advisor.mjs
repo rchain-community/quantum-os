@@ -114,6 +114,19 @@ record a decision of record. Facilitate, never dominate: neutral framing, equal 
 disagreement before converging, and never present your own opinion as the group's. Each reply is short,
 plain, and specific to what was actually said — no preamble, no sign-off.`;
 
+// `/observer summarize` — the reading of a recorded game, against its pre-registration.
+const gameSummaryKnowledge = () => `You are summarizing a recorded game played in a small QuantumOS chat room. You have the
+structured record: the verbatim start command (the pre-registration, made BEFORE any round), the
+payoff structure if one was stated, every poll with every ballot and both the raw and the
+trust-weighted tally, every estimate round, every lemma (a commitment of record), and the chat.
+Write, in Markdown, these sections: **What was posed** (the game as stated; if payoffs a,b,c,d were
+given, name the payoff-dominant and the risk-dominant option — S is risk-dominant iff (a−c) > (d−b)),
+**Rounds** (each poll/estimate in order: who chose what, the result), **Commitments** (lemmas and
+any commitment round), **Outcome**, **Against the pre-registered predictions** (one line per
+prediction: held / killed / not testable from this record, with the evidence), **Notable discussion**
+(quote briefly), **Data caveats** (never-closed polls, unsigned participants, missing ballots). Report
+what the record shows; do not infer motives; do not take sides. Be concrete and brief.`;
+
 const transcriptText = (transcript) =>
   (transcript || []).map((m) => (m.name ? `${m.name}: ${m.text}` : m.text)).join("\n").slice(-3000);
 
@@ -129,6 +142,9 @@ const CHAIR_PHASE_INSTR = {
 
 function userPrompt(mode, ctx) {
   const t = transcriptText(ctx.transcript);
+  if (mode === "gamesummary") {
+    return `Recorded game (structured record, chronological):\n${ctx.record}\n\nWrite the summary.`;
+  }
   if (mode === "chair") {
     const topic = ctx.topic ? ` on "${ctx.topic}"` : "";
     const instr = CHAIR_PHASE_INSTR[ctx.phase] || "Summarize the discussion in one or two sentences.";
@@ -184,6 +200,7 @@ export function makeAdvisor({ ai = false, backend = "api", apiKey = process.env.
     if (mode === "ask") return `${who}\n\n${askKnowledge(cmd, faucetActive)}`;
     if (mode === "optimize") return `${who}\n\n${optimizeKnowledge(cmd)}`;
     if (mode === "chair") return `${who}\n\n${chairKnowledge(cmd)}`;
+    if (mode === "gamesummary") return `${who}\n\n${gameSummaryKnowledge()}`;
     return `${who}\n\n${NUDGE_NORMS}`;
   };
   const apiModel = model || "claude-haiku-4-5-20251001";    // api backend default
@@ -196,15 +213,15 @@ export function makeAdvisor({ ai = false, backend = "api", apiKey = process.env.
     enabled,
     backend,
     model: label,
-    /** mode: "ask" | "stimulate" | "synthesize" | "optimize" | "chair". Returns a short string, or null. */
+    /** mode: "ask" | "stimulate" | "synthesize" | "optimize" | "chair" | "gamesummary". Returns a short string, or null. */
     async advise(mode, ctx) {
       if (!enabled) return null;
       const system = sysFor(mode);
       const prompt = userPrompt(mode, ctx);
-      const max_tokens = mode === "optimize" ? 400 : mode === "chair" ? (ctx?.phase === "closure" ? 400 : 256) : mode === "ask" ? 256 : 160;
+      const max_tokens = mode === "gamesummary" ? 1200 : mode === "optimize" ? 400 : mode === "chair" ? (ctx?.phase === "closure" ? 400 : 256) : mode === "ask" ? 256 : 160;
       let text = null;
       if (backend === "claude-code") {
-        text = await callClaudeCLI({ claudeBin, model: cliModel, system, prompt, log });
+        text = await callClaudeCLI({ claudeBin, model: cliModel, system, prompt, log, timeoutMs: mode === "gamesummary" ? 120_000 : 45_000 });
       } else {
         try {
           const res = await fetch(ANTHROPIC_URL, {
@@ -218,7 +235,7 @@ export function makeAdvisor({ ai = false, backend = "api", apiKey = process.env.
         } catch (e) { log(`[facil] advisor error: ${e?.message ?? e}`); return null; }
       }
       if (!text || (mode !== "chair" && /^NONE\b/i.test(text))) return null;   // chair phases always render (e.g. "no disagreement")
-      return text.slice(0, mode === "optimize" ? 1400 : mode === "chair" ? 1200 : mode === "ask" ? 700 : 400);   // optimize/chair are multi-part; ask a few sentences; nudges terse
+      return text.slice(0, mode === "gamesummary" ? 6000 : mode === "optimize" ? 1400 : mode === "chair" ? 1200 : mode === "ask" ? 700 : 400);   // optimize/chair are multi-part; ask a few sentences; nudges terse
     },
   };
 }
