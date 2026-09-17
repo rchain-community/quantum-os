@@ -86,7 +86,8 @@ machine-verified, no axioms; the runs in
 
 - **A room's objective is a game only if it is a potential game.** A decision problem has a free-action
   functional — the thing the loop relaxes on — iff its payoff changes are path-independent
-  (`free_action_iff_four_cycle`). Under it a Nash equilibrium **is** a ZFA closure (`nash_iff_closure`:
+  (`free_action_iff_four_cycle`, proven at the room's arity in
+  [QLF_NPlayerPotential](https://github.com/rchain-community/quantum-logical-framework/blob/main/lean/QLF_NPlayerPotential.lean)). Under it a Nash equilibrium **is** a ZFA closure (`nash_iff_closure`:
   zero regret = zero free action), the loop cannot cycle (`Descent.eventually_fixed`), and a pure
   equilibrium exists (`exists_nash_of_potential`). Pure-conflict objectives (matching pennies) have no
   functional; the loop cycles, which is the substrate reporting that the problem was posed as conflict.
@@ -194,4 +195,5 @@ round, ask a facilitator in your room: **`/facil optimize <objective + constrain
   [Mathematics_From_QLF](https://github.com/rchain-community/quantum-logical-framework/blob/main/Mathematics_From_QLF.md):
   [Game_Theory_QLF](https://github.com/rchain-community/quantum-logical-framework/blob/main/Game_Theory_QLF.md) ·
   [QLF_PotentialGames](https://github.com/rchain-community/quantum-logical-framework/blob/main/lean/QLF_PotentialGames.lean) ·
-  [QLF_EvolutionaryGames](https://github.com/rchain-community/quantum-logical-framework/blob/main/lean/QLF_EvolutionaryGames.lean).
+  [QLF_EvolutionaryGames](https://github.com/rchain-community/quantum-logical-framework/blob/main/lean/QLF_EvolutionaryGames.lean) ·
+  [QLF_NPlayerPotential](https://github.com/rchain-community/quantum-logical-framework/blob/main/lean/QLF_NPlayerPotential.lean).
