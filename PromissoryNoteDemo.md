@@ -315,13 +315,13 @@ The pass and redeem were direct-to-peer over DTLS — invisible to third parties
 - **Multi-issuer USD.** Two peers in the same room can each `/note declare USD` and produce different bearer authorities. The sidebar will show both (`✦ USD` for the holder, `USD (by Bob)` for the other). Receivers disambiguate by issuer — there is no global "USD" namespace.
 - **Cross-room continuity.** This entire flow is per-room. A receipt minted by Alice in room A is meaningless in room B; each room has its own `knownCurrencies` registry. Cross-room identity would require a separate identity layer (dynamic capabilities — planned).
 - **Unforgeable issuer identity.** A bearer authority token can in principle be stolen via URL leakage, screen recording, or browser-extension exfil — same limit as `/grant`. The planned dynamic-capability layer makes identity a continuously-proven trajectory instead of static bytes; see the discussion in the project history.
-- **Multi-party atomic swap.** This demo shows direct transfer and redemption. For atomic n-party exchanges (e.g. cyclic Alice→Bob→Charlie→Alice), use [`/rdv swap`](README.md#rdv-sub-direct) — the rendezvous primitive enforces `multiset(gives) == multiset(gets)` across all participants in one composite move.
+- **Multi-party atomic swap.** This demo shows direct transfer and redemption. For atomic n-party exchanges (e.g. cyclic Alice→Bob→Charlie→Alice), use [`/rdv swap`](docs/commands.md#rdv-sub-direct) — the rendezvous primitive enforces `multiset(gives) == multiset(gets)` across all participants in one composite move.
 
 ---
 
 ## Related
 
-- [README § `/note`](README.md#note-sub-direct) — full command reference
+- [Commands § `/note`](docs/commands.md#note-sub-direct) — full command reference
 - [`packages/browser/src/notes.ts`](packages/browser/src/notes.ts) — `parseNoteLabel`, `denomination`, `mintNote`, `splitNote`, `mergeNotes`, `mintReceipt`
 - [`packages/browser/src/app.ts`](packages/browser/src/app.ts) — dispatcher case `note`, inbound `note-*` handlers, state stores
 - [SECURITY.md](SECURITY.md) — bearer-note threat model and conservation guarantees

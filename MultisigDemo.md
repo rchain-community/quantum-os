@@ -262,7 +262,7 @@ The trust ceiling is the dyncap ceiling: TOFU at first contact, race conditions 
 
 ## Related
 
-- [README § `/dyncap`](README.md#dyncap-sub) — command reference
+- [Commands § `/dyncap`](docs/commands.md#dyncap-sub) — command reference
 - [`packages/browser/src/dyncap.ts`](packages/browser/src/dyncap.ts) — protocol module: `signEnvelope`, `verifyEnvelope`, `newDynCapState`, anchor / witness derivation
 - [`packages/browser/src/app.ts`](packages/browser/src/app.ts) — `signedBroadcast` / `signedSend` wrappers, `verifyDyncapIfPresent` helper, `/dyncap` dispatcher case
 - [AtomicSwapDemo.md](AtomicSwapDemo.md) — atomic swap protocol walkthrough this builds on

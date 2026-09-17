@@ -58,7 +58,7 @@ quantum-os/
 │   │       └── room.ts     Room — peer membership, broadcast helpers
 │   └── zfa-core-wasm/      wasm-pack output (generated — do not edit)
 ├── scripts/                Utility scripts
-├── docs/                   CLAUDE.md overflow — connection.md, rholang.md
+├── docs/                   architecture.md (engineering parent), commands.md (full slash-command reference), connection.md, rholang.md
 ├── .github/workflows/
 │   ├── ci.yml              Rust tests + WASM build + TS typecheck on every push/PR
 │   └── pages.yml           Build + deploy to GitHub Pages on every push to main
@@ -112,11 +112,11 @@ Pauli closure is not a "stronger condition" layered on top of count balance — 
 
 ### QuCalc Search — "what closes next" from a room position (`/search`, `/solve` — `qucalc-search.ts` + `app.ts`)
 
-**Computed in the browser — quantum-os runs no service for this** (qos#119, supersedes #117's HTTP-client approach). `packages/browser/src/qucalc-enum.ts` enumerates the admissible **next closures** from a QuCalc history — the twist words you can append so the whole thing is a ZFA closure — shortest first, a faithful port of the QLF reference [`qucalc_search.py`](../quantum-logical-framework/qucalc_search.py) ([`QucalcSearch.md`](../quantum-logical-framework/QucalcSearch.md)). The enumeration is cheap (a depth-6 continuation search is ~260k raw candidates, count-prefiltered to a few thousand before any Pauli fold) and runs in a **Web Worker** (`qucalc-worker.ts`) so a depth-7 sweep doesn't hitch the UI. No Render deployment, no HTTP client, no endpoint config, no contract-version pin — **and the `/solve` determinism ("the meeting of minds") is *stronger* for it**: every peer computes the same closure from the same algebra, with nothing to be "up" or "honest". "No server, no trust, just algebra."
+**Computed in the browser — quantum-os runs no service for this** (qos#119, supersedes #117's HTTP-client approach). `packages/browser/src/qucalc-enum.ts` enumerates the admissible **next closures** from a QuCalc history — the twist words you can append so the whole thing is a ZFA closure — shortest first, a faithful port of the QLF reference [`qucalc_search.py`](https://github.com/rchain-community/quantum-logical-framework/blob/main/qucalc_search.py) ([`QucalcSearch.md`](https://github.com/rchain-community/quantum-logical-framework/blob/main/QucalcSearch.md)). The enumeration is cheap (a depth-6 continuation search is ~260k raw candidates, count-prefiltered to a few thousand before any Pauli fold) and runs in a **Web Worker** (`qucalc-worker.ts`) so a depth-7 sweep doesn't hitch the UI. No Render deployment, no HTTP client, no endpoint config, no contract-version pin — **and the `/solve` determinism ("the meeting of minds") is *stronger* for it**: every peer computes the same closure from the same algebra, with nothing to be "up" or "honest". "No server, no trust, just algebra."
 
 **The count-balance gate is QLF's, not quantum-os's.** It is the signed action vector vanishing (`#^=#v ∧ #>=#< ∧ #/=#\ ∧ #+=#−`), matching `qucalc_search.py` — **not** the weaker aggregate `count_pos == count_neg` that `achievesZfa` accepts (`achievesZfa` would admit `^^<<`, which the reference rejects — see the `zfa.ts` header note). `pauliScalarOf` in `zfa.ts` (always pure-TS, so worker and main agree) gives the phase.
 
-**The search is the experiment, not a lookup — it is truth divination** ([`QucalcSearch.md` § "What search and solve are"](../quantum-logical-framework/QucalcSearch.md)). All admissible histories exist *a priori* as pure possibility (QLF possibilism); the enumeration is the generative/experimental act — it asks the substrate *which of them close from here*. Truth in QLF is what closes: a closure receipt, not a standing proposition, and `mode=events` makes that literal — a closure *is* an event, so each branch is reported only at its first closure (the future is un-rendered possibility; the search renders a slice of it). `mode=possibilities` is every closure within `max_depth`.
+**The search is the experiment, not a lookup — it is truth divination** ([`QucalcSearch.md` § "What search and solve are"](https://github.com/rchain-community/quantum-logical-framework/blob/main/QucalcSearch.md)). All admissible histories exist *a priori* as pure possibility (QLF possibilism); the enumeration is the generative/experimental act — it asks the substrate *which of them close from here*. Truth in QLF is what closes: a closure receipt, not a standing proposition, and `mode=events` makes that literal — a closure *is* an event, so each branch is reported only at its first closure (the future is un-rendered possibility; the search renders a slice of it). `mode=possibilities` is every closure within `max_depth`.
 
 **A concurrent search is a meeting of minds.** `/search` with no argument runs one enumeration over *every peer's* `/qlf-action` position (`qc=a,b,c`) with **shared listeners** — peers contribute their positions into the room, the listeners are the room's joint reading, and the search is the room's shared experiment (`QLF_as_Intelligence.md` §8: the room as one distributed synthesis, peers as Markov-blanket sub-agents; `ScientificApproach.md` §2: an apparatus is a closure inventory, an observer only a perspective on it). `capacity:R` listeners give each peer's reach on the *same* census — one possibility structure, heard by horizons of different capacity.
 
@@ -130,7 +130,7 @@ Pauli closure is not a "stronger condition" layered on top of count balance — 
 
 ### QLF alphabet / SU(2)
 
-The 8-twist alphabet is the SU(2) generator set up to sign (SU(2) ≅ unit quaternions; Hurwitz singles out H as the unique non-commutative associative composition real algebra — see QLF [HALF-SPIN-ZFA-EMBEDDING.md §6](../quantum-logical-framework/HALF-SPIN-ZFA-EMBEDDING.md)).
+The 8-twist alphabet is the SU(2) generator set up to sign (SU(2) ≅ unit quaternions; Hurwitz singles out H as the unique non-commutative associative composition real algebra — see QLF [HALF-SPIN-ZFA-EMBEDDING.md §6](https://github.com/rchain-community/quantum-logical-framework/blob/main/HALF-SPIN-ZFA-EMBEDDING.md)).
 
 Both faces are checked uniformly in `crates/zfa-core/src/pauli.rs`, `packages/browser/src/zfa.ts`, and the QLF Python core `twist_core.py`.
 
@@ -521,9 +521,32 @@ so the two do not drift.
 On every push/PR to `main`:
 1. `cargo test --workspace` — Rust unit tests
 2. `pnpm build:wasm` + `pnpm build:signaling` + `tsc --noEmit` — WASM build and TS typecheck
+3. the plain-JS `--selftest`s and `packages/browser/test/*.test.mjs` (see the `wasm` job)
+4. `python3 scripts/doc_network_check.py` — the document network (below)
 
 Check CI: `gh run list --limit 5`
 On failure: `gh run view <run-id> --log-failed`
+
+### Documentation PRs
+
+The docs are a **network**, and the root `README.md` is its hub, not its index (quantum-os#116).
+`README.md` routes by intent ("Choose your path") and keeps only what every reader needs;
+the engineering parent is `docs/architecture.md`, the full command reference is
+`docs/commands.md`, and every other doc hangs off one of those, the User Guide, or the
+Developer Guide. `python3 scripts/doc_network_check.py` runs in CI and fails on an orphaned
+root/`docs/` `.md`, a dead relative link, or a `#anchor` that names no heading — so run it
+before pushing a doc change. Then the review questions, for any new or moved page:
+
+- **Does it have a clear parent?** One doc links to it *by intent* (a row in the README's
+  routing table, or a section of the parent that says why you'd read it) — not just a bare
+  mention.
+- **Does it link out to its dependencies?** A claim of a proof or a security property is
+  followed by a hard relative link to the exact `.md` / `.lean` / source file.
+- **Is it running code or a design?** A design that is not implemented goes in the README's
+  *Roadmap* table with its issue, and says so in its own first lines — never in a section
+  that reads as shipped.
+- **Did the README get longer?** It should not. A new feature adds a row to an existing table
+  or a line to a sub-document; the reference material lives in `docs/`.
 
 ---
 
@@ -598,7 +621,7 @@ In a classical OS, security, scheduling, error correction, and garbage collectio
 
 The QLF math substrate has **active inference built into its foundation**: every admissible state is a free-energy-minimizing trajectory of a Markov-blanket agent, with per-event ΔF = −log 2 saturated by half-spin ZFA closure. The kernel here realises that substrate as an executable system — every capability token, room and closure is a concrete instance of the active-inference math. The runtime ZFA check (`is_zfa = is_count_balanced ∧ is_pauli_closed`, in `crates/zfa-core` and `zfa.ts`) is Lean-anchored in QLF at three layers: count balance under concatenation (`emergent_blanket_formation`), Pauli closure in the abstract scalar group (`pauli_closed_of_admissible_zfa`), and the explicit σ-matrix mapping (`hermitian_pair_is_pauli_scalar`, `concat_pairs_is_pauli_scalar`). QLF's wider programme — the constants-from-substrate derivations (α at 0.026%, m_p/m_e at 0.002%, γ at 0.017%, all Lean-verified), the vacuum-alignment TOE-completing layer, the atomic/nuclear mass spectrum, the Riemann prime-annihilation argument, the Kitada local-time GR scoping — lives in the QLF repo, not here.
 
-See [QLF CLAUDE.md](../quantum-logical-framework/CLAUDE.md) and [AI.md](https://github.com/rchain-community/quantum-logical-framework/blob/main/AI.md) for the full theoretical background.
+See [QLF CLAUDE.md](https://github.com/rchain-community/quantum-logical-framework/blob/main/CLAUDE.md) and [AI.md](https://github.com/rchain-community/quantum-logical-framework/blob/main/AI.md) for the full theoretical background.
 
 ### What NOT to say
 
