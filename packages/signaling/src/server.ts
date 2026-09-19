@@ -283,7 +283,7 @@ export class SignalingServer {
         this.onLeave(msg.roomId, msg.peerId);
         break;
       default:
-        this.send(ws, { type: "error", message: `unknown message type` });
+        this.send(ws, { type: "error", message: `unknown message type: ${msg.type}` });
     }
   }
 

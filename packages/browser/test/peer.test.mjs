@@ -719,6 +719,31 @@ many.disconnect();
   z.disconnect();
 }
 
+// --- which "unknown message type" it is --------------------------------------
+// A server from before the pong rejects our ping: chat is fine, and the error
+// reply is itself the heartbeat. A server from before the relay rejects the
+// data frame: chat is not fine, and it should be said once.
+{
+  const errs = [];
+  const u = new QOSPeer({ signalingUrl: "wss://x", roomId: "cap:room:0246", peerId: "u-me",
+    onSignalingError: (m) => errs.push(m) });
+  await u.connect();
+  FakeWS.last.onopen?.();
+  await tick();
+  const w = FakeWS.last;
+  const err = (message) => w.onmessage?.({ data: JSON.stringify({ type: "error", message }) });
+  err("unknown message type: ping");
+  check("a named rejected ping is not a mismatch", errs.length === 0, JSON.stringify(errs));
+  u.signal({ type: "ping", t: 1 });
+  err("unknown message type");
+  check("an unnamed rejection right after a ping is not a mismatch either", errs.length === 0, JSON.stringify(errs));
+  err("unknown message type: data");
+  err("unknown message type: data");
+  check("a rejected data frame is named as an older server, once",
+        errs.length === 1 && /older build/.test(errs[0]), JSON.stringify(errs));
+  u.disconnect();
+}
+
 check("a peer that left is not dialled", offersTo("aaaa") === goneAt, `${offersTo("aaaa")} vs ${goneAt}`);
 
 Date.now = realNow;
