@@ -66,6 +66,9 @@ test("join, data relay (room + unicast), and relay auth", async () => {
   await sleep(50);
   assert.equal(a.got.filter((m) => m.type === "data").length, 0, "a forged from is not relayed");
 
+  a.send({ type: "ping", t: 42 });
+  assert.deepEqual(await a.next((m) => m.type === "pong"), { type: "pong", t: 42 }, "a ping is answered with its t");
+
   b.send({ type: "leave", roomId: ROOM, peerId: "cap:peer:a" });
   assert.match((await b.next((m) => m.type === "error"))?.message ?? "", /peerId mismatch/);
   await sleep(50);

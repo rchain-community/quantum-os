@@ -9629,6 +9629,9 @@ async function init(): Promise<void> {
   window.addEventListener("pageshow", wakeAllRooms);
   window.addEventListener("focus", wakeAllRooms);
   window.addEventListener("online", wakeAllRooms);
+  // Page Lifecycle: a backgrounded tab on a phone is frozen after a while and
+  // resumed on return — a distinct event from visibility on some builds.
+  document.addEventListener("resume", wakeAllRooms);
   // Closing the tab is a departure; the server must not hold the seat for a
   // person who has gone. Only a socket that *vanishes* (a phone switching
   // apps, a wifi handoff, a lid) is grace-held and resumed — that case fires

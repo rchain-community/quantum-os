@@ -60,6 +60,20 @@ lists them" (or a direct channel); `hasChannel` stays the narrower question a
 call or a file needs, and what `/conn` diagnoses. The `⚠` in the roster
 therefore means "the server no longer lists this peer", which clears itself.
 
+**A socket is trusted only while it is heard from** (`peer.ts` `lastInboundAt`
+/ `suspect`). A phone that switches apps has its TCP dropped by the OS under
+the frozen tab, and on return the WebSocket still reads `OPEN` for minutes —
+`wake()` used to send a `join` into that void and everything typed followed it.
+Now `readyState` is a claim and traffic is the proof: on `wake()` the socket is
+*suspect* until the join's own `peers` reply arrives (outbound waits in the
+outbox meanwhile), and if nothing arrives within `WAKE_PROBE_MS` (4 s) the
+socket is closed and replaced at once — a resume, inside the server's grace.
+In the foreground the same idea runs on a timer: an app-level `ping` (the
+server answers `pong`; a browser cannot send a protocol ping and never sees
+the server's) after `QUIET_MS` (25 s) of silence, and a reconnect after
+`SILENT_MS` (70 s). Any inbound frame at all — even an error — counts.
+`document` `resume` (Page Lifecycle) wakes rooms alongside `visibilitychange`.
+
 Why this shape: before it, N−1 NAT-crossing WebRTC connections had to hold for
 chat to work, every socket blip became a `left`/`joined` and a redial storm
 for the whole room, and the server's logs showed one machine's uplink flapping
