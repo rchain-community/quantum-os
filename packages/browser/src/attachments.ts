@@ -148,9 +148,10 @@ export function createAttachments(host: AttachmentHost): Attachments {
     const mediaKind = mediaKindOf(file.type, file.name);
     const id = `${peer.peerId.slice(-6)}-${Date.now()}-${seq++}`;
     const total = Math.ceil(b64.length / FILE_CHUNK);
-    peer.broadcast({ kind: "file-start", id, name: file.name, mime, size: file.size, total, mediaKind });
+    // Bulk: the WebRTC overlay, never the relay (see peer.ts SendOptions).
+    peer.broadcast({ kind: "file-start", id, name: file.name, mime, size: file.size, total, mediaKind }, { bulk: true });
     for (let i = 0; i < total; i++) {
-      peer.broadcast({ kind: "file-chunk", id, seq: i, data: b64.slice(i * FILE_CHUNK, (i + 1) * FILE_CHUNK) });
+      peer.broadcast({ kind: "file-chunk", id, seq: i, data: b64.slice(i * FILE_CHUNK, (i + 1) * FILE_CHUNK) }, { bulk: true });
       // Every 32 chunks, let the buffers catch up rather than outrunning them.
       if ((i & 31) === 31) await paceSend();
     }

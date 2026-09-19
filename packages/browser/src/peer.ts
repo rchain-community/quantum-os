@@ -1,13 +1,49 @@
 import { generateCapability, validateCapability } from "./zfa.js";
+import { roomIdFor, deriveRoomKey, seal, open } from "./room-crypto.js";
+
+// The shape of the room's transport (the Jitsi-shaped rebuild, 2026-09):
+//
+//   control plane  — every envelope that is not media or bulk (chat, name,
+//                    lemmas, notes, polls, gov, every sync-*) rides the
+//                    signaling WebSocket as a `data` frame, sealed under a key
+//                    derived from the room token (room-crypto.js). One
+//                    connection per person, to a host with a public address,
+//                    over TLS/443 — the one path that crosses every NAT, CGNAT
+//                    and a phone switching apps. The server relays what it
+//                    cannot read and is told only a hash of the token.
+//   membership     — the server's roster, held across a socket blip by its
+//                    grace window (a rejoin under the same peerId is a silent
+//                    resume). A WebRTC connection dying is NOT a departure.
+//   WebRTC         — calls (media cannot be relayed this way) and bulk
+//                    (attachments, /file get: 64 KB frames through a shared
+//                    relay is not how 60 MB moves). Dialled opportunistically,
+//                    retried patiently, and nothing the room depends on.
+//
+// Before this every envelope rode the WebRTC mesh, so N−1 NAT-crossing
+// connections had to hold for chat to work, and every socket blip became a
+// `left`/`joined` and a redial storm for the whole room.
 
 type SignalMsg =
-  | { type: "peers";   roomId: string; peers: string[] }
+  | { type: "peers";   roomId: string; peers: string[]; resumed?: boolean }
   | { type: "joined";  roomId: string; peerId: string }
   | { type: "left";    roomId: string; peerId: string }
   | { type: "offer";   roomId: string; from: string; to: string; sdp: string }
   | { type: "answer";  roomId: string; from: string; to: string; sdp: string }
   | { type: "ice";     roomId: string; from: string; to: string; candidate: RTCIceCandidateInit }
+  | { type: "data";    roomId: string; from: string; to?: string; payload: string }
   | { type: "error";   message: string };
+
+/** Options on send()/broadcast(). */
+export interface SendOptions {
+  /**
+   * Bulk goes over a direct WebRTC data channel, never the relay: an
+   * attachment or a library fetch is megabytes, and the server's 64 KB frame
+   * cap and shared bandwidth are for handshakes and chat. A bulk broadcast
+   * floods the WebRTC overlay as before; a bulk send needs an open channel
+   * and returns false without one (the caller checks hasChannel first).
+   */
+  bulk?: boolean;
+}
 
 export interface PeerConfig {
   signalingUrl: string;    // ws://localhost:4444
@@ -16,6 +52,15 @@ export interface PeerConfig {
   /** Override the leased identity. Tests use it; the app never does. */
   peerId?: string;
   onSignalingOpen?: () => void;                       // fires on every successful WS connect
+  /**
+   * This peer can now be sent to — fires once per (their session × our
+   * session): for each peer in the room when we join fresh, and for each
+   * peer that joins after us. NOT on a silent resume (ours or theirs): nobody
+   * lost anything, so there is nothing to re-send. This is where the app does
+   * its handshake (name, sync-*) — it used to hang off onChannelOpen, which
+   * meant a peer with no direct WebRTC path never got one.
+   */
+  onPeerReady?: (peerId: string) => void;
   onSignalingClose?: () => void;                      // fires when WS drops (before retry)
   onSignalingError?: (message: string) => void;       // the server refused something
   onMessage?: (from: string, data: unknown) => void;
@@ -190,6 +235,29 @@ export class QOSPeer {
   private leaseTimer?: ReturnType<typeof setInterval>;
   private channels = new Map<string, RTCDataChannel>();
   private config: PeerConfig;
+  /** What the server is told the room is called — a hash of the token. */
+  private wireRoomId = "";
+  /** The room key (AES-GCM under HKDF of the token); null until connect() derives it. */
+  private roomKey: CryptoKey | null = null;
+  /** Serialises sealing so envelopes leave in the order they were sent (a name before its sync). */
+  private sealChain: Promise<void> = Promise.resolve();
+  /** Serialises opening so envelopes arrive in the order they were relayed. */
+  private openChain: Promise<void> = Promise.resolve();
+  /**
+   * Frames sealed while the socket was down, sent the moment it is back. The
+   * client half of the server's grace: a line typed during a blip still lands.
+   * Bounded — oldest dropped — because a socket that never comes back must
+   * not grow memory forever.
+   */
+  private outbox: string[] = [];
+  private static readonly OUTBOX_MAX = 256;
+  private warnedOldServer = false;
+  /**
+   * The server cuts a socket that sends a frame over its cap (256 KB,
+   * `SIGNAL_MAX_PAYLOAD`), and a cut socket loses everything queued behind
+   * the frame. Refuse the one frame instead, loudly.
+   */
+  private static readonly FRAME_MAX = 250 * 1024;
   private _disconnected = false;   // true after explicit disconnect()
   private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private _stableTimer: ReturnType<typeof setTimeout> | null = null;
@@ -275,17 +343,10 @@ export class QOSPeer {
   // makes each session's ids disjoint.
   private readonly relaySession = Math.random().toString(36).slice(2, 10);
 
-  // "Can we reach this peer at all" (direct channel OR recent relay
-  // traffic), as opposed to hasChannel's "are we directly linked to them" —
-  // see isReachable. Updated from relay traffic's _from field, and kept
-  // fresh for otherwise-silent peers by a periodic presence flood.
+  // When a peer was last heard from over a bulk relay hop (its _from tag) —
+  // a secondary reachability signal; the primary one is the server's roster.
   private lastHeardVia = new Map<string, number>();
   private static readonly REACHABLE_WINDOW_MS = 45_000;
-  private presenceTimer?: ReturnType<typeof setInterval>;
-  // 1.5x this is REACHABLE_WINDOW_MS — tolerates one missed beat before a
-  // silent peer reads as unreachable, the same "miss one, not two" idiom as
-  // qospeer.mjs's own ping/pong keepalive.
-  private static readonly PRESENCE_FLOOD_MS = 30_000;
 
   constructor(config: PeerConfig) {
     this.config = config;
@@ -297,31 +358,40 @@ export class QOSPeer {
     } catch { /* no storage, no lease */ }
   }
 
-  connect(): void {
+  /**
+   * Join the room. Resolves once the room key is derived and the first
+   * socket is on its way (not once it is open — that is onSignalingOpen).
+   * Throws only if WebCrypto is unavailable, in which case nothing could be
+   * sealed and joining would put the room's traffic in the clear.
+   */
+  async connect(): Promise<void> {
     this._disconnected = false;
     if (!validateCapability(this.config.roomId)) {
       console.warn(`[qos-peer] roomId ZFA check failed (may be cached token): ${this.config.roomId}`);
     }
-    this._openSignaling().catch(() => this._scheduleReconnect());
-    // A peer in the room we have no channel to is a peer nothing we type
-    // reaches. Look for those on a timer rather than only when the server
-    // happens to re-send the room's list.
-    if (!this.sweepTimer) this.sweepTimer = setInterval(() => this.sweep(), QOSPeer.SWEEP_MS);
-    // Keeps isReachable() honest for peers who are relay-only (past direct
-    // reach) and otherwise never send anything themselves.
-    if (!this.presenceTimer) {
-      this.presenceTimer = setInterval(() => this.broadcast({ kind: "presence" }), QOSPeer.PRESENCE_FLOOD_MS);
+    if (!this.roomKey) {
+      this.wireRoomId = await roomIdFor(this.config.roomId);
+      this.roomKey = await deriveRoomKey(this.config.roomId);
     }
+    if (this._disconnected) return;   // disconnect() raced the derivation
+    this._openSignaling().catch(() => this._scheduleReconnect());
+    // A peer in the room we have no direct link to is one calls and bulk
+    // cannot reach. Look for those on a timer rather than only when the
+    // server happens to re-send the room's list.
+    if (!this.sweepTimer) this.sweepTimer = setInterval(() => this.sweep(), QOSPeer.SWEEP_MS);
   }
 
   disconnect(): void {
     this._disconnected = true;
     if (this.sweepTimer) clearInterval(this.sweepTimer);
-    if (this.presenceTimer) clearInterval(this.presenceTimer);
+    this.sweepTimer = undefined;
     if (this.leaseTimer) clearInterval(this.leaseTimer);
     if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
     if (this._stableTimer) clearTimeout(this._stableTimer);
-    this.signal({ type: "leave", roomId: this.config.roomId, peerId: this.peerId });
+    this.outbox = [];
+    // An explicit leave is immediate on the server; only a socket that
+    // *vanishes* is grace-held. Closing the tab must not hold a seat.
+    this.signal({ type: "leave", roomId: this.wireRoomId, peerId: this.peerId });
     for (const pc of this.connections.values()) pc.close();
     this.ws?.close();
     this.connections.clear();
@@ -330,6 +400,14 @@ export class QOSPeer {
     this.disconnectTimers.clear();
     for (const t of this.pruneTimers.values()) clearTimeout(t);
     this.pruneTimers.clear();
+  }
+
+  /// Tell the server we are leaving, and nothing else — for pagehide, where
+  /// the page is going away and the socket is about to die anyway. Without
+  /// this the server would hold the seat for its grace window, and the room
+  /// would see a departed person as present for a minute.
+  leave(): void {
+    this.signal({ type: "leave", roomId: this.wireRoomId, peerId: this.peerId });
   }
 
   /// Recover promptly after a background-throttled / frozen tab returns to the
@@ -346,7 +424,9 @@ export class QOSPeer {
       this._reconnectDelay = QOSPeer.RECONNECT_MIN;        // reset backoff — we're foreground again
       void this._reconnectSignaling();
     } else if (ws.readyState === WebSocket.OPEN) {
-      this.signal({ type: "join", roomId: this.config.roomId, peerId: this.peerId });
+      // A re-join on a live socket is a resume on the server: silent to the
+      // room, and it re-sends the roster so anything we missed is refreshed.
+      this.signal({ type: "join", roomId: this.wireRoomId, peerId: this.peerId });
     }
   }
 
@@ -405,14 +485,14 @@ export class QOSPeer {
     return set;
   }
 
-  /// Can we reach this peer at all — a direct channel, or relay traffic seen
-  /// from them recently (including the periodic presence flood, so an
-  /// otherwise-silent peer isn't mistaken for unreachable)? Under the
-  /// overlay, "no direct channel" is normal for most peers past a handful in
-  /// the room — this answers "can I talk to them", where hasChannel answers
-  /// "am I directly linked to them", which stays meaningful on its own for
-  /// /conn-style diagnostics.
+  /// Can we reach this peer at all? Under the relayed control plane that is
+  /// the server's word: a peer in the roster gets what we send (queued for
+  /// them through a blip), whether or not a direct WebRTC link exists. A
+  /// direct channel, or recent bulk-relay traffic, also counts. hasChannel
+  /// answers the narrower "am I directly linked to them", which is what a
+  /// call or a file transfer needs and what /conn diagnoses.
   isReachable(peerId: string): boolean {
+    if (this.roster.has(peerId)) return true;
     if (this.hasChannel(peerId)) return true;
     const last = this.lastHeardVia.get(peerId);
     return last !== undefined && Date.now() - last < QOSPeer.REACHABLE_WINDOW_MS;
@@ -448,51 +528,79 @@ export class QOSPeer {
     return this.channels.get(peerId)?.readyState === "open";
   }
 
-  /// Send data to a specific peer. Direct and raw — byte-identical to
-  /// today, no format change — if we hold an open channel to them (still
-  /// true for everyone in a room of five or fewer, and for anyone pinned).
-  /// Otherwise flood-routes it over the overlay: tagged with a dedupe id, a
-  /// remaining-hop budget, and who it's actually for, so every neighbor
-  /// relays it onward (whether or not they're the target) until it reaches
-  /// someone who is. No routing table — a deliberate simplicity tradeoff,
-  /// accepted for how infrequent a direct send to a non-neighbor is.
-  send(targetPeerId: string, data: unknown): boolean {
-    const ch = this.channels.get(targetPeerId);
-    if (ch && ch.readyState === "open") {
+  /// Send to one peer. The control plane: sealed under the room key and
+  /// relayed by the server, which queues it for them through a blip — so
+  /// this returns true whenever they are someone we could address (the
+  /// frame is queued here too if our own socket is momentarily down).
+  /// `bulk` goes over a direct channel only, and is false without one.
+  send(targetPeerId: string, data: unknown, opts?: SendOptions): boolean {
+    if (opts?.bulk) {
+      const ch = this.channels.get(targetPeerId);
+      if (!ch || ch.readyState !== "open") return false;
       ch.send(JSON.stringify(data));
       return true;
     }
-    if (this.channels.size === 0) return false;
-    const relayId = this.nextRelayId();
-    const tagged = {
-      ...(data as Record<string, unknown>),
-      _relayId: relayId, _hops: this.hopBudget(), _from: this.peerId, _relayTo: targetPeerId,
-    };
-    for (const other of this.channels.values()) {
-      if (other.readyState === "open") other.send(JSON.stringify(tagged));
-    }
+    if (!this.roomKey) return false;
+    this.queueSealed(targetPeerId, data);
     return true;
   }
 
-  /// Broadcast to the room. Sent as a flood over the bounded-degree overlay
-  /// (see ringSkipNeighbors) — tagged with a dedupe id and a remaining-hop
-  /// budget so a peer beyond direct reach still gets it via relay, once,
-  /// with no routing table. A room of five or fewer is still direct to
-  /// everyone, so this degenerates to exactly today's fan-out.
-  broadcast(data: unknown): void {
-    const relayId = this.nextRelayId();
-    const tagged = {
-      ...(data as Record<string, unknown>),
-      _relayId: relayId, _hops: this.hopBudget(), _from: this.peerId,
-    };
-    const payload = JSON.stringify(tagged);
-    // Write directly rather than through send(): every entry here is by
-    // definition an open channel (we're iterating this.channels itself), so
-    // send()'s no-direct-link flood-fallback branch — which would add a
-    // _relayTo that doesn't belong on a broadcast — must never run here.
-    for (const ch of this.channels.values()) {
-      if (ch.readyState === "open") ch.send(payload);
+  /// Broadcast to the room. The control plane: one sealed frame to the
+  /// server, which fans it out to everyone present and queues it for anyone
+  /// grace-held. `bulk` instead floods the WebRTC overlay (see
+  /// ringSkipNeighbors / handleRelay) — tagged with a dedupe id and a hop
+  /// budget so a peer beyond direct reach still gets it once.
+  broadcast(data: unknown, opts?: SendOptions): void {
+    if (opts?.bulk) {
+      const relayId = this.nextRelayId();
+      const tagged = {
+        ...(data as Record<string, unknown>),
+        _relayId: relayId, _hops: this.hopBudget(), _from: this.peerId,
+      };
+      const payload = JSON.stringify(tagged);
+      for (const ch of this.channels.values()) {
+        if (ch.readyState === "open") ch.send(payload);
+      }
+      return;
     }
+    if (!this.roomKey) return;
+    this.queueSealed(undefined, data);
+  }
+
+  /// Seal one envelope (in order) and put it on the wire, or in the outbox
+  /// if the socket is between lives.
+  private queueSealed(to: string | undefined, data: unknown): void {
+    const key = this.roomKey!;
+    this.sealChain = this.sealChain.then(async () => {
+      const payload = await seal(key, this.peerId, data);
+      const frame: SignalMsg = { type: "data", roomId: this.wireRoomId, from: this.peerId, payload };
+      if (to !== undefined) frame.to = to;
+      const text = JSON.stringify(frame);
+      if (text.length > QOSPeer.FRAME_MAX) {
+        const kind = (data as { kind?: unknown })?.kind;
+        console.error(`[qos-peer] not sending a ${String(kind)} frame of ${text.length} bytes — over the relay's cap; bulk goes over WebRTC ({bulk:true})`);
+        return;
+      }
+      if (this.ws?.readyState === WebSocket.OPEN) { this.ws.send(text); return; }
+      if (this._disconnected) return;
+      this.outbox.push(text);
+      if (this.outbox.length > QOSPeer.OUTBOX_MAX) this.outbox.shift();
+    }).catch((e) => console.warn("[qos-peer] seal failed", e));
+  }
+
+  /// A relayed `data` frame: open it (in order) and deliver. One that does
+  /// not open — another room's key, a re-labelled sender, a tampered byte —
+  /// is dropped without a word to the app; the relay is not trusted to be
+  /// right, only to be there.
+  private receiveSealed(msg: Extract<SignalMsg, { type: "data" }>): void {
+    const key = this.roomKey;
+    if (!key) return;
+    this.openChain = this.openChain.then(async () => {
+      const obj = await open(key, msg.from, msg.payload);
+      if (obj === null) { console.warn(`[qos-peer] dropped a frame from ${msg.from.slice(-8)} that did not open`); return; }
+      if (this._disconnected) return;
+      this.config.onMessage?.(msg.from, obj);
+    }).catch((e) => console.warn("[qos-peer] open failed", e));
   }
 
   /// Unique id for one flood — `${peerId}:${session}:${counter}`, unique across
@@ -578,7 +686,7 @@ export class QOSPeer {
       if (pc.signalingState !== "stable") return;   // a remote offer landed first
       await pc.setLocalDescription(offer);
       this.signal({
-        type: "offer", roomId: this.config.roomId,
+        type: "offer", roomId: this.wireRoomId,
         from: this.peerId, to: peerId, sdp: pc.localDescription!.sdp,
       });
     } catch (e) {
@@ -635,8 +743,11 @@ export class QOSPeer {
       this._scheduleReconnect();
     };
 
-    // Join the room
-    this.signal({ type: "join", roomId: this.config.roomId, peerId: this.peerId });
+    // Join the room — a resume, if the server still holds our seat.
+    this.signal({ type: "join", roomId: this.wireRoomId, peerId: this.peerId });
+    // Then whatever was typed while the socket was down.
+    const pending = this.outbox; this.outbox = [];
+    for (const text of pending) ws.send(text);
     this.config.onSignalingOpen?.();
   }
 
@@ -685,6 +796,9 @@ export class QOSPeer {
         let nth = 0;
         for (const peerId of msg.peers) {
           this.config.onPeerJoined?.(peerId);
+          // Fresh in the room: everyone here needs our handshake. On a
+          // resume they already have it — the seat never emptied.
+          if (!msg.resumed) this.config.onPeerReady?.(peerId);
           if (!targets.has(peerId)) continue;
           const ch = this.channels.get(peerId);
           if (ch?.readyState === "open") continue;
@@ -714,6 +828,7 @@ export class QOSPeer {
         // ever closes a link, never opens one, so it can't glare.)
         this.roster.add(msg.peerId);
         this.config.onPeerJoined?.(msg.peerId);
+        this.config.onPeerReady?.(msg.peerId);
         this.reconcilePrune();
         break;
       case "left":
@@ -738,11 +853,22 @@ export class QOSPeer {
       case "ice":
         this.handleIce(msg.from, msg.candidate);
         break;
+      case "data":
+        this.receiveSealed(msg);
+        break;
       case "error":
         // Surfaced, not swallowed. "rate limit exceeded" is the server telling
         // us the room is bigger than the join burst it will carry — the exact
         // failure that looks, from inside a browser, like peers who never
         // arrived. Nobody could see it, so it was argued about instead.
+        // An older server does not know the `data` frame — every line typed
+        // would come back as this, once per line. Say what it is, once.
+        if (msg.message === "unknown message type") {
+          if (this.warnedOldServer) break;
+          this.warnedOldServer = true;
+          this.config.onSignalingError?.("the signaling server is an older build than this page — chat needs the resume/relay build (2026-09-18) deployed there");
+          break;
+        }
         console.error("[signaling]", msg.message);
         this.config.onSignalingError?.(msg.message);
         break;
@@ -837,7 +963,7 @@ export class QOSPeer {
 
     this.signal({
       type: "offer",
-      roomId: this.config.roomId,
+      roomId: this.wireRoomId,
       from: this.peerId,
       to: remotePeerId,
       sdp: offer.sdp!,
@@ -881,7 +1007,7 @@ export class QOSPeer {
       await pc.setLocalDescription(answer);
       this.signal({
         type: "answer",
-        roomId: this.config.roomId,
+        roomId: this.wireRoomId,
         from: this.peerId,
         to: fromPeerId,
         sdp: pc.localDescription!.sdp,
@@ -937,7 +1063,7 @@ export class QOSPeer {
       if (!event.candidate) return;
       this.signal({
         type: "ice",
-        roomId: this.config.roomId,
+        roomId: this.wireRoomId,
         from: this.peerId,
         to: remotePeerId,
         candidate: event.candidate.toJSON(),
@@ -1041,10 +1167,16 @@ export class QOSPeer {
     ch.onclose = () => {
       this.channels.delete(peerId);
       console.log(`[qos-peer] data channel closed with ${peerId}`);
-      // A closed data channel is the most reliable "peer is gone" signal for a
-      // clean tab-close — the underlying connection may never reach "failed".
-      // Declare the peer gone (the app debounces with its own short grace, and
-      // re-establishment fires onPeerJoined / onChannelOpen again).
+      // A closed data channel is a direct link gone, not a person gone: who is
+      // in the room is the server's word (with its grace window), and a peer
+      // it still lists gets our chat through the relay regardless. Tear the
+      // dead pc down so the sweep can redial for calls/bulk, and if the
+      // server has in fact forgotten them, say so.
+      if (this.roster.has(peerId)) {
+        this.cleanup(peerId);
+        this.retryAt.set(peerId, Date.now() + QOSPeer.RETRY_MIN_MS);
+        return;
+      }
       this.declarePeerGone(peerId);
     };
     ch.onmessage = (event) => {

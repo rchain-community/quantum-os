@@ -82,6 +82,17 @@ jobs:
       - name: Locker selftest
         run: node packages/browser/src/locker.js --selftest
 
+      # The room key and hashed room id (room-crypto.js) — the one file the
+      # browser and the Node agents both run, so one derivation, not two.
+      - name: Room crypto selftest
+        run: node packages/browser/src/room-crypto.js --selftest
+
+      # The signaling server over real sockets: the `data` relay and its
+      # sender check, the seat held through a lost socket, the silent resume
+      # with replay, departure only on grace expiry or an explicit leave.
+      - name: Signaling server test
+        run: node --test packages/signaling/test/server.test.mjs
+
       # The pooled token exchange contract (open/provide/swap/… + the atomic
       # cross-shard 2PC verbs) and its `$x*` macro call-site shape. Shape
       # only; live-node behaviour is verified manually against localnet.
@@ -103,6 +114,14 @@ jobs:
       # asserts which track ends up in the stream a joiner would be given.
       - name: Calls test
         run: node packages/browser/test/calls.test.mjs
+
+      # The browser peer against a stubbed clock, socket and RTCPeerConnection:
+      # the retry sweep (wrong twice from live rooms), and the relayed control
+      # plane — sealed frames, in-order queueing through a socket blip,
+      # onPeerReady on a fresh join but not a resume, a dead data channel not
+      # being a departure.
+      - name: Peer transport test
+        run: node packages/browser/test/peer.test.mjs
 
       # The local /search + /solve enumerator (#119) — possibilities/events
       # shapes, the listener rollups, the /solve cascade, and a conformance

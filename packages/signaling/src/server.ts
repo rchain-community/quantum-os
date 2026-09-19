@@ -10,7 +10,11 @@ type SignalMsg =
   | { type: "answer";    roomId: string; from: string; to: string; sdp: string }
   | { type: "ice";       roomId: string; from: string; to: string; candidate: unknown }
   | { type: "leave";     roomId: string; peerId: string }
-  | { type: "peers";     roomId: string; peers: string[] }   // server → client
+  // The control plane: one sealed envelope (see packages/browser/src/room-crypto.js)
+  // from a peer to one peer (`to`) or to the room. The server relays the
+  // ciphertext and queues it for a grace-held peer; it can open none of it.
+  | { type: "data";      roomId: string; from: string; to?: string; payload: string }
+  | { type: "peers";     roomId: string; peers: string[]; resumed?: boolean }   // server → client
   | { type: "joined";    roomId: string; peerId: string }    // server → others
   | { type: "left";      roomId: string; peerId: string }    // server → others
   | { type: "error";     message: string };
@@ -38,6 +42,9 @@ function isWellFormed(msg: SignalMsg): boolean {
     case "answer":
     case "ice":
       return str(msg.roomId) && str(msg.from) && str(msg.to);
+    case "data":
+      return str(msg.roomId) && str(msg.from) && str(msg.payload)
+        && (msg.to === undefined || str(msg.to));
     default:
       return true;   // unknown types are answered by the dispatcher below
   }
@@ -73,7 +80,38 @@ const RATE_BURST = parseInt(process.env.SIGNAL_RATE_BURST ?? String(RATE_LIMIT *
 
 // Build marker — surfaced at GET / so a deploy can be confirmed from outside
 // (`curl https://…/` shows the live build). Bump this string on each meaningful deploy.
-const BUILD = "2026-09-04-turn-relay";
+const BUILD = "2026-09-18-resume-relay";
+
+/**
+ * How long a peer whose socket died stays in the room, waiting to come back.
+ *
+ * A socket dying is not a person leaving: a phone switching apps, a laptop
+ * lid, a wifi handoff, this process restarting under everyone at once — every
+ * one of those used to become a `left` to the whole room, each peer tearing
+ * down and redialling, and a `joined` seconds later when the socket came back.
+ * That storm was most of what "people keep getting dropped" meant. So a lost
+ * socket now HOLDS the seat: nobody else is told, control-plane traffic for
+ * the seat is queued, and a rejoin under the same peerId inside the window
+ * resumes silently (Jitsi's XMPP session resume, in one map). An explicit
+ * `leave` (the browser sends one on pagehide) is still immediate — a person
+ * who closes the tab is gone at once; only a person who *vanished* is waited
+ * for. The server's own heartbeat (2 missed pongs, ~60s) is what turns a
+ * silent zombie into a lost socket, so a peer that truly evaporated is seen
+ * to leave within this plus that.
+ */
+export const GRACE_MS = parseInt(process.env.SIGNAL_GRACE_MS ?? "60000", 10);
+
+/**
+ * The largest frame a socket may send; `ws` closes the socket (1009) over it.
+ * Was 64 KB when the socket carried handshakes alone. The control plane's
+ * `sync-*` envelopes (a room's lemmas, polls, groups, library index — sealed
+ * and base64, +33%) ride it now, and a socket dying on every join because the
+ * room has grown is not a failure mode to keep. 256 KB holds a large room's
+ * state; the rate limit above is what bounds abuse. The clients refuse to
+ * send a frame over this rather than be cut off (peer.ts / qospeer.mjs
+ * FRAME_MAX), and `GET /` reports it.
+ */
+export const MAX_PAYLOAD = parseInt(process.env.SIGNAL_MAX_PAYLOAD ?? String(256 * 1024), 10);
 
 export class SignalingServer {
   private wss: WebSocketServer;
@@ -116,10 +154,11 @@ export class SignalingServer {
       res.end(JSON.stringify({
         status: "ok", build: BUILD, rooms: this.rooms.size,
         limit: RATE_LIMIT, burst: RATE_BURST, windowMs: RATE_WINDOW_MS,
+        maxPayload: MAX_PAYLOAD, graceMs: GRACE_MS,
         turn: turnConfigured(),
       }));
     });
-    this.wss = new WebSocketServer({ server: http, maxPayload: 65_536 });
+    this.wss = new WebSocketServer({ server: http, maxPayload: MAX_PAYLOAD });
     this._http = http;
   }
 
@@ -147,7 +186,19 @@ export class SignalingServer {
       }
     }, 30_000);
     this.wss.on("close", () => clearInterval(heartbeat));
+    this._heartbeat = heartbeat;
   }
+
+  /// Close every socket and the listener; grace timers are cleared with the rooms.
+  stop(): void {
+    if (this._heartbeat) clearInterval(this._heartbeat);
+    for (const room of this.rooms.values()) for (const id of room.peerIds()) room.remove(id);
+    this.rooms.clear();
+    for (const ws of this.wss.clients) { try { ws.terminate(); } catch { /* ignore */ } }
+    this.wss.close();
+    this._http.close();
+  }
+  private _heartbeat: ReturnType<typeof setInterval> | null = null;
 
   private onConnect(ws: WebSocket): void {
     const w = ws as WebSocket & { _missed?: number };
@@ -211,7 +262,16 @@ export class SignalingServer {
       case "ice":
         this.relay(ws, msg);
         break;
+      case "data":
+        this.relayData(ws, msg);
+        break;
       case "leave":
+        // Only your own seat. Before this check any socket could send a
+        // `leave` naming any peer and have the room told they had gone.
+        if (this.wsIndex.get(ws) !== msg.peerId) {
+          this.send(ws, { type: "error", message: "leave peerId mismatch" });
+          return;
+        }
         this.onLeave(msg.roomId, msg.peerId);
         break;
       default:
@@ -226,18 +286,61 @@ export class SignalingServer {
       this.rooms.set(roomId, room);
     }
 
-    const peer: Peer = { id: peerId, ws, joinedAt: Date.now() };
+    // A socket may only ever speak for one peer; a second join on the same
+    // socket under a different id would leave the first seat held forever.
+    const prior = this.wsIndex.get(ws);
+    if (prior && prior !== peerId) this.onLeave(this.peerIndex.get(prior)?.roomId ?? roomId, prior);
+
+    const existing = room.get(peerId);
+    if (existing) {
+      // Same seat, new socket: a RESUME. Either the peer is grace-held (its
+      // socket died and this is it coming back) or its old socket is a zombie
+      // the heartbeat hasn't reaped yet (a phone that reconnected before we
+      // noticed the old one was dead). Either way the seat is theirs: swap the
+      // socket in, tell nobody, replay what they missed.
+      const stale = existing.ws;
+      if (stale && stale !== ws) {
+        this.wsIndex.delete(stale);
+        try { stale.terminate(); } catch { /* already gone */ }
+      }
+      if (existing.graceTimer) { clearTimeout(existing.graceTimer); existing.graceTimer = null; }
+      existing.ws = ws;
+      this.peerIndex.set(peerId, { roomId, ws });
+      this.wsIndex.set(ws, peerId);
+      this.send(ws, { type: "peers", roomId, peers: room.peerIds().filter(id => id !== peerId), resumed: true });
+      const replayed = room.flush(existing);
+      console.log(`[resume] room=…${roomId.slice(-8)} peer=…${peerId.slice(-8)} replayed=${replayed} size=${room.size}`);
+      return;
+    }
+
+    const peer: Peer = { id: peerId, ws, joinedAt: Date.now(), graceTimer: null, queue: [], queuedBytes: 0 };
     room.add(peer);
     this.peerIndex.set(peerId, { roomId, ws });
     this.wsIndex.set(ws, peerId);
 
     // Tell the joiner who else is in the room.
-    this.send(ws, { type: "peers", roomId, peers: room.peerIds().filter(id => id !== peerId) });
+    this.send(ws, { type: "peers", roomId, peers: room.peerIds().filter(id => id !== peerId), resumed: false });
 
     // Tell existing peers that someone joined.
     room.broadcast(peerId, { type: "joined", roomId, peerId });
 
     console.log(`[join]  room=…${roomId.slice(-8)} peer=…${peerId.slice(-8)} size=${room.size}`);
+  }
+
+  /// The socket under a seat died. Hold the seat for GRACE_MS rather than
+  /// announce a departure — see GRACE_MS.
+  private holdSeat(roomId: string, peerId: string): void {
+    const room = this.rooms.get(roomId);
+    const peer = room?.get(peerId);
+    if (!room || !peer) return;
+    if (peer.ws) { this.wsIndex.delete(peer.ws); peer.ws = null; }
+    if (peer.graceTimer) clearTimeout(peer.graceTimer);
+    peer.graceTimer = setTimeout(() => {
+      peer.graceTimer = null;
+      // Still held (no resume swapped a socket in) → now they have left.
+      if (room.get(peerId) === peer && peer.ws === null) this.onLeave(roomId, peerId);
+    }, GRACE_MS);
+    console.log(`[hold]  room=…${roomId.slice(-8)} peer=…${peerId.slice(-8)} grace=${GRACE_MS}ms`);
   }
 
   private onLeave(roomId: string, peerId: string): void {
@@ -254,12 +357,13 @@ export class SignalingServer {
 
   private onDisconnect(ws: WebSocket): void {
     this.rateMap.delete(ws);
-    // Find the single peer on this socket and remove only them.
-    for (const [peerId, { roomId, ws: peerWs }] of this.peerIndex) {
-      if (peerWs !== ws) continue;
-      this.onLeave(roomId, peerId);
-      break;
-    }
+    // Find the single peer on this socket and hold its seat (a resume within
+    // GRACE_MS is silent; only the grace timer's expiry is a departure).
+    const peerId = this.wsIndex.get(ws);
+    if (!peerId) return;
+    const entry = this.peerIndex.get(peerId);
+    if (!entry || entry.ws !== ws) return;   // a newer socket already took the seat
+    this.holdSeat(entry.roomId, peerId);
   }
 
   private relay(ws: WebSocket, msg: Extract<SignalMsg, { to: string; from: string; roomId: string }>): void {
@@ -270,6 +374,20 @@ export class SignalingServer {
       return;
     }
     room.send(msg.to, msg);
+  }
+
+  /// The control plane. Authenticated exactly like a handshake (`from` must be
+  /// the socket's own seat) and then relayed unread — to one peer or to the
+  /// room — queued for whoever is grace-held so a blip drops nothing.
+  private relayData(ws: WebSocket, msg: Extract<SignalMsg, { type: "data" }>): void {
+    const room = this.rooms.get(msg.roomId);
+    if (!room) return;
+    if (this.wsIndex.get(ws) !== msg.from) {
+      this.send(ws, { type: "error", message: "relay from mismatch" });
+      return;
+    }
+    if (msg.to !== undefined) room.send(msg.to, msg, true);
+    else room.broadcast(msg.from, msg, true);
   }
 
   private send(ws: WebSocket, msg: unknown): void {

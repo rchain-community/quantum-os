@@ -13,7 +13,7 @@
 | Identity forgery | Peer IDs are 128-bit random ZFA-balanced tokens; guessing one is computationally infeasible |
 | Unauthorized room access | Room IDs are ZFA capability tokens; no token = no join |
 | SDP/ICE relay forgery | Signaling server binds each `peerId` to its WebSocket; relayed `from` fields are validated server-side |
-| Eavesdropping on peer data | WebRTC DTLS + SRTP encrypt all data channel traffic end-to-end; the signaling server never sees payloads |
+| Eavesdropping on peer data | Control-plane envelopes are AES-256-GCM sealed under a key derived from the room token before the signaling relay carries them; WebRTC DTLS + SRTP encrypt media and bulk end-to-end. The relay sees ciphertext and a hashed room name |
 | Capability decoherence | `decoherence_impossibility` (machine-verified in Lean 4): `parallel(peer1, peer2, …)` stays ZFA-balanced by construction |
 | Envelope authorship after TOFU | `/dyncap` ties each signable envelope to its sender's `H(seed)` anchor; once TOFU-pinned, mismatches and forks are detected and surfaced. Covers `name`, `lemma`, `note-declare`, `note-series`, `retract`, and the outer `sync-*` envelopes. |
 | Owner-gated removal | A `retract` is honored only from the item's owner — `from === poll.creator` for a poll, or the sender's verified anchor matching the lemma's stored author anchor. Anyone else only hides the item locally. Tombstones (`qos-retracted-<room>`) keep a removed gossiped item from healing back via a later `sync-*`. The memory-peer daemon honors author lemma retractions too, so an always-on peer won't resurrect a removed lemma. |
@@ -28,7 +28,7 @@
 |--------|-------|
 | Compromised browser / OS | If the client environment is compromised, RNG and capability storage are untrusted |
 | Sybil attacks | Anyone with the room URL can join; the signaling server imposes no per-identity limit |
-| Signaling server operator | The operator can observe room membership (who joined when) and disrupt signaling; they cannot read peer data |
+| Signaling server operator | The operator can observe room membership (peerIds, who joined when, message timing and sizes), disrupt or delay relay, and replay an unsigned `chat` frame under its original sender; they cannot read peer data, forge a sender, or join the room (they hold its hash, not its token) |
 | STUN server IP disclosure | ICE candidate gathering uses `stun.l.google.com`; Google observes peer IPs. Use a self-hosted STUN/TURN server to avoid this. |
 | Default TURN relay IP/metadata disclosure | When a call falls back to the default relay (`/ice auto`, on by default — see above), Cloudflare observes that call's traffic metadata (IPs, timing, volume) but not content (DTLS/SRTP end-to-end). `/ice auto off` or `/ice turn` substitutes a relay you trust more, or none. |
 | Physical link intercept | Signaling channel uses WSS (TLS) in production; a CA compromise could allow MITM of signaling (but not WebRTC data channels) |
@@ -179,10 +179,13 @@ here:
 The signaling server (`packages/signaling/`) is a **thin WebSocket relay**. It:
 
 - Routes SDP offers, answers, and ICE candidates between peers
-- Tracks room membership (peer join/leave)
-- Never sees WebRTC data channel contents (these are DTLS-encrypted peer-to-peer)
+- Relays the room's **control plane** — chat, lemmas, notes, polls, gov, every `sync-*` — as `data` frames whose payload is **sealed under a key derived from the room token** (below), so it carries what it cannot read
+- Tracks room membership (peer join/leave), holding a seat for `SIGNAL_GRACE_MS` (60 s) when a socket dies so a rejoin under the same peerId resumes silently ([docs/connection.md](docs/connection.md), "The transport")
+- Never sees WebRTC data channel or media contents (DTLS/SRTP-encrypted peer-to-peer) — calls, attachments and `/file get` stay on WebRTC
 
-**Relay forgery protection:** the server maintains a `ws → peerId` index populated at join time. Every relay message (`offer`, `answer`, `ice`) is rejected with an error if the `from` field does not match the peer ID registered for the sending connection. A peer cannot forge messages as if they came from another peer.
+**The relay cannot read or join the room** (`packages/browser/src/room-crypto.js`, shared by the browser and the Node agents). Each control-plane envelope is AES-256-GCM encrypted under `HKDF-SHA256(room token)`, with the sender's peerId as GCM additional data — so a frame the relay re-labels with another `from` opens for no one. The server is told only `SHA-256("qos-room-id:" + token)` as the room's name. **Before this build the raw room token was sent on `join`**: the relay operator held the capability to join every room it relayed. Now they hold a name that is not a capability. Symmetric primitives only — no keypair, so no new Shor exposure (see *Quantum security*). What this does **not** prevent: the relay **replaying** a sealed frame under its original `from`. The dyncap-signed kinds (`name`, `lemma`, `note-declare`, `sync-*`, polls, gov, …) carry a monotonic `seq` and a replay is refused as a chain violation; a plain `chat` line could be replayed. A per-room, per-sender frame counter inside the sealed payload would close this and is not built.
+
+**Relay forgery protection:** the server maintains a `ws → peerId` index populated at join time. Every relay message (`offer`, `answer`, `ice`, and `data`) is rejected with an error if the `from` field does not match the peer ID registered for the sending connection, and a `leave` is honoured only for the sending socket's own seat (before this any socket could `leave` any peer, making the room see them gone). A peer cannot forge messages as if they came from another peer.
 
 ```typescript
 // packages/signaling/src/server.ts
@@ -202,7 +205,7 @@ if (!isWellFormed(msg)) {
 }
 ```
 
-**Room ID as capability:** the signaling server does not enforce authentication. Knowing the room ID IS the capability to join — consistent with the ZFA model. The room URL hash (`#room=cap:room:…`) is the bearer token.
+**Room ID as capability:** the signaling server does not enforce authentication. Knowing the room token IS the capability to join — consistent with the ZFA model. The room URL hash (`#room=cap:room:…`) is the bearer token, and it is also the key material: a peer without it can reach the relay's room by its hashed name and read nothing there.
 
 ### WebRTC transport security
 
@@ -322,7 +325,7 @@ In the meantime, the bearer-and-room-scoped trust model should be read literally
 
 | # | Issue | Severity | Status |
 |---|-------|----------|--------|
-| 1 | No per-message size limit on signaling WebSocket | Medium | Fixed — `maxPayload: 65_536` on `WebSocketServer` |
+| 1 | No per-message size limit on signaling WebSocket | Medium | Fixed — `maxPayload` on `WebSocketServer` (64 KB, raised to 256 KB when the control plane moved onto the socket) |
 | 2 | No rate limiting on signaling connections or messages | Medium | Fixed — 20 msg/sec per connection (fixed window) |
 | 3 | Peer IDs logged in full on the signaling server | Low | Fixed — logs show last 8 chars only (`…abcd1234`) |
 | 4 | Hardcoded Google STUN server leaks peer IPs to Google | Low | Fixed — STUN URL editable in sidebar; empty value disables STUN |
@@ -336,7 +339,7 @@ In the meantime, the bearer-and-room-scoped trust model should be read literally
 | Issue | Fix |
 |-------|-----|
 | Relay `from` field forgery | `wsIndex` binding in `packages/signaling/src/server.ts` — validates `msg.from` against the sending WebSocket connection |
-| No message size limit | `maxPayload: 65_536` on `WebSocketServer` — oversized frames rejected at the protocol layer |
+| No message size limit | `maxPayload` (256 KB, `SIGNAL_MAX_PAYLOAD`) on `WebSocketServer` — oversized frames rejected at the protocol layer |
 | No rate limiting | Fixed-window rate limiter in `onConnect` — 20 msg/sec per connection; excess messages receive an error and are dropped |
 | Full peer/room IDs in logs | Signaling server logs truncated to last 8 chars (`…abcd1234`) |
 | Hardcoded Google STUN | STUN URL now user-configurable in the sidebar; defaults to `stun:stun.l.google.com:19302` |

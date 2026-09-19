@@ -3,7 +3,7 @@
 // In-process signaling relay + the real agent.mjs (as scribe) + one driver peer.
 // The driver talks, then asks `/scribe list N` and checks the reply.
 // Run: node list-cmd.e2e.mjs
-import { WebSocketServer } from "ws";
+import { startRelay } from "./mini-relay.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,37 +14,8 @@ import { run } from "./agent.mjs";
 const PORT = 4459;
 const ROOM = generateCapability("room");
 
-// ---- minimal signaling relay ----
-const rooms = new Map();
-const wsPeer = new Map();
-const wss = new WebSocketServer({ port: PORT });
-const send = (ws, m) => { try { ws.send(JSON.stringify(m)); } catch {} };
-wss.on("connection", (ws) => {
-  ws.on("message", (raw) => {
-    let m; try { m = JSON.parse(raw.toString()); } catch { return; }
-    if (m.type === "join") {
-      const room = rooms.get(m.roomId) ?? new Map();
-      rooms.set(m.roomId, room);
-      wsPeer.set(ws, { roomId: m.roomId, peerId: m.peerId });
-      const others = [...room.keys()];
-      room.set(m.peerId, ws);
-      send(ws, { type: "peers", roomId: m.roomId, peers: others });
-      for (const [pid, pws] of room) if (pid !== m.peerId) send(pws, { type: "joined", roomId: m.roomId, peerId: m.peerId });
-    } else if (m.type === "offer" || m.type === "answer" || m.type === "ice") {
-      const room = rooms.get(m.roomId);
-      const tgt = room?.get(m.to);
-      if (tgt) send(tgt, m);
-    } else if (m.type === "leave") {
-      const info = wsPeer.get(ws); const room = info && rooms.get(info.roomId);
-      if (room) { room.delete(info.peerId); for (const pws of room.values()) send(pws, { type: "left", roomId: info.roomId, peerId: info.peerId }); }
-    }
-  });
-  ws.on("close", () => {
-    const info = wsPeer.get(ws); wsPeer.delete(ws);
-    const room = info && rooms.get(info.roomId);
-    if (room) { room.delete(info.peerId); for (const pws of room.values()) send(pws, { type: "left", roomId: info.roomId, peerId: info.peerId }); }
-  });
-});
+// ---- minimal signaling relay (shared: mini-relay.mjs) ----
+const { wss } = startRelay(PORT);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const stateDir = mkdtempSync(join(tmpdir(), "scribe-e2e-"));
