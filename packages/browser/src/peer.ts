@@ -253,6 +253,8 @@ export class QOSPeer {
   private outbox: string[] = [];
   private static readonly OUTBOX_MAX = 256;
   private warnedOldServer = false;
+  /** The type of the last frame sent — what an unnamed "unknown message type" is about. */
+  private lastSentType = "";
   /**
    * Liveness of the socket, decided by traffic rather than by readyState.
    *
@@ -505,6 +507,7 @@ export class QOSPeer {
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const pending = this.outbox; this.outbox = [];
+    if (pending.length) this.lastSentType = "data";
     for (const text of pending) ws.send(text);
   }
 
@@ -659,7 +662,7 @@ export class QOSPeer {
         console.error(`[qos-peer] not sending a ${String(kind)} frame of ${text.length} bytes — over the relay's cap; bulk goes over WebRTC ({bulk:true})`);
         return;
       }
-      if (this.ws?.readyState === WebSocket.OPEN && !this.suspect) { this.ws.send(text); return; }
+      if (this.ws?.readyState === WebSocket.OPEN && !this.suspect) { this.lastSentType = "data"; this.ws.send(text); return; }
       if (this._disconnected) return;
       this.outbox.push(text);
       if (this.outbox.length > QOSPeer.OUTBOX_MAX) this.outbox.shift();
@@ -959,9 +962,18 @@ export class QOSPeer {
         // us the room is bigger than the join burst it will carry — the exact
         // failure that looks, from inside a browser, like peers who never
         // arrived. Nobody could see it, so it was argued about instead.
-        // An older server does not know the `data` frame — every line typed
-        // would come back as this, once per line. Say what it is, once.
-        if (msg.message === "unknown message type") {
+        // "unknown message type" means the server predates something we
+        // sent — but which thing matters. A rejected `ping` is a server from
+        // before the pong (2026-09-19) and chat is fine: the error reply is
+        // itself the heartbeat we wanted, so say nothing. A rejected `data`
+        // frame is a server from before the relay (2026-09-18) and every line
+        // typed would come back as this — say what it is, once. A newer
+        // server names the type; an older one does not, so fall back to what
+        // we last sent.
+        if (msg.message.startsWith("unknown message type")) {
+          const named = msg.message.split(": ")[1];
+          const rejected = named ?? this.lastSentType;
+          if (rejected === "ping") break;
           if (this.warnedOldServer) break;
           this.warnedOldServer = true;
           this.config.onSignalingError?.("the signaling server is an older build than this page — chat needs the resume/relay build (2026-09-18) deployed there");
@@ -1402,6 +1414,7 @@ export class QOSPeer {
 
   private signal(msg: unknown): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
+      this.lastSentType = String((msg as { type?: unknown })?.type ?? "");
       this.ws.send(JSON.stringify(msg));
     }
   }
