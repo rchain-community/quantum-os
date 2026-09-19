@@ -10,6 +10,11 @@ type SignalMsg =
   | { type: "answer";    roomId: string; from: string; to: string; sdp: string }
   | { type: "ice";       roomId: string; from: string; to: string; candidate: unknown }
   | { type: "leave";     roomId: string; peerId: string }
+  // App-level liveness for browsers, which cannot send a protocol ping and
+  // whose OS drops the TCP under a backgrounded tab while the WebSocket still
+  // claims OPEN. Any reply proves the socket; `t` is echoed for a round trip.
+  | { type: "ping";      t?: number }
+  | { type: "pong";      t?: number }
   // The control plane: one sealed envelope (see packages/browser/src/room-crypto.js)
   // from a peer to one peer (`to`) or to the room. The server relays the
   // ciphertext and queues it for a grace-held peer; it can open none of it.
@@ -264,6 +269,9 @@ export class SignalingServer {
         break;
       case "data":
         this.relayData(ws, msg);
+        break;
+      case "ping":
+        this.send(ws, { type: "pong", t: msg.t });
         break;
       case "leave":
         // Only your own seat. Before this check any socket could send a
