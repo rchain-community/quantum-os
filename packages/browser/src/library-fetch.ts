@@ -134,7 +134,8 @@ export function createLibraryFetch(host: FetchHost): LibraryFetch {
       // The asker may have gone; sending into a closed channel is wasted work.
       if (!peer.hasChannel(to)) return;
       const slice = file.slice(i * BIN_CHUNK, (i + 1) * BIN_CHUNK);
-      peer.send(to, { kind: "lib-part", hash, seq: i, data: toB64(await slice.arrayBuffer()) });
+      // Bulk: over the direct channel only (see peer.ts SendOptions).
+      peer.send(to, { kind: "lib-part", hash, seq: i, data: toB64(await slice.arrayBuffer()) }, { bulk: true });
       if ((i & 31) === 31) await pace();
     }
     host.say(`↑ sent ${file.name} to ${host.label(to)}  (${fmtSize(file.size)})`);

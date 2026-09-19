@@ -190,10 +190,18 @@ node dyncap.selftest.mjs # dyncap: sign→verify chain, canonicalization, fork d
 ```
 
 The dyncap suite proves the signing port matches the browser byte-for-byte
-(so the daemon's signatures verify there).
+(so the daemon's signatures verify there). The room key and hashed room id
+are not ported at all — `qospeer.mjs` imports the browser's own
+`packages/browser/src/room-crypto.js` (plain JS, `--selftest`), so an agent
+and a browser cannot derive them differently.
+
+The local relays these scripts run against are one shared file,
+`mini-relay.mjs` (the real server's protocol including the sealed `data`
+frame; no grace/replay — that is `packages/signaling/test/server.test.mjs`,
+which runs the real server over real sockets).
 
 ```bash
-npm install && node loopback.mjs            # werift↔werift WebRTC round-trip over a local relay
+npm install && node loopback.mjs            # two Node peers over a local relay: sealed chat over the control plane + a werift↔werift link for bulk
 node media-reject.selftest.mjs              # a data-only agent rejects a call's audio/video, keeps the data channel
 node turn-relay.selftest.mjs                # the default-relay auto-fetch (GET /turn) merges, falls back, and never overrides an explicit config
 node werift-patched.selftest.mjs            # RTCCertificate.getFingerprints() is memoized (issue #125) and still returns the right value

@@ -203,11 +203,13 @@ const peer = new QOSPeer({
   signalingUrl: "wss://x", roomId: "cap:room:0246", peerId: "mmm",
   onPeerLeft: (id) => left.push(id),
 });
-peer.connect();
-await tick();                 // the socket is created inside an async open
+await peer.connect();         // derives the room key, then creates the socket
 FakeWS.last.onopen?.();
 await tick();                 // handlers are attached after the open resolves
 check("joining the room is announced", sent.some((m) => m.type === "join"), JSON.stringify(sent));
+const joinFrame = sent.find((m) => m.type === "join");
+check("the server is told a hash of the room token, never the token",
+      /^[0-9a-f]{64}$/.test(joinFrame.roomId) && !joinFrame.roomId.includes("0246"), joinFrame.roomId);
 
 deliver({ type: "peers", peers: ["aaa", "zzz"] });
 // The stagger is real time and deliberate: dialling everyone at once makes a
@@ -297,8 +299,7 @@ check("a peer no longer in the roster IS reported gone on connection failure",
 // Deferring entirely to the lower id assumed the other side also retries, which
 // is false whenever builds are mixed — and then nobody dials at all.
 const high = new QOSPeer({ signalingUrl: "wss://x", roomId: "cap:room:0246", peerId: "zzzz" });
-high.connect();
-await tick();
+await high.connect();
 FakeWS.last.onopen?.();
 await tick();
 deliver({ type: "peers", peers: ["aaaa"] });
@@ -349,8 +350,7 @@ check("a room of eleven caps this peer's targets at degree 4, not ten", tenTarge
       JSON.stringify([...tenTargets]));
 
 const many = new QOSPeer({ signalingUrl: "wss://x", roomId: "cap:room:0246", peerId: "bbbb" });
-many.connect();
-await tick();
+await many.connect();
 FakeWS.last.onopen?.();
 await tick();
 const before10 = sent.length;   // an index into sent, not an offer count — sent mixes message types
@@ -384,8 +384,7 @@ many.disconnect();
 // --- pinning: always reach a peer regardless of ring position -----------------
 {
   const pinned = new QOSPeer({ signalingUrl: "wss://x", roomId: "cap:room:0246", peerId: "pin-a" });
-  pinned.connect();
-  await tick();
+  await pinned.connect();
   FakeWS.last.onopen?.();
   await tick();
   // A big room, and — computed, not guessed by name (the ring wraps around,
@@ -466,7 +465,7 @@ many.disconnect();
   solo.channels.set("nb2", fakeChannel("nb2"));
   solo.roster = new Set(["relay-a", "nb1", "nb2", "far1"]);
 
-  solo.broadcast({ kind: "chat", text: "hi" });
+  solo.broadcast({ kind: "chat", text: "hi" }, { bulk: true });
   const toNb1 = sentTo.get("nb1")[0];
   check("broadcast tags every neighbor with a dedupe id, hop budget and origin",
         typeof toNb1._relayId === "string" && typeof toNb1._hops === "number" && toNb1._from === "relay-a",
@@ -489,8 +488,8 @@ many.disconnect();
     const cap = (n) => { const a = []; return { readyState: "open", sent: a, send: (p) => a.push(JSON.parse(p)) }; };
     const cb = cap(); before.channels.set("x", cb);
     const ca = cap(); after.channels.set("x", ca);
-    before.broadcast({ kind: "chat", text: "pre" });
-    after.broadcast({ kind: "chat", text: "post" });
+    before.broadcast({ kind: "chat", text: "pre" }, { bulk: true });
+    after.broadcast({ kind: "chat", text: "post" }, { bulk: true });
     check("a reloaded peer's first relay id differs from the pre-reload run's",
           ca.sent[0]._relayId !== cb.sent[0]._relayId, `${ca.sent[0]._relayId} vs ${cb.sent[0]._relayId}`);
     const rx = new QOSPeer({ signalingUrl: "wss://x", roomId: "cap:room:0246", peerId: "rx",
@@ -527,28 +526,142 @@ many.disconnect();
         !("_relayId" in relayDelivered[0].d) && !("_hops" in relayDelivered[0].d),
         JSON.stringify(relayDelivered[0].d));
 
-  // A directed send() with no direct channel to the target: floods, tagged
-  // with who it's for, delivered only there — not at us, a pass-through hop.
+  // A bulk send needs a direct channel: megabytes do not flood through
+  // neighbors, and never through the relay.
   sentTo.set("nb1", []); sentTo.set("nb2", []);
-  const sentOk = solo.send("far-target", { kind: "note-pass", token: "cap:note-USD:0246" });
-  check("send() to a non-neighbor floods rather than failing outright", sentOk === true, "send returned false");
-  const toNb1Directed = sentTo.get("nb1")[0];
-  check("a directed send is tagged with who it's actually for",
-        toNb1Directed._relayTo === "far-target", JSON.stringify(toNb1Directed));
+  const sentOk = solo.send("far-target", { kind: "lib-part", data: "…" }, { bulk: true });
+  check("a bulk send() to a peer with no direct channel is refused, not flooded",
+        sentOk === false && sentTo.get("nb1").length === 0, `returned ${sentOk}`);
 
+  // A directed relay from an older flood still passes through correctly.
   relayDelivered.length = 0;
   solo.handleRelay("nb1", { kind: "chat", text: "not for me", _relayId: "x:1", _hops: 3, _from: "x", _relayTo: "someone-else" });
   check("a directed relay not addressed to us passes through without delivering here",
         relayDelivered.length === 0, JSON.stringify(relayDelivered));
 
-  // Direct send: byte-identical, no tagging at all — old-build compatibility.
+  // A bulk send to an actual neighbor: raw and untagged on the channel.
   sentTo.set("nb1", []);
-  solo.send("nb1", { kind: "chat", text: "direct" });
-  check("send() to an actual neighbor is raw and untagged — backward compatible",
-        JSON.stringify(sentTo.get("nb1")[0]) === JSON.stringify({ kind: "chat", text: "direct" }),
+  solo.send("nb1", { kind: "lib-part", data: "…" }, { bulk: true });
+  check("a bulk send() to a direct neighbor is raw and untagged on the channel",
+        JSON.stringify(sentTo.get("nb1")[0]) === JSON.stringify({ kind: "lib-part", data: "…" }),
         JSON.stringify(sentTo.get("nb1")[0]));
 
   solo.disconnect();
+}
+
+// --- the control plane: sealed, relayed, resumable ---------------------------
+// Everything that is not media or bulk rides the signaling socket as a `data`
+// frame sealed under the room key. This is what makes a room survive a NAT
+// that no ICE pair crosses, and a socket blip that used to be a departure.
+{
+  const { deriveRoomKey, seal, roomIdFor } = await import("../src/room-crypto.js");
+  const settle = () => new Promise((r) => setTimeout(r, 30));   // real WebCrypto, real async
+  const got = [];
+  const ready = [];
+  const gone = [];
+  const cp = new QOSPeer({
+    signalingUrl: "wss://x", roomId: "cap:room:0246", peerId: "cp-me",
+    onMessage: (from, d) => got.push({ from, d }),
+    onPeerReady: (id) => ready.push(id),
+    onPeerLeft: (id) => gone.push(id),
+  });
+  await cp.connect();
+  FakeWS.last.onopen?.();
+  await tick();
+  const sock = FakeWS.last;
+  const wire = await roomIdFor("cap:room:0246");
+  const key = await deriveRoomKey("cap:room:0246");
+
+  // `sent` is shared with the checks below this block; slice it, never clear it.
+  let mark = sent.length;
+  const since = () => sent.slice(mark);
+  cp.channels.set("nb", { readyState: "open", send() { throw new Error("chat must not go over WebRTC"); } });
+  cp.broadcast({ kind: "chat", text: "secret words" });
+  cp.send("cp-other", { kind: "name", name: "me" });
+  await settle();
+  const frames = since().filter((m) => m.type === "data");
+  check("a broadcast and a send each leave as one sealed data frame on the socket",
+        frames.length === 2 && frames[0].to === undefined && frames[1].to === "cp-other", JSON.stringify(frames));
+  check("frames carry the hashed room id and our peerId as from",
+        frames.every((f) => f.roomId === wire && f.from === "cp-me"), JSON.stringify(frames));
+  check("nothing readable is on the wire",
+        !JSON.stringify(frames).includes("secret") && !JSON.stringify(frames).includes("chat"), JSON.stringify(frames));
+  check("frames leave in the order they were sent (a name before its sync)", (() => {
+    const plain = frames.map((f) => f.to === undefined ? "b" : "s").join("");
+    return plain === "bs";
+  })(), "order");
+  cp.channels.delete("nb");
+
+  // Inbound: what another peer sealed with the same token opens here.
+  const fromOther = await seal(key, "cp-other", { kind: "chat", text: "hello back" });
+  deliver({ type: "data", roomId: wire, from: "cp-other", payload: fromOther });
+  await settle();
+  check("a relayed frame sealed under the room key is delivered to onMessage with its true sender",
+        got.length === 1 && got[0].from === "cp-other" && got[0].d.text === "hello back", JSON.stringify(got));
+  got.length = 0;
+  // A relay that re-labels a frame's sender produces nothing.
+  deliver({ type: "data", roomId: wire, from: "cp-imposter", payload: fromOther });
+  await settle();
+  check("a frame whose sender label was changed in transit does not open — the relay cannot re-attribute",
+        got.length === 0, JSON.stringify(got));
+  // Another room's key produces nothing.
+  const otherKey = await deriveRoomKey("cap:room:1111");
+  deliver({ type: "data", roomId: wire, from: "cp-other", payload: await seal(otherKey, "cp-other", { kind: "chat", text: "x" }) });
+  await settle();
+  check("a frame from another room's key does not open", got.length === 0, JSON.stringify(got));
+
+  // Presence and the handshake come from the server, not from WebRTC.
+  ready.length = 0;
+  deliver({ type: "peers", peers: ["cp-a", "cp-b"], resumed: false });
+  check("a fresh join fires onPeerReady for everyone present (the handshake goes to each)",
+        ready.length === 2 && ready.includes("cp-a") && ready.includes("cp-b"), JSON.stringify(ready));
+  ready.length = 0;
+  deliver({ type: "peers", peers: ["cp-a", "cp-b"], resumed: true });
+  check("a resume fires onPeerReady for nobody — nothing was lost, nothing is re-served",
+        ready.length === 0, JSON.stringify(ready));
+  deliver({ type: "joined", peerId: "cp-c" });
+  check("a newcomer fires onPeerReady", ready.length === 1 && ready[0] === "cp-c", JSON.stringify(ready));
+  check("everyone the server lists is reachable, direct channel or not",
+        cp.isReachable("cp-a") && cp.isReachable("cp-c") && !cp.hasChannel("cp-a"), "reachability");
+
+  // A WebRTC link dying is not a departure.
+  gone.length = 0;
+  const dc = { readyState: "open", send() {}, close() {} };
+  cp.setupDataChannel("cp-a", dc);
+  dc.onopen();
+  dc.onclose();
+  check("a data channel closing to a peer the server still lists does not report them gone",
+        gone.length === 0 && cp.isReachable("cp-a"), JSON.stringify(gone));
+  deliver({ type: "left", peerId: "cp-a" });
+  check("the server's left is what reports a departure", gone.length === 1 && gone[0] === "cp-a", JSON.stringify(gone));
+
+  // The socket dies mid-sentence: what is typed is queued and lands on the
+  // resume, after the join, in order.
+  mark = sent.length;
+  sock.readyState = 3;
+  sock.onclose?.();
+  cp.broadcast({ kind: "chat", text: "typed while down" });
+  cp.broadcast({ kind: "chat", text: "and this" });
+  await settle();
+  check("nothing is sent on a dead socket", since().filter((m) => m.type === "data").length === 0, JSON.stringify(since()));
+  cp.wake();                       // the tab came back: reconnect now
+  await settle();
+  FakeWS.last.onopen?.();
+  await tick();
+  const after = since();
+  const order = after.map((m) => m.type);
+  check("on reconnect the join goes first, then the queued frames, in order",
+        order[0] === "join" && order[1] === "data" && order[2] === "data" && after[1].from === "cp-me",
+        JSON.stringify(order));
+  const q1 = await (async () => { const { open } = await import("../src/room-crypto.js"); return open(key, "cp-me", after[1].payload); })();
+  check("the queued frames are the ones typed while down", q1?.text === "typed while down", JSON.stringify(q1));
+
+  mark = sent.length;
+  cp.leave();
+  check("leave() tells the server at once, under the hashed room id",
+        since().length === 1 && since()[0].type === "leave" && since()[0].roomId === wire && since()[0].peerId === "cp-me",
+        JSON.stringify(since()));
+  cp.disconnect();
 }
 
 check("a peer that left is not dialled", offersTo("aaaa") === goneAt, `${offersTo("aaaa")} vs ${goneAt}`);

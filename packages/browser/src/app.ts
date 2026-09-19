@@ -1260,10 +1260,10 @@ function readConnection(row: { channel: string; connection: string; ice: string 
 }
 
 function reportUnreachable(id: string): void {
-  // isReachable, not hasChannel: under the bounded-degree overlay, "no
-  // direct channel" is the normal state for most peers past a handful in
-  // the room — it's only worth surfacing once there's also been no relay
-  // traffic from them at all (see peer.ts isReachable/lastHeardVia).
+  // isReachable, not hasChannel: chat rides the relayed control plane, so a
+  // peer the server lists gets what we type whether or not a direct WebRTC
+  // link exists (that link matters for calls and files — see /conn). This
+  // only fires for a peer we show that the server does not list at all.
   if (!qpeer || qpeer.isReachable(id) || !peers.has(id)) return;
   if (unreachableWarned.has(id)) return;
   // Long enough to be a problem rather than a handshake in progress. Timed from
@@ -1281,8 +1281,8 @@ function reportUnreachable(id: string): void {
     ? `⚠ the room is full — ${size} here, and a browser mesh holds about ${ROOM_HOLDS}. `
       + `${peerLabel(id)} is in the room but not connected to you: neither of you sees what the other types. `
       + `Split the group (five is where a room actually thinks together) or run your own signaling server.`
-    : `⚠ still not connected to ${peerLabel(id)} — they are in the room but no channel has opened, `
-      + `so neither of you sees what the other types. It keeps retrying.`,
+    : `⚠ ${peerLabel(id)} is listed here but the signaling server no longer lists them, `
+      + `so nothing typed reaches them. They will clear from the room, or come back, shortly.`,
     "system");
   if (row) {
     addMessage("", `   connection ${row.connection} · ice ${row.ice} — ${readConnection(row)}`, "system");
@@ -1298,11 +1298,10 @@ function reportUnreachable(id: string): void {
 }
 
 /**
- * Peers in the room we have no data channel to. They are not a rare edge: the
- * public signaling server rate-limits the offer/answer/ICE exchange itself, so
- * past a handful of peers a handshake simply never completes — everyone still
- * appears in the room, and nothing typed reaches them. Unmarked, that is
- * indistinguishable from chat being broken, which is how it gets reported.
+ * Peers we show that the relay cannot reach — not in the server's roster and
+ * no direct link either. Rare now that chat rides the relay (a WebRTC
+ * handshake that never completes no longer makes anyone unreachable); what
+ * is left is a roster disagreement, which clears itself on the next roster.
  */
 function unreachablePeers(): string[] {
   if (!qpeer) return [];
@@ -1643,17 +1642,16 @@ function renderPeers(): void {
   for (const id of peers) {
     const li = document.createElement("li");
     li.textContent = peerLabel(id);
-    // isReachable, not hasChannel: past a handful of peers, "no direct
-    // channel" is the ordinary state — most peers are reached over the
-    // bounded-degree overlay (ring + skip-links), not a direct link. This
-    // only lights up once there's also been no relay traffic from them.
+    // isReachable, not hasChannel: chat reaches everyone the server lists,
+    // through the relay, with or without a direct WebRTC link (which only
+    // calls and file transfers need — /conn shows those). This lights up
+    // only for a peer the server itself no longer lists.
     if (qpeer && !qpeer.isReachable(id)) {
       li.classList.add("unreachable");
       const warn = document.createElement("span");
       warn.textContent = " ⚠";
-      warn.title = "Not reachable — no direct channel and no relay traffic seen recently. Either "
-        + "the WebRTC handshake never completed, or every path to them (direct or via other "
-        + "peers) is down. Reload, drop a peer, or run your own signaling server.";
+      warn.title = "Not reachable — the signaling server no longer lists this peer, so nothing "
+        + "typed reaches them. They will clear from the room, or come back, shortly.";
       li.appendChild(warn);
     }
     const role = peerAgents.get(id);
@@ -6596,6 +6594,13 @@ async function connect(): Promise<void> {
         }
       } finally { setActiveRoom(prev); }
     },
+    onSignalingError(message) {
+      // The server refused something. Into the room, not only the console —
+      // "rate limit exceeded" or "older build" is a thing to read, not argue about.
+      const prev = activeRoom; setActiveRoom(ctx);
+      try { addMessage("", `⚠ signaling: ${message}`, "system"); }
+      finally { setActiveRoom(prev); }
+    },
     async onMessage(from, data) {
       const prev = activeRoom; setActiveRoom(ctx);
       try {
@@ -7716,12 +7721,12 @@ async function connect(): Promise<void> {
     onChannelOpen(peerId) {
       const prev = activeRoom; setActiveRoom(ctx);
       try {
-        // A data channel is open ⇒ this peer is connected, regardless of who
-        // initiated the offer. onPeerJoined only fires for signaling-driven joins,
-        // so a remote-initiated peer (e.g. an agent that offered to us) would never
-        // land in the roster. Add it here so the peer list reflects real channels.
-        // Always repaint, not only for a peer new to the roster: a peer already
-        // listed from signaling was being shown as unreachable until now.
+        // A direct WebRTC link — what a call or a file transfer needs. The
+        // handshake (name, sync-*) no longer hangs off this: it rides the
+        // relayed control plane in onPeerReady below, so a peer we never get
+        // a direct path to still gets it. Here: the roster (a remote-
+        // initiated link is proof of presence too) and the ⚠ that this
+        // link resolves.
         peers.add(peerId);
         // If we said this peer was unreachable, say that it worked out — a
         // warning left standing after the thing it warned about has fixed
@@ -7729,6 +7734,17 @@ async function connect(): Promise<void> {
         if (unreachableWarned.delete(peerId)) {
           addMessage("", `✓ connected to ${peerLabel(peerId)} after all`, "system");
         }
+        renderPeers();
+      } finally { setActiveRoom(prev); }
+    },
+    onPeerReady(peerId) {
+      const prev = activeRoom; setActiveRoom(ctx);
+      try {
+        // This peer can be sent to (fresh in the room, or we are): the
+        // handshake — who we are and everything the room has agreed so far.
+        // Fires once per session pairing, never on a silent resume, so a
+        // socket blip does not re-serve the room's whole state.
+        peers.add(peerId);
         renderPeers();
         signedSend(peerId, { kind: "name", name: myName });
         if (lemmaStore.size > 0) {
@@ -9613,6 +9629,15 @@ async function init(): Promise<void> {
   window.addEventListener("pageshow", wakeAllRooms);
   window.addEventListener("focus", wakeAllRooms);
   window.addEventListener("online", wakeAllRooms);
+  // Closing the tab is a departure; the server must not hold the seat for a
+  // person who has gone. Only a socket that *vanishes* (a phone switching
+  // apps, a wifi handoff, a lid) is grace-held and resumed — that case fires
+  // no pagehide, or one with `persisted` (the page is kept for a return).
+  // Send the leave on the live socket; there is no time to do more.
+  window.addEventListener("pagehide", (e) => {
+    if (e.persisted) return;
+    for (const ctx of rooms.values()) ctx.qpeer?.leave();
+  });
 
   // Restore saved name
   myNameEl.value = myName;

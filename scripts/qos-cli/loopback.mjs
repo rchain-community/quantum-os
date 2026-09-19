@@ -2,47 +2,15 @@
 // QOSPeer instances in the same room, exchanging a chat over WebRTC. Verifies
 // the werift↔werift handshake and the inbound-message hook end to end, with no
 // browser and no external server. Run: node loopback.mjs
-import { WebSocketServer } from "ws";
+import { startRelay } from "./mini-relay.mjs";
 import { QOSPeer } from "./qospeer.mjs";
 import { generateCapability } from "./zfa.mjs";
 
 const PORT = 4456;
 const ROOM = "cap:room:" + "0167".repeat(8); // any well-formed-ish room id
 
-// ---- minimal signaling relay (join/peers/joined/left/offer/answer/ice/leave) ----
-const rooms = new Map();           // roomId -> Map<peerId, ws>
-const wsPeer = new Map();          // ws -> { roomId, peerId }
-const wss = new WebSocketServer({ port: PORT });
-const send = (ws, m) => { try { ws.send(JSON.stringify(m)); } catch {} };
-
-wss.on("connection", (ws) => {
-  ws.on("message", (raw) => {
-    let m; try { m = JSON.parse(raw.toString()); } catch { return; }
-    if (m.type === "join") {
-      const room = rooms.get(m.roomId) ?? new Map();
-      rooms.set(m.roomId, room);
-      wsPeer.set(ws, { roomId: m.roomId, peerId: m.peerId });
-      const others = [...room.keys()];
-      room.set(m.peerId, ws);
-      send(ws, { type: "peers", roomId: m.roomId, peers: others });
-      for (const [pid, pws] of room) if (pid !== m.peerId) send(pws, { type: "joined", roomId: m.roomId, peerId: m.peerId });
-    } else if (m.type === "offer" || m.type === "answer" || m.type === "ice") {
-      const room = rooms.get(m.roomId);
-      const target = room?.get(m.to);
-      if (target) send(target, m);
-    } else if (m.type === "leave") {
-      const room = rooms.get(m.roomId);
-      room?.delete(m.peerId);
-      if (room) for (const pws of room.values()) send(pws, { type: "left", roomId: m.roomId, peerId: m.peerId });
-    }
-  });
-  ws.on("close", () => {
-    const info = wsPeer.get(ws); wsPeer.delete(ws);
-    if (!info) return;
-    const room = rooms.get(info.roomId); room?.delete(info.peerId);
-    if (room) for (const pws of room.values()) send(pws, { type: "left", roomId: info.roomId, peerId: info.peerId });
-  });
-});
+// ---- minimal signaling relay (shared: mini-relay.mjs) ----
+const { wss } = startRelay(PORT);
 
 // ---- two peers ----
 const url = `ws://localhost:${PORT}`;
