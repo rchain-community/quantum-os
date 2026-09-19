@@ -664,6 +664,61 @@ many.disconnect();
   cp.disconnect();
 }
 
+// --- a phone that switched apps: the socket says open and is a corpse ------
+// The OS drops the TCP under a frozen tab; on return the WebSocket still
+// reads OPEN for minutes. readyState is a claim; the join's reply is proof.
+{
+  const { deriveRoomKey, open } = await import("../src/room-crypto.js");
+  const key = await deriveRoomKey("cap:room:0246");
+  const settle = () => new Promise((r) => setTimeout(r, 30));
+  QOSPeer.WAKE_PROBE_MS = 60;
+  const closes = [];
+  const z = new QOSPeer({ signalingUrl: "wss://x", roomId: "cap:room:0246", peerId: "zz-me",
+    onSignalingClose: () => closes.push(1) });
+  await z.connect();
+  FakeWS.last.onopen?.();
+  await tick();
+  const corpse = FakeWS.last;
+  let mark = sent.length;
+  const since = () => sent.slice(mark);
+
+  // Back in the foreground. The socket claims OPEN; nothing answers.
+  z.wake();
+  z.broadcast({ kind: "chat", text: "typed on return" });
+  await settle();
+  check("waking sends a join on the socket that claims to be open",
+        since().some((m) => m.type === "join"), JSON.stringify(since()));
+  check("what is typed before the socket proves itself waits, rather than going into the void",
+        since().filter((m) => m.type === "data").length === 0, JSON.stringify(since()));
+  await new Promise((r) => setTimeout(r, 120));   // past WAKE_PROBE_MS, no reply
+  check("a socket that does not answer the join is declared dead and replaced",
+        FakeWS.last !== corpse && corpse.readyState === 3 && closes.length === 1,
+        `same socket: ${FakeWS.last === corpse}, closes: ${closes.length}`);
+  mark = sent.length;
+  FakeWS.last.onopen?.();
+  await tick();
+  const after = since();
+  check("the new socket joins, then delivers what was typed on return",
+        after[0]?.type === "join" && after[1]?.type === "data"
+        && (await open(key, "zz-me", after[1].payload))?.text === "typed on return",
+        JSON.stringify(after.map((m) => m.type)));
+
+  // The other case: the socket answers. Nothing is torn down.
+  const live = FakeWS.last;
+  mark = sent.length;
+  z.wake();
+  z.broadcast({ kind: "chat", text: "held briefly" });
+  await settle();
+  live.onmessage?.({ data: JSON.stringify({ type: "peers", peers: [], resumed: true }) });
+  await settle();
+  check("a socket that answers is kept, and the held line goes out at once",
+        FakeWS.last === live && since().some((m) => m.type === "data") && closes.length === 1,
+        JSON.stringify(since().map((m) => m.type)));
+  await new Promise((r) => setTimeout(r, 120));
+  check("...and the probe does not fire after the answer", FakeWS.last === live && closes.length === 1, "reconnected anyway");
+  z.disconnect();
+}
+
 check("a peer that left is not dialled", offersTo("aaaa") === goneAt, `${offersTo("aaaa")} vs ${goneAt}`);
 
 Date.now = realNow;

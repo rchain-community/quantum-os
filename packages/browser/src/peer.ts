@@ -31,6 +31,7 @@ type SignalMsg =
   | { type: "answer";  roomId: string; from: string; to: string; sdp: string }
   | { type: "ice";     roomId: string; from: string; to: string; candidate: RTCIceCandidateInit }
   | { type: "data";    roomId: string; from: string; to?: string; payload: string }
+  | { type: "pong";    t?: number }
   | { type: "error";   message: string };
 
 /** Options on send()/broadcast(). */
@@ -253,6 +254,32 @@ export class QOSPeer {
   private static readonly OUTBOX_MAX = 256;
   private warnedOldServer = false;
   /**
+   * Liveness of the socket, decided by traffic rather than by readyState.
+   *
+   * A phone that switches apps has its TCP connection dropped by the OS while
+   * the tab is frozen, and when the tab comes back the WebSocket still says
+   * OPEN — for minutes, until the TCP stack gives up. Everything sent goes
+   * into that void, the server's own ping/pong never reaches the page (a
+   * browser answers pings invisibly and cannot send one), and nothing
+   * reconnects. So the socket is trusted only while it is heard from:
+   * `lastInboundAt` is any frame at all, an app-level `ping` is sent when it
+   * has been quiet, and silence past a limit means the socket is dead
+   * whatever it claims. On wake() the socket is *suspect* until the join's
+   * own `peers` reply proves it — and while suspect, what is typed waits in
+   * the outbox rather than being sent into a socket that may be a corpse.
+   */
+  private lastInboundAt = 0;
+  private suspect = false;
+  private probeTimer: ReturnType<typeof setTimeout> | null = null;
+  private livenessTimer: ReturnType<typeof setInterval> | null = null;
+  /** How long a woken socket has to answer the join before it is declared dead. */
+  static WAKE_PROBE_MS = 4_000;
+  /** Ping when nothing has been heard for this long… */
+  private static readonly QUIET_MS = 25_000;
+  /** …and give up on the socket when nothing has been heard for this long. */
+  private static readonly SILENT_MS = 70_000;
+  private static readonly LIVENESS_TICK_MS = 10_000;
+  /**
    * The server cuts a socket that sends a frame over its cap (256 KB,
    * `SIGNAL_MAX_PAYLOAD`), and a cut socket loses everything queued behind
    * the frame. Refuse the one frame instead, loudly.
@@ -388,6 +415,8 @@ export class QOSPeer {
     if (this.leaseTimer) clearInterval(this.leaseTimer);
     if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
     if (this._stableTimer) clearTimeout(this._stableTimer);
+    if (this.livenessTimer) clearInterval(this.livenessTimer);
+    if (this.probeTimer) clearTimeout(this.probeTimer);
     this.outbox = [];
     // An explicit leave is immediate on the server; only a socket that
     // *vanishes* is grace-held. Closing the tab must not hold a seat.
@@ -426,8 +455,57 @@ export class QOSPeer {
     } else if (ws.readyState === WebSocket.OPEN) {
       // A re-join on a live socket is a resume on the server: silent to the
       // room, and it re-sends the roster so anything we missed is refreshed.
+      // It is also the probe: OPEN is a claim, the `peers` reply is proof.
+      // Until it arrives the socket is suspect and outbound waits (see
+      // queueSealed); if it never arrives, the socket is a corpse — close it
+      // and reconnect now, at which point the outbox is flushed after the
+      // fresh join (a resume, if inside the server's grace).
+      this.suspect = true;
       this.signal({ type: "join", roomId: this.wireRoomId, peerId: this.peerId });
+      if (this.probeTimer) clearTimeout(this.probeTimer);
+      this.probeTimer = setTimeout(() => {
+        this.probeTimer = null;
+        if (!this.suspect || this.ws !== ws) return;
+        console.warn("[qos-peer] woke to a socket that says open but does not answer — reconnecting");
+        this.declareSocketDead(ws);
+      }, QOSPeer.WAKE_PROBE_MS);
     }
+  }
+
+  /// A socket that has stopped answering. Closing it fires onclose, which
+  /// schedules the reconnect; the backoff is reset because this is a
+  /// detected death, not a refused connect.
+  private declareSocketDead(ws: WebSocket): void {
+    this.suspect = false;
+    this._reconnectDelay = QOSPeer.RECONNECT_MIN;
+    try { ws.close(); } catch { /* ignore */ }
+    // Some browsers only fire onclose once the close handshake completes,
+    // which on a dead TCP connection is never. Detach and reconnect ourselves.
+    if (this.ws === ws) {
+      ws.onclose = null;
+      this.ws = null;
+      if (this._stableTimer) { clearTimeout(this._stableTimer); this._stableTimer = null; }
+      this.config.onSignalingClose?.();
+      if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
+      void this._reconnectSignaling();
+    }
+  }
+
+  /// Any frame at all proves the socket. Clears a wake-time suspicion and
+  /// releases what was waiting on it.
+  private heard(): void {
+    this.lastInboundAt = Date.now();
+    if (!this.suspect) return;
+    this.suspect = false;
+    if (this.probeTimer) { clearTimeout(this.probeTimer); this.probeTimer = null; }
+    this.flushOutbox();
+  }
+
+  private flushOutbox(): void {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const pending = this.outbox; this.outbox = [];
+    for (const text of pending) ws.send(text);
   }
 
   /**
@@ -581,7 +659,7 @@ export class QOSPeer {
         console.error(`[qos-peer] not sending a ${String(kind)} frame of ${text.length} bytes — over the relay's cap; bulk goes over WebRTC ({bulk:true})`);
         return;
       }
-      if (this.ws?.readyState === WebSocket.OPEN) { this.ws.send(text); return; }
+      if (this.ws?.readyState === WebSocket.OPEN && !this.suspect) { this.ws.send(text); return; }
       if (this._disconnected) return;
       this.outbox.push(text);
       if (this.outbox.length > QOSPeer.OUTBOX_MAX) this.outbox.shift();
@@ -728,6 +806,7 @@ export class QOSPeer {
     }, QOSPeer.STABLE_MS);
 
     ws.onmessage = (event) => {
+      this.heard();
       try {
         const msg = JSON.parse(event.data) as SignalMsg;
         this.handleSignal(msg);
@@ -736,8 +815,26 @@ export class QOSPeer {
       }
     };
 
+    // Liveness by traffic (see lastInboundAt). A fresh socket starts trusted.
+    this.suspect = false;
+    this.lastInboundAt = Date.now();
+    if (this.livenessTimer) clearInterval(this.livenessTimer);
+    this.livenessTimer = setInterval(() => {
+      if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+      const quiet = Date.now() - this.lastInboundAt;
+      if (quiet > QOSPeer.SILENT_MS) {
+        console.warn(`[qos-peer] nothing heard from signaling for ${Math.round(quiet / 1000)}s — reconnecting`);
+        this.declareSocketDead(ws);
+      } else if (quiet > QOSPeer.QUIET_MS) {
+        this.signal({ type: "ping", t: Date.now() });
+      }
+    }, QOSPeer.LIVENESS_TICK_MS);
+
     ws.onclose = () => {
       if (this._stableTimer) { clearTimeout(this._stableTimer); this._stableTimer = null; }
+      if (this.livenessTimer) { clearInterval(this.livenessTimer); this.livenessTimer = null; }
+      if (this.probeTimer) { clearTimeout(this.probeTimer); this.probeTimer = null; }
+      this.suspect = false;
       if (this._disconnected) return;
       this.config.onSignalingClose?.();
       this._scheduleReconnect();
@@ -746,8 +843,7 @@ export class QOSPeer {
     // Join the room — a resume, if the server still holds our seat.
     this.signal({ type: "join", roomId: this.wireRoomId, peerId: this.peerId });
     // Then whatever was typed while the socket was down.
-    const pending = this.outbox; this.outbox = [];
-    for (const text of pending) ws.send(text);
+    this.flushOutbox();
     this.config.onSignalingOpen?.();
   }
 
@@ -856,6 +952,8 @@ export class QOSPeer {
       case "data":
         this.receiveSealed(msg);
         break;
+      case "pong":
+        break;   // heard() already did the work
       case "error":
         // Surfaced, not swallowed. "rate limit exceeded" is the server telling
         // us the room is bigger than the join burst it will carry — the exact
