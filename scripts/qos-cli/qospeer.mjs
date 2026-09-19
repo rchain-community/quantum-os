@@ -12,6 +12,25 @@ import WebSocket from "ws";
 // importing it here patches the shared prototype for every werift consumer.
 import { RTCPeerConnection } from "./werift-patched.mjs";
 import { ringSkipNeighbors } from "./ring-neighbors.mjs";
+// The room key and the hashed room id — the one file the browser runs too, so
+// an agent and a browser cannot derive them differently (plain JS, no deps).
+import { roomIdFor, deriveRoomKey, seal, open } from "../../packages/browser/src/room-crypto.js";
+
+// TRANSPORT (the Jitsi-shaped rebuild, 2026-09 — the full note is at the top of
+// packages/browser/src/peer.ts). The control plane — every envelope that is
+// not media or bulk — rides the signaling socket as a sealed `data` frame; the
+// server relays what it cannot read, holds a seat through a socket blip, and
+// resumes it on rejoin. Membership is the server's roster. WebRTC stays for
+// calls (rejected here, see _rejectMedia) and for bulk (attachments, /file
+// get), which an agent still relays between two browsers that cannot reach
+// each other directly — that is why werift is still dialled at all.
+//
+// CALLBACKS: `onPeerReady(id)` fires when a peer can be sent to (each peer on
+// a fresh join, each newcomer; never on a silent resume) and is where an agent
+// announces itself and serves state. A consumer that only gives
+// `onChannelOpen` gets it called with exactly that meaning (the handshake it
+// was already doing there, now on a path every peer has); one that also gives
+// `onPeerReady` gets `onChannelOpen` for the direct WebRTC link alone.
 
 const DEFAULT_ICE = [{ urls: "stun:stun.l.google.com:19302" }];
 // How long a connection may sit in ICE "disconnected" before we tear it down.
@@ -30,9 +49,10 @@ const PRUNE_GRACE_MS = 30_000;
 const SEEN_RELAY_MAX = 5000;
 const REACHABLE_WINDOW_MS = 45_000;
 const ATTEMPT_PATIENCE_MS = 45_000;   // how long a dial/answer in flight is left alone before a redial is allowed
-const PRESENCE_FLOOD_MS = 30_000;
 const REAP_MS = 20_000;              // how often _reapOrphans runs
-const REAP_STUCK_MS = 90_000;       // a channel-less pc older than this is reaped even if still in the roster
+const REAP_STUCK_MS = 90_000;
+const OUTBOX_MAX = 256;              // frames held for the socket's return; oldest dropped
+const FRAME_MAX = 250 * 1024;        // under the server's 256 KB cap — it cuts the socket over it       // a channel-less pc older than this is reaped even if still in the roster
 
 // The ICE username fragment identifies an ICE session; a peer that reconnects (or
 // reloads its browser) brings a new one. Used to tell a genuine renegotiation
@@ -64,22 +84,25 @@ export class QOSPeer {
     // reload/restart (the counter restarts at 0), so a restarted peer's first
     // messages get deduped away by peers still holding the old ids. See peer.ts.
     this._relaySession = Math.random().toString(36).slice(2, 10);
-    this.lastHeardVia = new Map();        // peerId -> last relay-traffic timestamp, see isReachable
-    this._presenceTimer = null;
+    this.lastHeardVia = new Map();        // peerId -> last bulk-relay-traffic timestamp, see isReachable
     this._reapTimer = null;
+    this.wireRoomId = "";                 // what the server is told: a hash of the token
+    this.roomKey = null;                  // AES-GCM under HKDF of the token; derived in connect()
+    this._sealChain = Promise.resolve();  // envelopes leave in the order they were sent
+    this._openChain = Promise.resolve();  // and arrive in the order they were relayed
+    this._outbox = [];                    // frames sealed while the socket was down
     this._autoTurn = [];                  // fetched relay, see _loadAutoTurn
   }
 
-  connect() {
+  async connect() {
     this._disconnected = false;
+    if (!this.roomKey) {
+      this.wireRoomId = await roomIdFor(this.config.roomId);
+      this.roomKey = await deriveRoomKey(this.config.roomId);
+    }
+    if (this._disconnected) return;
     this._openSignaling().catch(() => this._scheduleReconnect());
     void this._loadAutoTurn();
-    // Keeps isReachable() honest for peers who are relay-only (past direct
-    // reach) and otherwise never send anything themselves.
-    if (!this._presenceTimer) {
-      this._presenceTimer = setInterval(() => this.broadcast({ kind: "presence" }), PRESENCE_FLOOD_MS);
-      this._presenceTimer.unref?.();
-    }
     // Reap orphaned peer connections. werift's ICE layer has no consent-freshness
     // timer, so a peer that vanishes ungracefully (a phone losing wifi, no
     // `leave` sent) can park a pc that never reaches "failed" — its SCTP
@@ -193,9 +216,15 @@ export class QOSPeer {
   /// from "do we have a direct channel to them" — most peers past a handful
   /// in the room are reached over the overlay, not directly.
   isReachable(peerId) {
+    if (this.roster.has(peerId)) return true;   // the relay reaches everyone the server lists
     if (this._channelOpen(this.channels.get(peerId))) return true;
     const last = this.lastHeardVia.get(peerId);
     return last !== undefined && Date.now() - last < REACHABLE_WINDOW_MS;
+  }
+
+  /// A peer can be sent to — see the CALLBACKS note at the top.
+  _ready(id) {
+    (this.config.onPeerReady ?? this.config.onChannelOpen)?.(id);
   }
 
   /**
@@ -257,9 +286,9 @@ export class QOSPeer {
   disconnect() {
     this._disconnected = true;
     if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
-    if (this._presenceTimer) clearInterval(this._presenceTimer);
     if (this._reapTimer) clearInterval(this._reapTimer);
-    this._signal({ type: "leave", roomId: this.config.roomId, peerId: this.peerId });
+    this._outbox = [];
+    this._signal({ type: "leave", roomId: this.wireRoomId, peerId: this.peerId });
     for (const pc of this.connections.values()) { try { pc.close(); } catch {} }
     try { this.ws?.close(); } catch {}
     this.connections.clear();
@@ -268,43 +297,61 @@ export class QOSPeer {
     this.pruneTimers.clear();
   }
 
-  /// Direct and raw if we hold an open channel to them (unchanged, byte-
-  /// identical to before). Otherwise flood-routes over the bounded-degree
-  /// overlay: tagged with a dedupe id, a remaining-hop budget, and who it's
-  /// actually for, so every neighbor relays it onward until it reaches
-  /// someone who is. No routing table — see peer.ts for the full rationale.
-  send(targetPeerId, data) {
-    const ch = this.channels.get(targetPeerId);
-    if (this._channelOpen(ch)) {
+  /// Send to one peer over the control plane — sealed, relayed by the
+  /// server, queued for them through a blip (and here through ours). True
+  /// whenever they are addressable at all. `{ bulk: true }` goes over a
+  /// direct channel only, and is false without one — megabytes do not go
+  /// through the relay.
+  send(targetPeerId, data, opts) {
+    if (opts?.bulk) {
+      const ch = this.channels.get(targetPeerId);
+      if (!this._channelOpen(ch)) return false;
       try { ch.send(JSON.stringify(data)); return true; } catch { return false; }
     }
-    if (this.channels.size === 0) return false;
-    const tagged = {
-      ...data,
-      _relayId: this._nextRelayId(), _hops: this._hopBudget(), _from: this.peerId, _relayTo: targetPeerId,
-    };
-    const payload = JSON.stringify(tagged);
-    let sent = false;
-    for (const other of this.channels.values()) {
-      if (this._channelOpen(other)) { try { other.send(payload); sent = true; } catch {} }
-    }
-    return sent;
+    if (!this.roomKey) return false;
+    this._queueSealed(targetPeerId, data);
+    return true;
   }
 
-  /// Flooded over the overlay (see ringSkipNeighbors) — tagged with a dedupe
-  /// id and a remaining-hop budget so a peer beyond direct reach still gets
-  /// it via relay. A room of five or fewer is still direct to everyone, so
-  /// this degenerates to exactly the old fan-out.
-  broadcast(data) {
-    const tagged = { ...data, _relayId: this._nextRelayId(), _hops: this._hopBudget(), _from: this.peerId };
-    const payload = JSON.stringify(tagged);
-    // Write directly rather than through send(): every entry here is by
-    // definition an open channel, so send()'s no-direct-link flood-fallback
-    // — which would add a _relayTo that doesn't belong on a broadcast —
-    // must never run here.
-    for (const ch of this.channels.values()) {
-      if (this._channelOpen(ch)) { try { ch.send(payload); } catch {} }
+  /// Broadcast to the room over the control plane: one sealed frame to the
+  /// server, fanned out to everyone present and queued for anyone held.
+  /// `{ bulk: true }` floods the WebRTC overlay instead (see _handleRelay).
+  broadcast(data, opts) {
+    if (opts?.bulk) {
+      const tagged = { ...data, _relayId: this._nextRelayId(), _hops: this._hopBudget(), _from: this.peerId };
+      const payload = JSON.stringify(tagged);
+      for (const ch of this.channels.values()) {
+        if (this._channelOpen(ch)) { try { ch.send(payload); } catch {} }
+      }
+      return;
     }
+    if (!this.roomKey) return;
+    this._queueSealed(undefined, data);
+  }
+
+  _queueSealed(to, data) {
+    const key = this.roomKey;
+    this._sealChain = this._sealChain.then(async () => {
+      const payload = await seal(key, this.peerId, data);
+      const frame = { type: "data", roomId: this.wireRoomId, from: this.peerId, payload };
+      if (to !== undefined) frame.to = to;
+      const text = JSON.stringify(frame);
+      if (text.length > FRAME_MAX) { this.config.onError?.(new Error(`not sending a ${data?.kind} frame of ${text.length} bytes — over the relay's cap`)); return; }
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) { this.ws.send(text); return; }
+      if (this._disconnected) return;
+      this._outbox.push(text);
+      if (this._outbox.length > OUTBOX_MAX) this._outbox.shift();
+    }).catch((e) => this.config.onError?.(e));
+  }
+
+  _receiveSealed(msg) {
+    const key = this.roomKey;
+    if (!key) return;
+    this._openChain = this._openChain.then(async () => {
+      const obj = await open(key, msg.from, msg.payload);
+      if (obj === null || this._disconnected) return;
+      this.config.onMessage?.(msg.from, obj);
+    }).catch((e) => this.config.onError?.(e));
   }
 
   _signal(msg) {
@@ -370,7 +417,9 @@ export class QOSPeer {
       this.config.onSignalingClose?.(code, String(reason ?? ""));
       this._scheduleReconnect();
     });
-    this._signal({ type: "join", roomId: this.config.roomId, peerId: this.peerId });
+    this._signal({ type: "join", roomId: this.wireRoomId, peerId: this.peerId });
+    const pending = this._outbox; this._outbox = [];
+    for (const text of pending) ws.send(text);
     this.config.onSignalingOpen?.();
   }
 
@@ -394,6 +443,7 @@ export class QOSPeer {
         const targets = this.targetPeers();
         for (const peerId of msg.peers) {
           this.config.onPeerJoined?.(peerId);
+          if (!msg.resumed) this._ready(peerId);   // fresh in the room: they need our handshake
           if (!targets.has(peerId)) continue;
           if (this._channelOpen(this.channels.get(peerId))) continue;
           if (this._connecting(peerId)) continue;   // attempt in flight — leave it
@@ -407,6 +457,7 @@ export class QOSPeer {
         // now want each other, but only the joiner has the trigger to dial.
         this.roster.add(msg.peerId);
         this.config.onPeerJoined?.(msg.peerId); // newcomer initiates to us
+        this._ready(msg.peerId);
         this._reconcilePrune();
         break;
       case "left":
@@ -423,6 +474,7 @@ export class QOSPeer {
       case "offer":  this._handleOffer(msg.from, msg.sdp).catch((e) => this.config.onError?.(e)); break;
       case "answer": this._handleAnswer(msg.from, msg.sdp).catch((e) => this.config.onError?.(e)); break;
       case "ice":    this._handleIce(msg.from, msg.candidate).catch(() => {}); break;
+      case "data":   this._receiveSealed(msg); break;
       case "error":  this.config.onError?.(new Error(msg.message)); break;
     }
   }
@@ -437,7 +489,7 @@ export class QOSPeer {
     const pc = new RTCPeerConnection({ iceServers: this._iceServers() });
     this._onIce(pc, (candidate) => {
       if (!candidate) return;
-      this._signal({ type: "ice", roomId: this.config.roomId, from: this.peerId, to: remoteId, candidate: candidate.toJSON ? candidate.toJSON() : candidate });
+      this._signal({ type: "ice", roomId: this.wireRoomId, from: this.peerId, to: remoteId, candidate: candidate.toJSON ? candidate.toJSON() : candidate });
     });
     const stateEvt = pc.connectionStateChange ?? pc.iceConnectionStateChange;
     // Teardown on BOTH terminal states. werift never escalates "disconnected" to
@@ -449,14 +501,18 @@ export class QOSPeer {
     // a core indefinitely. "disconnected" can also be a recoverable blip, so give it
     // a grace period and re-check that the SAME pc is still stuck before dropping it.
     if (stateEvt?.subscribe) stateEvt.subscribe((s) => {
-      if (s === "failed") { this._cleanup(remoteId); this.config.onPeerLeft?.(remoteId); }
+      // A direct link dying is not a departure: who is in the room is the
+      // server's word. Tear the pc down (the SCTP-orphan fix above still
+      // applies) and report a departure only for a peer the server has
+      // already forgotten.
+      const gone = () => { this._cleanup(remoteId); if (!this.roster.has(remoteId)) this.config.onPeerLeft?.(remoteId); };
+      if (s === "failed") gone();
       else if (s === "disconnected") {
         setTimeout(() => {
           if (this.connections.get(remoteId) !== pc) return;                       // already replaced/cleaned
           const now = pc.connectionState ?? pc.iceConnectionState;
           if (now !== "disconnected") return;                                      // recovered
-          this._cleanup(remoteId);
-          this.config.onPeerLeft?.(remoteId);
+          gone();
         }, DISCONNECT_GRACE_MS).unref?.();
       }
     });
@@ -465,7 +521,9 @@ export class QOSPeer {
   }
 
   _setupChannel(remoteId, ch) {
-    const onOpen = () => { this.channels.set(remoteId, ch); this.config.onChannelOpen?.(remoteId); };
+    // The direct link: only a consumer that distinguishes it (gives onPeerReady
+    // too) hears about it here — see the CALLBACKS note at the top.
+    const onOpen = () => { this.channels.set(remoteId, ch); if (this.config.onPeerReady) this.config.onChannelOpen?.(remoteId); };
     if (ch.stateChanged?.subscribe) {
       ch.stateChanged.subscribe((state) => { if (state === "open") onOpen(); else if (state === "closed") this.channels.delete(remoteId); });
     } else {
@@ -540,7 +598,7 @@ export class QOSPeer {
       this._setupChannel(remoteId, ch);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      this._signal({ type: "offer", roomId: this.config.roomId, from: this.peerId, to: remoteId, sdp: pc.localDescription?.sdp ?? offer.sdp });
+      this._signal({ type: "offer", roomId: this.wireRoomId, from: this.peerId, to: remoteId, sdp: pc.localDescription?.sdp ?? offer.sdp });
     } finally {
       this.makingOffer.set(remoteId, false);
     }
@@ -581,7 +639,7 @@ export class QOSPeer {
         this._rejectMedia(existing);
         const answer = await existing.createAnswer();
         await existing.setLocalDescription(answer);
-        this._signal({ type: "answer", roomId: this.config.roomId, from: this.peerId, to: fromId, sdp: existing.localDescription?.sdp ?? answer.sdp });
+        this._signal({ type: "answer", roomId: this.wireRoomId, from: this.peerId, to: fromId, sdp: existing.localDescription?.sdp ?? answer.sdp });
       } catch (e) { this.config.onError?.(e); }
       return;
     }
@@ -607,7 +665,7 @@ export class QOSPeer {
     this._rejectMedia(pc);
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-    this._signal({ type: "answer", roomId: this.config.roomId, from: this.peerId, to: fromId, sdp: pc.localDescription?.sdp ?? answer.sdp });
+    this._signal({ type: "answer", roomId: this.wireRoomId, from: this.peerId, to: fromId, sdp: pc.localDescription?.sdp ?? answer.sdp });
   }
 
   // A node agent is data-only. When a browser peer starts a call it renegotiates

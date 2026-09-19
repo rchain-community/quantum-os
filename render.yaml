@@ -15,7 +15,17 @@ services:
     # NOT change the live service. quantum-os-signaling was hand-created, not
     # deployed from this blueprint (see the autoDeploy note below), so Render
     # ignores render.yaml's settings for it. The plan change has to be made in
-    # the dashboard: Settings -> Instance Type -> Starter.
+    # the dashboard: the SERVICE's Settings -> Instance Type (not the
+    # workspace plan — "Pro" there changes nothing about cold starts). If the
+    # dashboard offers no paid instance type, two ways out: an external HTTP
+    # pinger hitting GET / every 10 min (a WebSocket ping does not count as
+    # inbound traffic for the idle timer), or `fly deploy` from
+    # packages/signaling — its fly.toml is already an always-on config
+    # (auto_stop_machines off, min_machines_running 1).
+    #
+    # 2026-09-18: the resume/relay build makes a restart a blip rather than a
+    # room-wide storm (docs/connection.md "The transport"), but a host that
+    # sleeps still costs every peer its socket every time it wakes.
     plan: starter
     envVars:
       - key: PORT
@@ -26,10 +36,17 @@ services:
       # at about four peers and handshakes stop completing — while every peer
       # still appears in the room, which is indistinguishable from the others
       # never having arrived. 200/s holds a full cast; the messages are small
-      # and the 64 KB payload cap and wsIndex relay auth are what actually
+      # and the 256 KB payload cap and wsIndex relay auth are what actually
       # guard the server.
       - key: SIGNAL_RATE_LIMIT
         value: "200"
+      # How long a seat is held after its socket dies before the room is told
+      # the peer left (a rejoin inside it is a silent resume). Code default
+      # 60000. The clients reconnect from 1.5-3s and double on failure, so a
+      # seat is only missed when the server itself was unreachable for most
+      # of the window — in which case it restarted and the seat is gone anyway.
+      - key: SIGNAL_GRACE_MS
+        value: "60000"
       # Cloudflare Realtime TURN Service credentials — mint short-lived relay
       # credentials for GET /turn (packages/signaling/src/turn.ts), which is
       # what makes a call work between two peers who can't form a direct ICE

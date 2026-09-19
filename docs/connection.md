@@ -1,18 +1,84 @@
 # Connection & networking
 
-Detail split out of [CLAUDE.md](../CLAUDE.md). Covers the signaling relay, room
-capacity, the bounded-degree overlay, leased peer IDs, `/ice` diagnostics, the
-default TURN relay, and the signaling-reconnect / false leave-join fixes.
+Detail split out of [CLAUDE.md](../CLAUDE.md). Covers the transport (the
+relayed, room-keyed control plane), the signaling relay's trust model, room
+capacity, the bounded-degree WebRTC overlay, leased peer IDs, `/ice`
+diagnostics, the default TURN relay, and the signaling-reconnect / false
+leave-join fixes.
 
 ---
+
+## The transport — one connection per person, and a seat that survives a blip
+
+Modelled on what works (Jitsi), after a season of "people keep getting
+dropped": every participant holds **one** connection that the room depends on
+— the signaling WebSocket, TLS on 443, to a host with a public address — and
+that is the path chat and state take. WebRTC is kept for what only it can do.
+
+| | control plane | media & bulk |
+|---|---|---|
+| carries | chat, `name`, lemmas, notes, polls, gov, every `sync-*` — every envelope that is not below | calls (`MediaStreamTrack`s), attachments (`file-start`/`file-chunk`), `/file get` (`lib-part`) |
+| path | `{type:"data"}` frame over the signaling socket, relayed by the server | direct WebRTC data channel / media, dialled over the ring+skip overlay below |
+| when it fails | the server holds the seat (below) and the client queues (`outbox`) — a blip loses nothing | the sweep redials; the link is opportunistic and nothing the room depends on |
+| API | `send(to, msg)` / `broadcast(msg)` | `send(to, msg, {bulk:true})` (needs `hasChannel`) / `broadcast(msg, {bulk:true})` (floods the overlay) |
+
+**The relay cannot read the room.** Each frame's payload is the envelope
+sealed with **AES-256-GCM under a key derived by HKDF-SHA256 from the room
+capability token** (`packages/browser/src/room-crypto.js` — plain JS, the same
+file the browser and the Node agents both run, so one derivation, not two).
+The sender's peerId is bound in as GCM additional data, so a relay that
+re-labels a frame's `from` produces a frame nobody can open. The server is
+told only `SHA-256("qos-room-id:" + token)` as the room's name — it **used to
+be handed the raw token on `join`**, i.e. the capability to join any room it
+relayed. Now holding the room's name is not holding the room. Symmetric only,
+no keypair: nothing here is exposed to Shor (see [SECURITY.md](../SECURITY.md)).
+What it does *not* do is stop the relay replaying a frame under its original
+`from` — the dyncap-signed kinds carry a monotonic `seq` and catch that; plain
+chat does not.
+
+**Membership is the server's roster, held across a blip.** A socket that dies
+(a phone switching apps, a wifi handoff, a lid, the server itself restarting
+under everyone) does not remove the peer: the server **holds the seat** for
+`SIGNAL_GRACE_MS` (60 s), tells nobody, queues control-plane frames for it
+(`QUEUE_MAX_MSGS`/`QUEUE_MAX_BYTES`, oldest dropped), and a `join` under the
+same peerId inside the window is a **resume** — `peers` comes back with
+`resumed: true`, the queue is replayed, no `joined` is broadcast. A rejoin on a
+new socket while the old one is still open (a phone that reconnected before we
+noticed) supersedes it. Only the grace expiring, or an explicit `leave`, is a
+departure — and a `leave` is only honoured for the socket's own seat (before
+this any socket could `leave` anyone). The browser sends `leave` on `pagehide`
+(not `persisted`), so closing the tab is immediate; `QOSPeer.leave()`.
+`peer.ts`/`qospeer.mjs` fire **`onPeerReady(id)`** — where the app's handshake
+(`name`, `sync-*`) now lives — for each peer on a fresh join and for each
+newcomer, and **not on a resume**, so a blip does not re-serve the room's whole
+state to everyone (that used to hang off `onChannelOpen`, so a peer with no
+direct WebRTC path never got it at all). **A WebRTC connection dying is not a
+departure**: a data channel closing or a pc reaching `failed` for a peer the
+server still lists tears the pc down for the sweep and reports nothing;
+`onPeerLeft` follows the server's `left`. `isReachable(id)` is "the server
+lists them" (or a direct channel); `hasChannel` stays the narrower question a
+call or a file needs, and what `/conn` diagnoses. The `⚠` in the roster
+therefore means "the server no longer lists this peer", which clears itself.
+
+Why this shape: before it, N−1 NAT-crossing WebRTC connections had to hold for
+chat to work, every socket blip became a `left`/`joined` and a redial storm
+for the whole room, and the server's logs showed one machine's uplink flapping
+being amplified into "everyone keeps dropping" (the facilitator and a browser
+on the same laptop reaped within 3 ms of each other, back within a second of
+each other 15 minutes later — a lid). With one resumable connection per
+person, a flap is that person's few seconds of silence, replayed. Tests:
+`packages/signaling/test/server.test.mjs` (real sockets: relay, sender check,
+hold, resume with replay, grace expiry, explicit leave, zombie superseded) and
+the control-plane block of `packages/browser/test/peer.test.mjs`.
 
 ## Signaling server trust model
 
 The signaling server is an **untrusted relay**:
-- Routes SDP/ICE between peers; never sees WebRTC data channel contents (DTLS-encrypted)
-- `wsIndex: Map<WebSocket, string>` — binds each socket to its peerId at join; validates `msg.from` on every relay to prevent forgery
+- Routes SDP/ICE between peers, and relays the sealed control-plane frames it cannot open (above); never sees WebRTC data channel or media contents either (DTLS-encrypted)
+- Knows a room only by the hash of its token — it cannot join what it relays
+- `wsIndex: Map<WebSocket, string>` — binds each socket to its peerId at join; validates `msg.from` on every relay (`offer`/`answer`/`ice` **and `data`**) and `peerId` on `leave` to prevent forgery
 - Rate-limited per connection as a **token bucket** — `SIGNAL_RATE_LIMIT` sustained (200/s on the public deployment via `render.yaml`, 20/s if unset) with `SIGNAL_RATE_BURST` depth (4× by default). Joining is bursty then quiet — offers plus their ICE candidates arrive in a clump — and a fixed window punished exactly that shape; the sustained rate protects the server, the burst is what lets a legitimate join land. The client staggers its offers (`JOIN_STAGGER_MS`, 250ms) **and holds at most `MAX_IN_FLIGHT` (3) handshakes at once**, since the burst is otherwise self-inflicted: a dial is an offer plus a trickle of ICE candidates, so dialling everyone at once makes a join cost a burst that grows with the room — past what the server carries per connection, handshakes stop completing, which from inside a browser looks exactly like peers who never arrived. A server refusal is now **surfaced into the room** (`onSignalingError`) instead of going only to the console, so "rate limit exceeded" is a thing you read rather than a thing you argue about
-- Message size capped at 64 KB (`maxPayload: 65_536`)
+- Message size capped at 256 KB (`SIGNAL_MAX_PAYLOAD`; 64 KB before the control plane rode the socket — a `sync-*` envelope for a large room needs the headroom, and the clients refuse to send a frame over the cap rather than be cut off for it)
 - Logs show only last 8 chars of IDs
 
 ## How many people a room holds
@@ -33,13 +99,13 @@ Full mesh means every peer opens N−1 connections, and the join cost is worse t
 
 **`reconcilePrune` is deliberately inert — an already-open connection is never actively closed for falling outside `targetPeers()`.** It shipped active (a grace timer, `PRUNE_GRACE_MS` 30s, that closed a now-out-of-range link) and was disabled after live testing showed the real cost: a roster change reshuffles ring positions for *everyone* in the room, not just the peer that joined/left, so one bouncing/flaky peer could cascade into closing *other* peers' entirely healthy connections as a side effect — amplifying one device's instability into churn across the room. The grace period bounded how often that could happen, not whether it could. `targetPeers()`/`ringSkipNeighbors` still bound who gets *newly* dialled — that's the actual fix for the join-burst/rate-limit problem this overlay exists for — only the active *closing* of a working connection is gone. Accepted tradeoff: connection count can only grow past 4 over a long session with a lot of churn, never shrink back on its own. `prunePeer`/`clearPruneTimer`/`pruneTimers` stay in place and tested (closes a link without ever firing `onPeerLeft` — the peer usually hasn't left the room, just stopped being a direct neighbor, and app.ts's leave handling assumes true departure) for a deliberate future re-enable behind something better than a fixed per-peer grace timer — e.g. only pruning once the *room*, not just one peer, has been stable for a while.
 
-**Message relay is flooding, not routing** — no routing table, a deliberate simplicity tradeoff. `broadcast(data)` tags the payload with `_relayId` (unique per broadcast), `_hops` (a remaining budget, `max(4, ceil((roster.size+1)/2))` — roughly 2x the true ring+skip diameter, erring generous since dedupe bounds the cost of over-relaying but an undersized budget means a genuine delivery failure), and `_from` (the true originator — without it a relayed message would be attributed to whichever neighbor forwarded it last, the wrong name in chat and the wrong dyncap-anchor cross-check), then sends to every open channel. `send(targetPeerId, data)` stays **raw and untagged** when a direct channel is open — byte-identical to before, so anyone already directly connected (old build or new) sees no format change at all; only when there's no direct link does it flood, additionally tagged `_relayTo`. On receipt, a tagged message dedupes against a bounded `Set` (`seenRelay`, cleared past 5000 — mirroring `bridge.mjs`'s own durable dedupe `firstState`, not its transient `firstTime`, since this must survive the message's full multi-hop lifetime), strips the tag fields before delivery (`delete`, not `undefined` — `bridge.mjs`'s `stripMeta` idiom) so `onMessage` callers see the exact original payload unchanged, delivers only if untargeted or addressed to this peer, and **always** relays onward to every other neighbor if hops remain regardless of whether this hop was the target — that's what lets a directed send reach through peers who aren't the recipient. The `_hops` field name is deliberately reused from `bridge.mjs`'s own cross-room relay tagging, but counts in the opposite direction (down from a budget here, up to a ceiling there) — by the time a message reaches `bridge.mjs`'s handler this file's own `_hops` has already been stripped, so there's no collision, just a naming echo worth knowing about. **Originating a broadcast/send also marks its own `_relayId` seen immediately** (not just on receipt) — otherwise a flood that loops all the way around the ring back to its own originator would be delivered to `onMessage` twice.
+**Bulk relay over the overlay is flooding, not routing** — this whole mechanism now carries only `{bulk:true}` traffic (attachments, `/file get`), since the control plane rides the signaling socket (see the transport section above). No routing table, a deliberate simplicity tradeoff. `broadcast(data, {bulk:true})` tags the payload with `_relayId` (unique per broadcast), `_hops` (a remaining budget, `max(4, ceil((roster.size+1)/2))` — roughly 2x the true ring+skip diameter, erring generous since dedupe bounds the cost of over-relaying but an undersized budget means a genuine delivery failure), and `_from` (the true originator — without it a relayed message would be attributed to whichever neighbor forwarded it last, the wrong name in chat and the wrong dyncap-anchor cross-check), then sends to every open channel. `send(targetPeerId, data)` stays **raw and untagged** when a direct channel is open — byte-identical to before, so anyone already directly connected (old build or new) sees no format change at all; only when there's no direct link does it flood, additionally tagged `_relayTo`. On receipt, a tagged message dedupes against a bounded `Set` (`seenRelay`, cleared past 5000 — mirroring `bridge.mjs`'s own durable dedupe `firstState`, not its transient `firstTime`, since this must survive the message's full multi-hop lifetime), strips the tag fields before delivery (`delete`, not `undefined` — `bridge.mjs`'s `stripMeta` idiom) so `onMessage` callers see the exact original payload unchanged, delivers only if untargeted or addressed to this peer, and **always** relays onward to every other neighbor if hops remain regardless of whether this hop was the target — that's what lets a directed send reach through peers who aren't the recipient. The `_hops` field name is deliberately reused from `bridge.mjs`'s own cross-room relay tagging, but counts in the opposite direction (down from a budget here, up to a ceiling there) — by the time a message reaches `bridge.mjs`'s handler this file's own `_hops` has already been stripped, so there's no collision, just a naming echo worth knowing about. **Originating a broadcast/send also marks its own `_relayId` seen immediately** (not just on receipt) — otherwise a flood that loops all the way around the ring back to its own originator would be delivered to `onMessage` twice.
 
 **Dyncap signatures are unaffected**: `signedBroadcast`/`signedSend` (app.ts) sign a `dyncap`-stripped canonical form *before* calling `qpeer.broadcast`/`send`; the relay fields are added after signing and stripped again before `onMessage` fires, so `verifyEnvelope` downstream always hashes exactly what was signed.
 
 **New trust consideration, honestly flagged, not a blocker**: an unsigned direct-send kind (`rdv-propose`, `note-pass`) routed through ≥2 hops could now be dropped or tampered with by an intermediate relay peer — not possible when every send was a direct DTLS link. Signed kinds are unaffected (tampering invalidates the signature at the true recipient). Existing timeout/retry (rendezvous's 60s proposal timeout) already covers "the message didn't arrive"; nothing new was built for this.
 
-**`isReachable(peerId)`** replaces `hasChannel` for "can I talk to them at all" (`renderPeers`'s `⚠`, `reportUnreachable`, `unreachablePeers`) — true if a direct channel is open, or relay traffic (`lastHeardVia`, keyed off `_from`) has been seen from them within `REACHABLE_WINDOW_MS` (45s, 1.5x the presence-flood interval — one missed beat tolerated, the same "miss one, not two" idiom as `qospeer.mjs`'s own ping/pong heartbeat). A periodic `{kind:"presence"}` broadcast (`PRESENCE_FLOOD_MS`, 30s, silently absorbed by every inbound dispatcher — app.ts's `onMessage`, `agent.mjs`'s, and filtered before `room-memory.mjs`'s durable transcript, since it's protocol noise, not room content) keeps this honest for peers who would otherwise never say anything themselves. `hasChannel`/`connectionReport` are unchanged and stay meaningful on their own for `/conn`'s direct-link diagnostics — "am I directly linked to X" is still a different, still-useful question from "can I reach X at all."
+**`isReachable(peerId)`** is "the server lists them" — the relay reaches everyone in the roster — or a direct channel, or bulk-relay traffic seen from them (`lastHeardVia`, keyed off `_from`) within `REACHABLE_WINDOW_MS` (45s). The periodic `{kind:"presence"}` flood that used to keep this honest is gone: presence is the server's word now. `hasChannel`/`connectionReport` are unchanged and stay meaningful on their own for `/conn`'s direct-link diagnostics — "am I directly linked to X" (a call, a file) is a different question from "can I reach X at all."
 
 **Required follow-up, not yet built**: `calls.ts`'s `addLocalMedia` iterates `this.connections` — only direct links, since a `MediaStreamTrack` can't be relayed. Starting a call in a room past the degeneracy threshold without pinning every participant first would silently transmit audio/video only to the caller's 4 ring-neighbors. Tracked in issue #111 along with the other known limitations (no k-connectivity proof — best-effort resilience only; no eviction/priority scheme for pin overrun; flooding's bandwidth cost for a directed send).
 
