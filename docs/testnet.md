@@ -8,9 +8,9 @@ dev wallets.
 > `getBonds`/`getActiveValidators`, `/health` and deploys all work. The testnet's binary (built
 > 2026-09-21, `8432bff7b9455193…`) anchors `rnode deploy` at the node's current height, so no extra
 > flags are needed; a binary older than that still needs `--valid-after-block-number <height>` — see
-> [K1](#known-issues). **Validator onboarding is still blocked** by a separate bug,
-> [K6](#known-issues). Not production, holds no value, and its chain can be rebuilt (and therefore
-> reset) at any time.
+> [K1](#known-issues). **Validator onboarding is still blocked**: no key on this chain is both trusted
+> and able to pay phlo, so `pos!("trust", …)` cannot run — see [K3](#known-issues)/[K6](#known-issues).
+> Not production, holds no value, and its chain can be rebuilt (and therefore reset) at any time.
 
 ---
 
@@ -66,8 +66,8 @@ These are throwaway development keys, published on purpose. Never use them for a
 | `GET /api/status` | ✅ works |
 | `/health` monitoring snapshot | ✅ works |
 | **Deploys — browser, room agents, `rnode deploy` CLI** | ✅ works (the CLI needed `--valid-after-block-number` until the 2026-09-21 binary — K1) |
-| Transfers (faucet, `$transfer`) | ✅ works — verified `processedWithSuccess` on this chain |
-| **Becoming a validator** | ❌ blocked by K6 (genesis route works) |
+| Transfers (faucet, `$transfer`) | ✅ works from a genesis-funded key |
+| **Becoming a validator** | ❌ blocked up front: it needs a key that is **both trusted and genesis-funded**, and there is none — K3/K6 |
 
 ## Monitoring
 
@@ -221,9 +221,11 @@ means a **new genesis and a new chain**.
 
 Two funding prerequisites that are easy to miss:
 
-- the **trusting key must hold REV**, because it pays phlo for the `trust` deploy from its own
-  vault — genesis validator keys are *not* funded in `wallets.txt` (K3);
-- the **newcomer must hold REV ≥ stake**, because the bond is deducted from its vault.
+- the **trusting key must hold REV**, because it pays phlo for the `trust` deploy from its own vault —
+  and only keys funded *at genesis* (`wallets.txt`) can actually spend: a key that receives REV by
+  transfer afterwards still cannot deploy, even a trivial term (K3);
+- the **newcomer must hold REV ≥ stake**, because the bond is deducted from its vault — subject to the
+  same caveat.
 
 A plain transfer fixes both: `revVault!("transfer", *deployerId, "<its REV address>", <amount>, *ret)`
 (reply is `Nil` on success, an error string on failure). To derive a key's vault address:
@@ -287,9 +289,10 @@ Two easy-to-miss details:
 | step | result |
 |---|---|
 | `getBonds` / `getActiveValidators` reads | ✅ verified live |
-| `revVault!("transfer", …)` and an ordinary term | ✅ `processedWithSuccess` on this chain |
-| `pos!("trust", …)` from a genesis validator | ❌ executed, `processedWithError` — see K6 |
-| `pos!("bond", …)` by a funded observer | ✅ executed, then rejected `Validator is not trusted…` because trust failed |
+| `revVault!("transfer", …)` and an ordinary term | ✅ `processedWithSuccess` **when the deployer is genesis-funded** |
+| any deploy signed by a key funded only by transfer | ❌ `processedWithError`, even `return!(1)` — phlo, see K3 |
+| `pos!("trust", …)` from a genesis validator | ⚠️ never executed — that key cannot deploy at all (K3), so whether a genesis validator is trusted is **untested** (K6) |
+| `pos!("bond", …)` by a key nobody trusted | ⚠️ executed, rejected `Validator is not trusted…` — correct behaviour |
 | `getBonds` afterwards | unchanged — A 300, B 100, no new member |
 
 The read path and ordinary writes (transfers) are demonstrated; **validator admission is not**, and
@@ -335,38 +338,56 @@ start-up latency: a healthy restart took ~55s before `/api/status` answered, and
 appeared to hang was made ~25s in. The injector stays on because it is what keeps blocks flowing for
 joiners. **Do not treat the injector as a suspect for deploy problems.**
 
-**K3 — genesis validator keys are unfunded.** `wallets.txt` funds the dev keys, not the bonded
-validator keys, so a genesis validator cannot pay phlo to deploy `trust`. Fund one first with a
-transfer to its vault address (see the two admission routes).
+**K3 — only keys funded at genesis can deploy, which blocks the whole admission path.**
+Phlo is charged to the deployer's vault. On this chain, keys listed in `wallets.txt` at genesis (dave,
+deployer, alice…) can deploy, but keys funded *later* by `revVault!("transfer", …)` still **cannot**:
+they get `processedWithError` on even a trivial `return!(1)`, so the transfer succeeds as a deploy
+while the recipient's funds are not spendable. Measured with the same term and flags:
+
+| deployer | funded how | trivial `return!(1)` |
+|---|---|---|
+| dave | genesis `wallets.txt` | `processedWithSuccess` |
+| validator-a (genesis bond) | 1e11 transferred to its vault | **`processedWithError`** |
+| a brand-new key F | 1e11 transferred to its vault | **`processedWithError`** |
+
+Since `trusted` = the genesis bond keys ∪ `--pos-multi-sig-public-keys`, **no key here is both trusted
+and able to deploy**, so `pos!("trust", …)` cannot run at all. It cannot be fixed on the current
+chain: the next rebuild should put a **`wallets.txt`-funded** key into
+`--pos-multi-sig-public-keys`, so that a trusted-and-funded key exists. Whether the
+transfer-credit behaviour is itself a bug is an open question — see K6.
 
 **K4 — deploy output is not observable.** `stdout!(…)` from a deploy does not reach the journal, and
 `deploy-status` for a failed deploy answers
 `"deploy error message not available in cache or deploy executed on another node"`. So *why* a
 `bond`/`trust` failed cannot be read from the node after the fact; the return value is only reachable
-through the registry result-slot pattern (`insertSigned` with a nonce) that the browser client uses.
-This is what makes K6 hard to pin down.
+through the registry result-slot pattern (`insertSigned` with a nonce) that the browser client uses —
+and that path lags by about one deploy when driven through `scripts/qos-cli/rholang-client.mjs`
+(`deployTerm` returns the *previous* call's value), so read twice before trusting the answer.
 
 **K5 — disk growth.** With the injector on, the chain grows ~140 MB/day (a block every ~2–4s,
 ~6.6 KB/block). `/health` reports `disk_free_mb`; 25 GB gives months of headroom, but a busy
 testnet will need a plan.
 
-**K6 — live validator admission is blocked: the trusted set appears empty at runtime.**
-`pos!("trust", …)` was deployed by a **genesis bonded validator** — the same key that signs every
-block on A — and it executed, then errored. The native implementation has exactly one failure path
-(`rholang/src/native_state.rs::trust`):
+**K6 — whether a genesis validator is trusted is still UNTESTED. An earlier revision of this section
+was wrong and that claim is retracted.**
 
-```rust
-if !trusted.contains(caller) { return Ok(Err("Only a trusted stakeholder can admit validators.")) }
+It previously said the genesis-seeded trusted set reads as empty at runtime, based on a
+`pos!("trust", …)` deploy that errored. The evidence now points elsewhere: that deploy **never
+executed**. Every deploy signed by the genesis validator's key fails on phlo (K3) — including a
+trivial `return!(1)` — so its `trust` call never reached the pos system process at all. The gate
+message that *was* captured,
+
+```
+(false, "Only a trusted stakeholder can admit validators.")
 ```
 
-and the genesis builder seeds that set from the genesis bonds plus `--pos-multi-sig-public-keys`
-(`casper/src/genesis/mod.rs`). Since the caller *is* a genesis bond, the likely explanation is that
-`trusted()` reads an empty set at deploy time — it returns an empty set when the key is absent from
-the store — i.e. the genesis-seeded trusted set is not visible to the runtime that executes deploys.
-**Unconfirmed, because K4 hides the message.** Until it is fixed the live admission route does not
-work; the genesis route still does (`--pos-multi-sig-public-keys <hex>[,…]`, then rebuild the
-chain), which is the practical way to make testnet onboarding work today and is worth doing at the
-next rebuild.
+came from a **different, untrusted** key (dave), which is exactly what it should say. So the trusted
+set may well be seeded correctly, and nothing here shows otherwise.
+
+Why it matters and how to settle it: the question cannot be answered on this genesis because no key
+is both trusted and funded. Answer it at the next rebuild — put a `wallets.txt`-funded key into the
+trusted set, then have that key `trust` a second funded key and have the second key `bond`. Read the
+verdicts through the browser client's result-slot path (K4), not from `deploy-status`.
 
 ## Housekeeping
 
