@@ -4,11 +4,13 @@ A small public RChain testnet run on [rchain-rust](../) for the rholang playgrou
 agents and experiments. Two bonded validators on two hosts, dev-mode block production, funded
 dev wallets.
 
-> **Status: READS WORK, WRITES DO NOT (yet).** `/api/status`, `/api/explore-deploy` (eval),
-> `getBonds`, `getActiveValidators` and `/health` all work. Deploys are *accepted* but **do not
-> land in blocks** on the current configuration — see [Known issues](#known-issues). Treat this
-> testnet as read-only until K1 is fixed. It is not production, holds no value, and its chain
-> can be rebuilt (and therefore reset) at any time.
+> **Status: reads work; deploys work only with a flag.** `/api/status`, `/api/explore-deploy`
+> (eval), `getBonds`, `getActiveValidators` and `/health` all work. **Deploys sent by the `rnode
+> deploy` CLI are silently dropped unless you pass `--valid-after-block-number <current height>`**
+> — the CLI defaults that field to `-1`, which the proposer treats as expired on any chain taller
+> than ~49 blocks. The browser and agent clients already send the right value; see [K1](#known-issues).
+> Validator onboarding is blocked by a separate bug, [K6](#known-issues). Not production, holds no
+> value, and its chain can be rebuilt (and therefore reset) at any time.
 
 ---
 
@@ -60,11 +62,12 @@ These are throwaway development keys, published on purpose. Never use them for a
 | | |
 |---|---|
 | `eval` / `explore-deploy` | ✅ works — the full Rholang/QLF macro surface |
-| Reads of chain state (`getBonds`, `getActiveValidators`, balances) | ✅ works |
+| Reads of chain state (`getBonds`, `getActiveValidators`) | ✅ works |
 | `GET /api/status` | ✅ works |
 | `/health` monitoring snapshot | ✅ works |
-| **Deploys** (transfers, contracts, bonding) | ❌ **accepted but never included** — K1 |
-| Facet / faucet transfers | ❌ same cause — the transfer deploy does not land |
+| **Deploys from the browser / room agents** (`rholang.ts`, `rholang-client.mjs`) | ✅ works — they send `latestBlockNumber - 1` themselves |
+| **Deploys from the `rnode deploy` CLI** | ⚠️ **dropped** unless you pass `--valid-after-block-number <current height>` — K1 |
+| Facet / faucet transfers | ⚠️ same rule if the send path uses the CLI; the browser/agent faucet path is fine |
 
 ## Monitoring
 
@@ -263,54 +266,99 @@ new return, pos(`rho:rchain:pos`), deployerId(`rho:rchain:deployerId`), ret in {
 }
 ```
 
-Deploy them the way `tools/devnet.sh` does:
+Deploy them with:
 
 ```bash
-rnode --profile docker deploy --phlo-limit 90000 --phlo-price 1 --shard-id /root \
-  --private-key <hex> term.rho
+H=$(curl -s https://testnet.rhobot.net/api/status | python3 -c 'import sys,json;print(json.load(sys.stdin)["latestBlockNumber"])')
+rnode --profile docker deploy --phlo-limit 90000 --phlo-price 1 \
+  --valid-after-block-number "$H" --shard-id /root --private-key <hex> term.rho
 rnode --profile docker deploy-status --deploy-signature <deployId>
 ```
 
-`--shard-id /root` is required; without it the node answers
-`Deploy shardId '' is not a member of this node's shards: [/root]`.
+Two required fields, both easy to miss:
 
-### Status: not yet demonstrated end to end
+- `--shard-id /root`, or the node answers
+  `Deploy shardId '' is not a member of this node's shards: [/root]`;
+- `--valid-after-block-number <current height>`, or the deploy is silently discarded as expired (K1).
 
-The read paths above are **verified on the live testnet**. The write path is **code-verified
-only**: on 2026-09-21 the `trust` and `bond` deploys were accepted
-(`Response: Success!`, DeployIds issued) but `deploy-status` reported
-`"notProcessed": {"status": "Unknown"}` and `getBonds` was unchanged — because *no* deploy lands
-on this configuration (K1 below). **Fix K1 first, then re-run the sequence above** and expect
-`getBonds` to gain the newcomer's key.
+### Status: reads verified, ordinary writes verified, admission blocked
+
+| step | result |
+|---|---|
+| `getBonds` / `getActiveValidators` reads | ✅ verified live |
+| `revVault!("transfer", …)` deploy | ✅ `processedWithSuccess` (with `--valid-after-block-number`) |
+| `pos!("trust", …)` from a genesis validator | ❌ executed, `processedWithError` — see K6 |
+| `pos!("bond", …)` by a funded observer | ✅ executed, then rejected `Validator is not trusted…` because trust failed |
+| `getBonds` afterwards | unchanged — A 300, B 100, no new member |
+
+The read path and ordinary writes (transfers) are demonstrated; **validator admission is not**, and
+the failure sits in `trust`, not in the deploy mechanics.
 
 ## Known issues
 
-**K1 — deploys are accepted but never included (blocks writes).** With the dev-mode dummy-deploy
-injector enabled, every block logs `No pooled deploys; injecting dummy deploy for block #NNN` and
-a freshly submitted deploy reports `notProcessed / Unknown`. Isolation: rhobot runs dev-mode
-*without* `--deployer-private-key` and the same deploy reports `processedWithSuccess`. Removing
-the injector from A changed the status to `Pooled` (i.e. the deploy then reached the pool).
-Consequence: no transfers, contracts or bonding execute on the testnet; `eval` is unaffected.
+**K1 — `rnode deploy` drops deploys by default (this is what "writes don't work" turned out to be).**
+Without the flag the CLI sends `valid_after_block_number = -1`
+(`node/src/runtime/node_main.rs`: `valid_after_block_number.unwrap_or(-1)`), and the proposer
+classifies a deploy as expired when `valid_after_block_number < next_block_num - DEPLOY_LIFESPAN`
+(`casper/src/blocks/proposer/proposer.rs`, `DEPLOY_LIFESPAN = 50`). On any chain taller than ~49
+blocks, every unflagged CLI deploy is therefore dropped before it can be proposed — which is why the
+proposer logs `No pooled deploys; injecting dummy deploy for block #NNN` indefinitely. The node's own
+faucet documents the rule (`node/src/api/faucet.rs`): *"must be the current chain height (not `-1`)"*.
 
-**K2 — removing the injector left A's HTTP API unresponsive.** With the injector removed the
-node was up, listening on 40403/40405, gRPC 40401 accepted deploys — but HTTP requests hung and
-the health timer reported `api-unreachable`. Caveat: a healthy restart also needed ~55s before
-the API answered, so a slow start is a possible confound rather than a genuine hang. The injector
-was restored so the node stays usable; **this needs a proper investigation in rchain-rust before
-the testnet can be relied on for writes.**
+Measured on the testnet at height 904, same term and key:
+
+| deploy | status |
+|---|---|
+| no flag (default `-1`) | `notProcessed / Unknown` |
+| `--valid-after-block-number 904` | **`processedWithSuccess`** |
+
+rhobot hides this: at height 8, `-1 < 8 - 50` is false, so deploys there pass. The dummy-deploy
+injector is **not** involved — it only fires when the pool really is empty, and it was enabled for
+both rows above. The browser and agent clients are unaffected because they compute
+`Math.max(0, latestBlockNumber - 1)` themselves.
+
+*Upstream fix:* default the CLI to the node's current height, or have the node treat a negative
+value as "no constraint". *Workaround:* always pass `--valid-after-block-number`.
+
+**K2 — an earlier diagnosis in this document was wrong; corrected.** It blamed the dummy-deploy
+injector and claimed that removing it left A's HTTP API unresponsive. K1 shows the injector has
+nothing to do with deploy inclusion, and the unresponsive-API observation is better explained by
+start-up latency: a healthy restart took ~55s before `/api/status` answered, and the check that
+appeared to hang was made ~25s in. The injector stays on because it is what keeps blocks flowing for
+joiners. **Do not treat the injector as a suspect for deploy problems.**
 
 **K3 — genesis validator keys are unfunded.** `wallets.txt` funds the dev keys, not the bonded
 validator keys, so a genesis validator cannot pay phlo to deploy `trust`. Fund one first with a
 transfer to its vault address (see the two admission routes).
 
-**K4 — deploy stdout is not logged.** `stdout!(…)` from a deploy does not appear in the journal,
-so a failed `bond`/`trust` cannot be diagnosed from logs; the return value is only reachable
-through the registry result-slot pattern (`insertSigned` with a nonce) that the browser client
-uses.
+**K4 — deploy output is not observable.** `stdout!(…)` from a deploy does not reach the journal, and
+`deploy-status` for a failed deploy answers
+`"deploy error message not available in cache or deploy executed on another node"`. So *why* a
+`bond`/`trust` failed cannot be read from the node after the fact; the return value is only reachable
+through the registry result-slot pattern (`insertSigned` with a nonce) that the browser client uses.
+This is what makes K6 hard to pin down.
 
 **K5 — disk growth.** With the injector on, the chain grows ~140 MB/day (a block every ~2–4s,
 ~6.6 KB/block). `/health` reports `disk_free_mb`; 25 GB gives months of headroom, but a busy
 testnet will need a plan.
+
+**K6 — live validator admission is blocked: the trusted set appears empty at runtime.**
+`pos!("trust", …)` was deployed by a **genesis bonded validator** — the same key that signs every
+block on A — and it executed, then errored. The native implementation has exactly one failure path
+(`rholang/src/native_state.rs::trust`):
+
+```rust
+if !trusted.contains(caller) { return Ok(Err("Only a trusted stakeholder can admit validators.")) }
+```
+
+and the genesis builder seeds that set from the genesis bonds plus `--pos-multi-sig-public-keys`
+(`casper/src/genesis/mod.rs`). Since the caller *is* a genesis bond, the likely explanation is that
+`trusted()` reads an empty set at deploy time — it returns an empty set when the key is absent from
+the store — i.e. the genesis-seeded trusted set is not visible to the runtime that executes deploys.
+**Unconfirmed, because K4 hides the message.** Until it is fixed the live admission route does not
+work; the genesis route still does (`--pos-multi-sig-public-keys <hex>[,…]`, then rebuild the
+chain), which is the practical way to make testnet onboarding work today and is worth doing at the
+next rebuild.
 
 ## Housekeeping
 
