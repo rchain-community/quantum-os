@@ -1,16 +1,17 @@
 # Testnet — `testnet.rhobot.net`
 
 A small public RChain testnet run on [rchain-rust](../) for the rholang playground, the room
-agents and experiments. Two bonded validators on two hosts, dev-mode block production, funded
-dev wallets.
+agents and experiments. Two bonded validators on two hosts, funded dev wallets, and an **idle**
+chain that produces a block only when a deploy arrives.
 
-> **Status: reads and writes both work.** `/api/status`, `/api/explore-deploy` (eval),
-> `getBonds`/`getActiveValidators`, `/health` and deploys all work. The testnet's binary (built
-> 2026-09-21, `8432bff7b9455193…`) anchors `rnode deploy` at the node's current height, so no extra
-> flags are needed; a binary older than that still needs `--valid-after-block-number <height>` — see
-> [K1](#known-issues). **Validator onboarding is still blocked**: no key on this chain is both trusted
-> and able to pay phlo, so `pos!("trust", …)` cannot run — see [K3](#known-issues)/[K6](#known-issues).
-> Not production, holds no value, and its chain can be rebuilt (and therefore reset) at any time.
+> **Status: reads, writes and validator onboarding all work — verified end to end.** A brand-new key
+> can be funded by transfer, deploy, be trusted, and bond into the validator pool (transcript in
+> [Status](#status-of-the-verified-path)). `/api/status`, `/api/explore-deploy`, `getBonds`,
+> `getActiveValidators`, `/health`, and `rnode deploy` with no extra flags all work. The chain is
+> deliberately **idle** (no `--autopropose`): blocks appear when a deploy arrives. A
+> continuously-producing chain cannot be restarted on a 1 GB host — that is what broke the previous
+> chain, and it is [K7](#known-issues), the most important operational constraint here. Not
+> production, holds no value, and its chain can be reset at any time.
 
 ---
 
@@ -20,11 +21,16 @@ dev wallets.
 
 | | |
 |---|---|
-| Chain | `testnet` network id, shard `/root`, genesis `c14849a4…573a` |
-| Validators | node A (stake 300) + node B (stake 100), both dev-mode |
+| Chain | `testnet` network id, shard `/root`, genesis `26bf2328…19a9` |
+| Validators | node A (`d3cc3442…`, stake **1000**) + node B (`ec923454…`, stake 100) |
 | Hosts | A `164.90.140.144` (private `10.108.0.3`), B `104.131.176.164` (private `10.108.0.4`) |
 | Cost | 2 × DigitalOcean `s-1vcpu-1gb`, **$12/mo** |
+| Binary | rchain-rust `dev` + the deploy-anchor fix, static musl `d7f5000b…`, on all three hosts |
 | Endpoint | **https://testnet.rhobot.net** (nginx → node A's HTTP API) |
+
+A's stake is 1000 against B's 100 on purpose: with no `--autopropose`, A is the only proposer, so A
+must hold **more than ⅔ of the whole bond pool** (including any stake sitting in withdrawal
+quarantine) or no block is ever finalised. That is what keeps A able to finalise after observers bond.
 
 ## Connect
 
@@ -65,9 +71,9 @@ These are throwaway development keys, published on purpose. Never use them for a
 | Reads of chain state (`getBonds`, `getActiveValidators`) | ✅ works |
 | `GET /api/status` | ✅ works |
 | `/health` monitoring snapshot | ✅ works |
-| **Deploys — browser, room agents, `rnode deploy` CLI** | ✅ works (the CLI needed `--valid-after-block-number` until the 2026-09-21 binary — K1) |
-| Transfers (faucet, `$transfer`) | ✅ works from a genesis-funded key |
-| **Becoming a validator** | ❌ blocked up front: it needs a key that is **both trusted and genesis-funded**, and there is none — K3/K6 |
+| **Deploys — browser, room agents, `rnode deploy` CLI** | ✅ works (the CLI needed `--valid-after-block-number` before the 2026-09-21 binary — K1) |
+| Transfers, including funding a brand-new key | ✅ verified: a fresh key's balance went `0` → `100000000000`, and it could then deploy |
+| **Becoming a validator** | ✅ verified end to end: `trust` → `(true)`, `bond` → `(true)`, bond pool 2 → 3, active set 3 |
 
 ## Monitoring
 
@@ -76,22 +82,26 @@ that node's snapshot (node A's, since nginx fronts A):
 
 ```json
 { "host": "testnet-a", "ok": true, "rnode_unit": "active", "api_reachable": true,
-  "blocks": 866, "blocks_since_last_tick": 0, "peers": 1, "nodes": 1,
-  "finalized_fringe": true, "autopropose": true,
-  "mem_available_mb": 367, "disk_free_mb": 22665 }
+  "blocks": 6, "blocks_since_last_tick": 0, "peers": 1, "nodes": 1,
+  "finalized_fringe": false, "autopropose": false,
+  "mem_available_mb": 627, "disk_free_mb": 22665 }
 ```
 
-`ok: false` means the unit is down, the API is unreachable, the height is zero, or — the failure
-that silently breaks joining — **there is no finalised fringe**. DigitalOcean's dashboard also
-graphs CPU/RAM/disk for both hosts (`do-agent`).
+`ok: false` means the unit is down, the API is unreachable, or the height is zero. **`finalized_fringe:
+false` is expected here and is not a failure** — this chain is idle, and nothing is finalised while no
+blocks are produced. Joining nodes still sync: they restore from the *approved genesis* fringe, which
+was verified twice with node B. DigitalOcean's dashboard also graphs CPU/RAM/disk for both hosts
+(`do-agent`).
 
 ## Limits to expect
 
-- **Dev-mode.** The chain is kept moving by an injected dummy deploy; heights advance whether or
-  not anyone is doing anything.
-- **A rebuild resets everything.** Changing `bonds.txt`/`wallets.txt` means a new genesis and a
-  new chain.
-- ~140 MB/day of growth at the current rate (a block every ~2–4s). Watch `disk_free_mb`.
+- **Idle chain, by design.** No `--autopropose` and no injected dummy deploy: a block is produced
+  when a deploy arrives (`--propose-on-deploy`). Heights stay put while nobody is doing anything.
+- **A rebuild resets everything.** Changing `bonds.txt`/`wallets.txt` means a new genesis and a new
+  chain.
+- Disk now grows with real usage only (~6.6 KB per block) instead of ~140 MB/day.
+- **Restart cost grows with chain length** — roughly 1 MB of RAM per replayed block, so a 1 GB host
+  gives out somewhere around 1000 blocks. See [K7](#known-issues).
 - No SLA, no backups of chain state beyond the genesis files.
 
 ---
@@ -101,33 +111,48 @@ graphs CPU/RAM/disk for both hosts (`do-agent`).
 ## Topology
 
 ```
-testnet.rhobot.net ──► node A 164.90.140.144 (10.108.0.3)   genesis master, stake 300
+testnet.rhobot.net ──► node A 164.90.140.144 (10.108.0.3)   genesis master, stake 1000
                         └─ nginx + Let's Encrypt (cert to 2026-12-20), /health from a timer
-                        └─ rnode: -s --dev-mode --autopropose --deployer-private-key …
+                        └─ rnode: -s --dev-mode --propose-on-deploy  (NO --autopropose)
                        node B 104.131.176.164 (10.108.0.4)   joining validator, stake 100
-                        └─ rnode: --dev-mode --propose-on-deploy  (NO --autopropose)
+                        └─ rnode: --dev-mode --propose-on-deploy --bootstrap A  (no -s)
 ```
 
 Both live in the `default-nyc3` VPC, the same one as rhobot-2, so they can also talk over
 private addresses (`10.108.0.0/20`).
 
-**Why the stake is 300/100 and not 100/100.** Finality needs >⅔ of the stake. With two equal
-validators a lone master can never reach it, so it cannot finalise — and because joiners sync
-through the **finalised fringe**, a joining node would then wait forever for a fringe that never
-appears. That is exactly the deadlock seen on rhobot (an observer stuck at block 0 with
-`Finalized fringe is not available`). At 300/100, A alone is 75% and finalises immediately, and
-B is still a real bonded validator once it joins.
+**Why 1000/100, and why no `--autopropose`.** Both were learned by breaking it:
+
+1. **Finality needs >⅔ of the whole pool, and A is the only proposer.** At 300/100 the chain
+   finalised fine — right up until an observer bonded 100, which took A to 60% and stopped finality
+   dead. `withdraw` is not an immediate escape either: the stake is escrowed until the quarantine
+   deadline, so it goes on diluting the pool. 1000 tolerates about four joiners at stake 100.
+2. **The previous chain outgrew the host.** It ran `--autopropose` plus an injected dummy deploy,
+   about one block every 2.5 s. Start-up replay retains roughly **1 MB per block**, so by ~1140
+   blocks every restart needed 700+ MB on a 957 MB host: the kernel OOM-killed rnode, the next start
+   replayed the same DAG and died again, and the API never came up (K7 — the "unresponsive API"
+   symptom, which is *not* the injector). Omitting `--autopropose` and `--deployer-private-key`
+   makes blocks arrive only when deploys do, keeping restart cost proportional to real usage.
 
 ## Genesis
 
 Built once with `scripts/localnet/keys.mjs`; the exact files are on each node:
 
 ```
-/var/lib/rnode/genesis/bonds.txt    2 lines: <65-byte pubkey> <stake>
+/var/lib/rnode/genesis/bonds.txt    2 lines: <65-byte pubkey> <stake>  (A 1000, B 100)
 /var/lib/rnode/genesis/wallets.txt  6 funded REV addresses (the dev keys)
 /etc/rnode/validator.key            that node's validator key (0600 rnode:rnode)
-/etc/rnode/deployer.env             DEPLOYER_PRIVATE_KEY=… (dev-mode injector)
+/etc/rnode/deployer.env             DEPLOYER_PRIVATE_KEY=… (kept on disk, now unused: no injector)
 ```
+
+Genesis hash `26bf2328190ab2d7b580a868e63cd71b34c8a7a33a89ecbff19f9c8abb8819a9`; A's node id
+`d3cc3442ebcbc633edf950b579caf3f0a259ac76`, B's `ec92345441deaf20250e881fe890c65e1a596b7f`.
+
+Both nodes start with `--pos-multi-sig-public-keys <dave's pubkey> --pos-multi-sig-quorum 1`, which
+puts **dave** — a `wallets.txt`-funded key that can actually pay phlo — into the trusted set at
+genesis. That is what makes live admission possible (K6): dave is the key that can `trust` others.
+Give the same list to every node, or a joiner's own view of the genesis PoS spec will not match the
+chain it is joining.
 
 Bond parameters come from defaults: `--bond-minimum 1`, `--bond-maximum 100`,
 `number_of_active_validators 10`. **10 is larger than the bond pool**, so every properly bonded
@@ -148,12 +173,12 @@ Rebuild / re-key (the whole network):
 
 ```bash
 # on the master
-rnode --profile docker run -s --dev-mode --autopropose --no-upnp --host <ip> \
+rnode --profile docker run -s --dev-mode --propose-on-deploy --no-upnp --host <ip> \
   --data-dir /var/lib/rnode \
   --bonds-file /var/lib/rnode/genesis/bonds.txt \
   --wallets-file /var/lib/rnode/genesis/wallets.txt \
-  --validator-private-key-path /etc/rnode/validator.key \
-  --deployer-private-key ${DEPLOYER_PRIVATE_KEY}
+  --pos-multi-sig-public-keys <dave pubkey> --pos-multi-sig-quorum 1 \
+  --validator-private-key-path /etc/rnode/validator.key
 # a joining validator: same flags minus -s, plus --bootstrap, and its own validator key
 ```
 
@@ -168,18 +193,23 @@ anywhere:
 
 ```bash
 rnode --profile docker run --host <its-ip> --data-dir /var/lib/rnode \
-  --bootstrap rnode://b48cd51989b159658824c6d0337a576ba241dd63@164.90.140.144?protocol=40400&discovery=40404
+  --pos-multi-sig-public-keys <dave pubkey> --pos-multi-sig-quorum 1 \
+  --bootstrap rnode://d3cc3442ebcbc633edf950b579caf3f0a259ac76@164.90.140.144?protocol=40400&discovery=40404
 ```
 
-Success looks like this in the log — note the LFS step, which is what fails when no fringe
-exists:
+(The multi-sig flags must match the genesis master's, or the joiner's own view of the genesis PoS
+spec will not match — see [Genesis](#genesis).)
+
+Success looks like this in the log — note the LFS step, which restores from the **approved genesis**
+fringe. That is why joining works even though this idle chain has no *last-finalised* fringe:
 
 ```
-INFO [casper.engine.NodeSyncing] Adding #0 c14849a4…573a.
 INFO [casper.engine.NodeSyncing] Blocks for approved state added to DAG.
 INFO [casper.engine.NodeSyncing] LFS state is successfully restored.
 INFO [casper.engine.NodeLaunch] Making a transition to Running state.
 ```
+
+A join takes about 15 seconds and ~19 MB, measured.
 
 ## Onboarding an observer into the validator pool
 
@@ -219,16 +249,19 @@ means a **new genesis and a new chain**.
 2. the newcomer deploys         pos!("bond",  *deployerId, <stake>, *ret)      # 1..100 here
 ```
 
-Two funding prerequisites that are easy to miss:
+Two funding prerequisites, both easy to miss, and both now **verified working**:
 
-- the **trusting key must hold REV**, because it pays phlo for the `trust` deploy from its own vault —
-  and only keys funded *at genesis* (`wallets.txt`) can actually spend: a key that receives REV by
-  transfer afterwards still cannot deploy, even a trivial term (K3);
-- the **newcomer must hold REV ≥ stake**, because the bond is deducted from its vault — subject to the
-  same caveat.
+- the **trusting key must hold REV**, because it pays for the `trust` deploy's phlo from its own vault.
+  A genesis-trusted key that is *not* in `wallets.txt` cannot deploy at all — that is why the trusted
+  set is seeded with a funded key (dave) rather than with the bonded validator keys (K6);
+- the **newcomer must hold REV ≥ stake**, because the bond is deducted from its vault.
 
-A plain transfer fixes both: `revVault!("transfer", *deployerId, "<its REV address>", <amount>, *ret)`
-(reply is `Nil` on success, an error string on failure). To derive a key's vault address:
+A plain transfer funds both:
+`revVault!("transfer", *deployerId, "<its REV address>", <amount>, *ret)` — the reply is `Nil` on
+success and an error string on failure. Verified: a fresh key read `0`, then `100000000000` after a
+1e11 transfer, and it could then deploy. Read a balance with
+`revVault!("getBalance", "<address>", *ret)` — the method is `getBalance`, **not** `balance`. Derive a
+key's vault address with
 `node -e "import('./keys.mjs').then(m=>console.log(m.revAddressOf('<priv>')))"`.
 
 ### The exact terms
@@ -243,7 +276,7 @@ with `Top level free variables are not allowed`.
 new return, pos(`rho:rchain:pos`), ret in {
   pos!("getBonds", *ret) | for (@b <- ret) { return!(b) }
 }
-// → {"expr":[{"ExprMap":[["0410b8c5…0c3c73",{"ExprInt":300}],["04675f16…514404",{"ExprInt":100}]]}]}
+// → {"expr":[{"ExprMap":[["0410b8c5…0c3c73",{"ExprInt":1000}],["04675f16…514404",{"ExprInt":100}]]}]}
 
 // read the consensus set (works today)
 new return, pos(`rho:rchain:pos`), ret in {
@@ -284,19 +317,29 @@ Two easy-to-miss details:
   current testnet binary is anchored at the node's height automatically (K1). If `deploy-status`
   answers `notProcessed / Unknown`, the deploy was swept from the pool as expired.
 
-### Status: reads verified, ordinary writes verified, admission blocked
+### Status of the verified path
+
+Everything below was run against this chain, with the deploys signed through
+`scripts/qos-cli/rholang-client.mjs` (which wraps each term in a result slot, so the term's *return
+value* is readable) and with dev's registry-lookup fix in the running binary:
 
 | step | result |
 |---|---|
-| `getBonds` / `getActiveValidators` reads | ✅ verified live |
-| `revVault!("transfer", …)` and an ordinary term | ✅ `processedWithSuccess` **when the deployer is genesis-funded** |
-| any deploy signed by a key funded only by transfer | ❌ `processedWithError`, even `return!(1)` — phlo, see K3 |
-| `pos!("trust", …)` from a genesis validator | ⚠️ never executed — that key cannot deploy at all (K3), so whether a genesis validator is trusted is **untested** (K6) |
-| `pos!("bond", …)` by a key nobody trusted | ⚠️ executed, rejected `Validator is not trusted…` — correct behaviour |
-| `getBonds` afterwards | unchanged — A 300, B 100, no new member |
+| `getBonds` / `getActiveValidators` reads | ✅ |
+| fund a brand-new key: `getBalance` → transfer 1e11 → `getBalance` | ✅ `0` → `100000000000` |
+| the new key deploys `return!(1)`, no flags | ✅ value `"1"` |
+| **a trusted key deploys `pos!("trust", …)` for it** | ✅ value **`(true)`** |
+| **the new key deploys `pos!("bond", …, 100)`** | ✅ value **`(true)`** |
+| `getBonds` afterwards | ✅ grew 2 → 3 (A 1000, newcomer 100, B 100) |
+| `getActiveValidators` afterwards | ✅ 3 validators |
+| `pos!("withdraw", …)` | ✅ value `(true)` — deactivates at once, stake escrowed |
+| `rnode deploy` with no `--valid-after-block-number` | ✅ `processedWithSuccess` |
 
-The read path and ordinary writes (transfers) are demonstrated; **validator admission is not**, and
-the failure sits in `trust`, not in the deploy mechanics.
+**A caution learned the hard way.** Bonding a key that has no running node still counts against
+finality: when the newcomer bonded 100, A's share fell from 75% to 60% of the pool, and with no
+`--autopropose` A is the only proposer, so blocks kept arriving but nothing was finalised any more
+(`Finalized fringe is not available`). `withdraw` is not an instant escape either — the stake stays in
+the pool until the quarantine deadline. Hence A's 1000.
 
 ## Known issues
 
@@ -327,8 +370,9 @@ throughout.
 The fix (`fix/deploy-expiry-negative`, commit `756f1727d`) makes a negative anchor mean "not
 specified" and resolves it from the node's own status, which already carries `latest_block_number` —
 the same thing the faucet, the browser client, `gateway::current_height` and
-`txn_coordinator::run_phase_at` do. Both nodes now run that binary (`8432bff7b9455193…`; rollback kept
-at `/usr/local/bin/rnode.old-ebfe299cdf785ad0`), so `rnode deploy` works with no extra flags.
+`txn_coordinator::run_phase_at` do. All three nodes now run a binary that includes it
+(`d7f5000b…`, which also carries the upstream registry-lookup fix), so `rnode deploy` works with no
+extra flags. Rollbacks are kept in place as `/usr/local/bin/rnode.old-<sha>`.
 **A binary built before that commit still needs `--valid-after-block-number <height>`.**
 
 **K2 — an earlier diagnosis in this document was wrong; corrected.** It blamed the dummy-deploy
@@ -338,61 +382,90 @@ start-up latency: a healthy restart took ~55s before `/api/status` answered, and
 appeared to hang was made ~25s in. The injector stays on because it is what keeps blocks flowing for
 joiners. **Do not treat the injector as a suspect for deploy problems.**
 
-**K3 — only keys funded at genesis can deploy, which blocks the whole admission path.**
-Phlo is charged to the deployer's vault. On this chain, keys listed in `wallets.txt` at genesis (dave,
-deployer, alice…) can deploy, but keys funded *later* by `revVault!("transfer", …)` still **cannot**:
-they get `processedWithError` on even a trivial `return!(1)`, so the transfer succeeds as a deploy
-while the recipient's funds are not spendable. Measured with the same term and flags:
+**K3 — transfers credit a spendable vault; an earlier claim here was wrong and is retracted.**
+Phlo is charged against the deployer's vault (`native_state.rs::pre_charge`, which derives the address
+as `RevAddress::from_public_key(deployer)` and returns `preCharge: insufficient funds (… < …)` as a
+*value* — which is exactly what `processedWithError` on a trivial deploy looks like). An earlier
+revision of this document concluded from such errors that only `wallets.txt`-funded keys could ever
+spend. That was an artifact of a chain that was already OOM-thrashing (K7); on a healthy chain the
+same experiment gives the opposite answer:
 
-| deployer | funded how | trivial `return!(1)` |
-|---|---|---|
-| dave | genesis `wallets.txt` | `processedWithSuccess` |
-| validator-a (genesis bond) | 1e11 transferred to its vault | **`processedWithError`** |
-| a brand-new key F | 1e11 transferred to its vault | **`processedWithError`** |
+| step | measured |
+|---|---|
+| a brand-new key's balance | `0` |
+| transfer 1e11 to it | balance `100000000000` |
+| it deploys `return!(1)` | **value `"1"`** — a transfer-funded key deploys fine |
 
-Since `trusted` = the genesis bond keys ∪ `--pos-multi-sig-public-keys`, **no key here is both trusted
-and able to deploy**, so `pos!("trust", …)` cannot run at all. It cannot be fixed on the current
-chain: the next rebuild should put a **`wallets.txt`-funded** key into
-`--pos-multi-sig-public-keys`, so that a trusted-and-funded key exists. Whether the
-transfer-credit behaviour is itself a bug is an open question — see K6.
+So funding a new key works. The requirement that does bite is that the **trusted** key must be funded,
+because it pays for its own `trust` deploy — and the genesis bond keys are not in `wallets.txt`. Hence
+`--pos-multi-sig-public-keys <dave>` (K6).
 
-**K4 — deploy output is not observable.** `stdout!(…)` from a deploy does not reach the journal, and
-`deploy-status` for a failed deploy answers
-`"deploy error message not available in cache or deploy executed on another node"`. So *why* a
-`bond`/`trust` failed cannot be read from the node after the fact; the return value is only reachable
-through the registry result-slot pattern (`insertSigned` with a nonce) that the browser client uses —
-and that path lags by about one deploy when driven through `scripts/qos-cli/rholang-client.mjs`
-(`deployTerm` returns the *previous* call's value), so read twice before trusting the answer.
+**K4 — read deploy output from the term, not from `deploy-status`.** `stdout!(…)` from a deploy does
+not reach the journal, and `deploy-status` for a failed deploy answers
+`"deploy error message not available in cache or deploy executed on another node"`. The way in is the
+registry result-slot pattern the browser client uses: `scripts/qos-cli/rholang-client.mjs`'s
+`deployTerm` wraps the term so that its return value is stored and handed back. That is how the
+[verified path](#status-of-the-verified-path) was measured.
 
-**K5 — disk growth.** With the injector on, the chain grows ~140 MB/day (a block every ~2–4s,
-~6.6 KB/block). `/health` reports `disk_free_mb`; 25 GB gives months of headroom, but a busy
-testnet will need a plan.
+An earlier revision warned that this read-back "lags by about one deploy". That was wrong: the lag was
+dev's registry-lookup divergence (C18 — the native handler wrapped its reply in `(uri, value)` while
+the genesis `Registry.rho` forwards it unwrapped, so a client's `for (X <- ch) { X!(…) }` silently did
+nothing, with no error and no result). It is fixed in the binary these nodes run (`d7f5000b…`), and
+with it deploy result values are readable — which is what unblocked the whole diagnosis.
 
-**K6 — whether a genesis validator is trusted is still UNTESTED. An earlier revision of this section
-was wrong and that claim is retracted.**
+**K5 — disk and memory growth.** Disk now grows only with real usage (~6.6 KB/block) since the injector
+is gone. Memory is the constraint that matters, and it grows with the length of the chain rather than
+with activity — see K7.
 
-It previously said the genesis-seeded trusted set reads as empty at runtime, based on a
-`pos!("trust", …)` deploy that errored. The evidence now points elsewhere: that deploy **never
-executed**. Every deploy signed by the genesis validator's key fails on phlo (K3) — including a
-trivial `return!(1)` — so its `trust` call never reached the pos system process at all. The gate
-message that *was* captured,
+**K6 — live validator admission works. Two earlier claims here were wrong; both are retracted.**
 
-```
-(false, "Only a trusted stakeholder can admit validators.")
-```
+The first said the genesis-seeded trusted set reads as empty at runtime; the second said no key on
+this chain could be both trusted and able to deploy. Both came from experiments run on a chain that
+was already OOM-thrashing (K7), where every deploy failed on phlo for reasons unrelated to trust.
 
-came from a **different, untrusted** key (dave), which is exactly what it should say. So the trusted
-set may well be seeded correctly, and nothing here shows otherwise.
+On the rebuilt chain the whole path is verified — see
+[Status of the verified path](#status-of-the-verified-path):
 
-Why it matters and how to settle it: the question cannot be answered on this genesis because no key
-is both trusted and funded. Answer it at the next rebuild — put a `wallets.txt`-funded key into the
-trusted set, then have that key `trust` a second funded key and have the second key `bond`. Read the
-verdicts through the browser client's result-slot path (K4), not from `deploy-status`.
+- a trusted key's `pos!("trust", …)` returns **`(true)`**, so `trusted` *is* seeded and readable at
+  deploy time; it contains dave, admitted by `--pos-multi-sig-public-keys`;
+- the newly trusted key's `pos!("bond", …, 100)` returns **`(true)`**, and both the bond pool and the
+  active validator set grow;
+- an untrusted key's `trust` still answers
+  `(false, "Only a trusted stakeholder can admit validators.")` — correct.
+
+The one real requirement: **the trusted key must be able to pay phlo**, so it has to be funded. The
+genesis bond keys are not in `wallets.txt`, so the trusted set is seeded with dave instead, via
+`--pos-multi-sig-public-keys <hex> --pos-multi-sig-quorum 1` — on every node, so a joiner's own view
+of the genesis PoS spec matches the chain it is joining.
+
+**K7 — start-up replay memory grows with chain length, capping a 1 GB host at roughly 1000 blocks.
+This is what broke the previous chain, and it is the most important operational constraint here.**
+
+Measured: a chain at 1142 blocks needed a start-up replay that climbed to **738 MB** on a 957 MB host
+(`Out of memory: Killed process … (rnode) … anon-rss:738604kB`, exit `status=9/KILL`), while the
+persisted state was only **4.5 MB**. The replay inflates by roughly 150× — about **1 MB per block**,
+essentially independent of what is on disk. After the OOM kill every restart repeated the same replay,
+grew the same way and died again: the API never answered the health check (`api-unreachable no-blocks`)
+while `systemctl is-active` still reported `active`. That, not the injector, is the real explanation of
+the "removing the injector left the API unresponsive" observation in K2.
+
+What was done about it:
+
+- the rebuilt chain runs **without `--autopropose` and without `--deployer-private-key`**, so blocks
+  arrive only when deploys do, and restart cost tracks real usage instead of wall-clock time;
+- a fresh chain starts in **15 s at 18–20 MB** (measured), where the 1142-block chain never started;
+- the health check no longer fails on a missing finalised fringe — an idle chain has none, and joiners
+  restore from the approved genesis fringe instead;
+- if this testnet is meant to carry sustained traffic this belongs in the node: replay should not
+  retain a per-block working set proportional to the whole chain. More RAM only moves the wall (2 GB
+  would put it near ~2000 blocks), it does not remove it.
 
 ## Housekeeping
 
-- Snapshots/rollback: the unit files are backed up in place (`rnode.service.bak-<epoch>`);
-  genesis files are the source of truth and are tiny.
+- Snapshots/rollback: unit files are backed up in place (`rnode.service.bak-<epoch>`), node binaries as
+  `/usr/local/bin/rnode.old-<sha>`, and each rebuild left the previous data dir as
+  `/var/lib/rnode.bak-<timestamp>`. The genesis files are the source of truth and are tiny; those old
+  data dirs (4.5 MB each) can be deleted once the new chain is confirmed.
 - Firewall: `ufw` allows `22`, `40400`, `40401`, `40403`, `40404`, `40405`, plus `80`/`443` on A.
   Nothing else — the old rhobot box's 36-rule ruleset was pruned to what actually has listeners.
 - Certificates renew via `certbot.timer` on A (nginx authenticator), first expiry 2026-12-20.
