@@ -4,13 +4,13 @@ A small public RChain testnet run on [rchain-rust](../) for the rholang playgrou
 agents and experiments. Two bonded validators on two hosts, dev-mode block production, funded
 dev wallets.
 
-> **Status: reads work; deploys work only with a flag.** `/api/status`, `/api/explore-deploy`
-> (eval), `getBonds`, `getActiveValidators` and `/health` all work. **Deploys sent by the `rnode
-> deploy` CLI are silently dropped unless you pass `--valid-after-block-number <current height>`**
-> — the CLI defaults that field to `-1`, which the proposer treats as expired on any chain taller
-> than ~49 blocks. The browser and agent clients already send the right value; see [K1](#known-issues).
-> Validator onboarding is blocked by a separate bug, [K6](#known-issues). Not production, holds no
-> value, and its chain can be rebuilt (and therefore reset) at any time.
+> **Status: reads and writes both work.** `/api/status`, `/api/explore-deploy` (eval),
+> `getBonds`/`getActiveValidators`, `/health` and deploys all work. The testnet's binary (built
+> 2026-09-21, `8432bff7b9455193…`) anchors `rnode deploy` at the node's current height, so no extra
+> flags are needed; a binary older than that still needs `--valid-after-block-number <height>` — see
+> [K1](#known-issues). **Validator onboarding is still blocked** by a separate bug,
+> [K6](#known-issues). Not production, holds no value, and its chain can be rebuilt (and therefore
+> reset) at any time.
 
 ---
 
@@ -65,9 +65,9 @@ These are throwaway development keys, published on purpose. Never use them for a
 | Reads of chain state (`getBonds`, `getActiveValidators`) | ✅ works |
 | `GET /api/status` | ✅ works |
 | `/health` monitoring snapshot | ✅ works |
-| **Deploys from the browser / room agents** (`rholang.ts`, `rholang-client.mjs`) | ✅ works — they send `latestBlockNumber - 1` themselves |
-| **Deploys from the `rnode deploy` CLI** | ⚠️ **dropped** unless you pass `--valid-after-block-number <current height>` — K1 |
-| Facet / faucet transfers | ⚠️ same rule if the send path uses the CLI; the browser/agent faucet path is fine |
+| **Deploys — browser, room agents, `rnode deploy` CLI** | ✅ works (the CLI needed `--valid-after-block-number` until the 2026-09-21 binary — K1) |
+| Transfers (faucet, `$transfer`) | ✅ works — verified `processedWithSuccess` on this chain |
+| **Becoming a validator** | ❌ blocked by K6 (genesis route works) |
 
 ## Monitoring
 
@@ -269,24 +269,25 @@ new return, pos(`rho:rchain:pos`), deployerId(`rho:rchain:deployerId`), ret in {
 Deploy them with:
 
 ```bash
-H=$(curl -s https://testnet.rhobot.net/api/status | python3 -c 'import sys,json;print(json.load(sys.stdin)["latestBlockNumber"])')
-rnode --profile docker deploy --phlo-limit 90000 --phlo-price 1 \
-  --valid-after-block-number "$H" --shard-id /root --private-key <hex> term.rho
+rnode --profile docker deploy --phlo-limit 90000 --phlo-price 1 --shard-id /root \
+  --private-key <hex> term.rho
 rnode --profile docker deploy-status --deploy-signature <deployId>
 ```
 
-Two required fields, both easy to miss:
+Two easy-to-miss details:
 
 - `--shard-id /root`, or the node answers
   `Deploy shardId '' is not a member of this node's shards: [/root]`;
-- `--valid-after-block-number <current height>`, or the deploy is silently discarded as expired (K1).
+- `--valid-after-block-number <current height>` **only on a binary built before 2026-09-21** — the
+  current testnet binary is anchored at the node's height automatically (K1). If `deploy-status`
+  answers `notProcessed / Unknown`, the deploy was swept from the pool as expired.
 
 ### Status: reads verified, ordinary writes verified, admission blocked
 
 | step | result |
 |---|---|
 | `getBonds` / `getActiveValidators` reads | ✅ verified live |
-| `revVault!("transfer", …)` deploy | ✅ `processedWithSuccess` (with `--valid-after-block-number`) |
+| `revVault!("transfer", …)` and an ordinary term | ✅ `processedWithSuccess` on this chain |
 | `pos!("trust", …)` from a genesis validator | ❌ executed, `processedWithError` — see K6 |
 | `pos!("bond", …)` by a funded observer | ✅ executed, then rejected `Validator is not trusted…` because trust failed |
 | `getBonds` afterwards | unchanged — A 300, B 100, no new member |
@@ -296,29 +297,36 @@ the failure sits in `trust`, not in the deploy mechanics.
 
 ## Known issues
 
-**K1 — `rnode deploy` drops deploys by default (this is what "writes don't work" turned out to be).**
-Without the flag the CLI sends `valid_after_block_number = -1`
-(`node/src/runtime/node_main.rs`: `valid_after_block_number.unwrap_or(-1)`), and the proposer
-classifies a deploy as expired when `valid_after_block_number < next_block_num - DEPLOY_LIFESPAN`
-(`casper/src/blocks/proposer/proposer.rs`, `DEPLOY_LIFESPAN = 50`). On any chain taller than ~49
-blocks, every unflagged CLI deploy is therefore dropped before it can be proposed — which is why the
-proposer logs `No pooled deploys; injecting dummy deploy for block #NNN` indefinitely. The node's own
-faucet documents the rule (`node/src/api/faucet.rs`): *"must be the current chain height (not `-1`)"*.
+**K1 — `rnode deploy` used to drop deploys in silence. ✅ FIXED 2026-09-21 and deployed to both nodes.**
 
-Measured on the testnet at height 904, same term and key:
+Without the flag the CLI sent `valid_after_block_number = -1`
+(`node/src/runtime/node_main.rs`: `valid_after_block_number.unwrap_or(-1)`), and a deploy is expired
+once `height - valid_after_block_number > DEPLOY_LIFESPAN` (50) — enforced when the pool is swept
+(`casper/src/dag.rs::expire_deploys`) and again by the proposer
+(`casper/src/blocks/proposer/proposer.rs`). On any chain taller than ~49 blocks every unflagged CLI
+deploy was therefore *deleted from the pool*: the node answered `Response: Success!` with a DeployId
+and the deploy was then silently never proposed, which is why the proposer logged
+`No pooled deploys; injecting dummy deploy for block #NNN` indefinitely. The node's own faucet
+documents the rule (`node/src/api/faucet.rs`): *"must be the current chain height (not `-1`)"*.
+
+Measured on the testnet, same term and key:
 
 | deploy | status |
 |---|---|
-| no flag (default `-1`) | `notProcessed / Unknown` |
-| `--valid-after-block-number 904` | **`processedWithSuccess`** |
+| no flag, before the fix (height 904) | `notProcessed / Unknown` |
+| `--valid-after-block-number 904`, before the fix | `processedWithSuccess` |
+| **no flag, after the fix** (height ~1060) | **`processedWithSuccess`** |
 
-rhobot hides this: at height 8, `-1 < 8 - 50` is false, so deploys there pass. The dummy-deploy
-injector is **not** involved — it only fires when the pool really is empty, and it was enabled for
-both rows above. The browser and agent clients are unaffected because they compute
-`Math.max(0, latestBlockNumber - 1)` themselves.
+rhobot hid it: at height 8, `-1 < 8 - 50` is false, so deploys there always passed. The dummy-deploy
+injector was never involved — it only fires when the pool really is empty, and it was enabled
+throughout.
 
-*Upstream fix:* default the CLI to the node's current height, or have the node treat a negative
-value as "no constraint". *Workaround:* always pass `--valid-after-block-number`.
+The fix (`fix/deploy-expiry-negative`, commit `756f1727d`) makes a negative anchor mean "not
+specified" and resolves it from the node's own status, which already carries `latest_block_number` —
+the same thing the faucet, the browser client, `gateway::current_height` and
+`txn_coordinator::run_phase_at` do. Both nodes now run that binary (`8432bff7b9455193…`; rollback kept
+at `/usr/local/bin/rnode.old-ebfe299cdf785ad0`), so `rnode deploy` works with no extra flags.
+**A binary built before that commit still needs `--valid-after-block-number <height>`.**
 
 **K2 — an earlier diagnosis in this document was wrong; corrected.** It blamed the dummy-deploy
 injector and claimed that removing it left A's HTTP API unresponsive. K1 shows the injector has
