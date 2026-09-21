@@ -104,8 +104,9 @@ name** — only its author can change or remove it for everyone; anyone else's
 
 ## Part 2 — reading a little rholang
 
-The second half of MacRhoLang reaches a **chain** (an RChain *rnode*). To test
-it you need your own rnode running — `bash scripts/localnet/run-node.sh`, then
+The second half of MacRhoLang reaches a **chain** (an RChain *rnode*). By
+default that is the public node at `https://rnodeapi.rhobot.net`; to use your
+own instead — `bash scripts/localnet/run-node.sh`, then
 `/rholang rnode http://127.0.0.1:40403`. A room works completely without one;
 this half is opt‑in.
 
@@ -149,7 +150,7 @@ These ship with the app. Run one as its own line and it is wrapped, sent, and
 the answer read back for you.
 
 ```
-$balance("11112VYAt8rUGNRRZX3eJdgagaAhtWTK8Js7F7X5iqddMVqyDTtYau")
+$balance("1111bn92xHbttqWHEXqD8PiykFxgeUjizzquT6JRePj2pAoHFAuiK")
 → 1000000000000
 ```
 
@@ -158,7 +159,7 @@ $balance("11112VYAt8rUGNRRZX3eJdgagaAhtWTK8Js7F7X5iqddMVqyDTtYau")
 
 ```
 $balance($me)
-$transfer(10, "11112VYAt8…")
+$transfer(10, "1111bn92xH…")
 ```
 
 `$balance` is a *read* — free, no block, answered immediately. `$transfer` is a
@@ -200,7 +201,7 @@ $balance($me) as bal {
 other way round:
 
 ```
-$transfer(50, "11112VYAt8…") as (result, error) {
+$transfer(50, "1111bn92xH…") as (result, error) {
   match error {
     Nil => return!(("paid", result))
     _   => return!(("failed", error))
@@ -212,7 +213,7 @@ For several cases, **repeat `<pattern> { block }`** — two or more arms become 
 `match`:
 
 ```
-$transfer(50, "11112VYAt8…") as (ok, Nil)  { return!(("paid", ok)) }
+$transfer(50, "1111bn92xH…") as (ok, Nil)  { return!(("paid", ok)) }
                                 (Nil, err) { return!(("failed", err)) }
 ```
 

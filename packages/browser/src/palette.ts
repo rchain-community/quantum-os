@@ -287,7 +287,7 @@ const OTHER_ACTIONS: QuickAction[] = [
   // rnode, no key and no phlo. A chain is for the part you want to outlive the
   // room, and most rooms never need it.
   { label: "Point at an rnode", ico: "🔗", kind: "command", cmd: "/rholang rnode", section: "If you use a chain",
-    args: [{ prompt: "Which rnode?", example: "http://localhost:40403" }],
+    args: [{ prompt: "Which rnode?", example: "https://rnodeapi.rhobot.net" }],
     hint: "where /rholang eval and deploy send programs — nothing else in the app needs an rnode" },
   { label: "Make a signing key", ico: "🗝", kind: "command", cmd: "/rholang key generate",
     section: "If you use a chain",

@@ -69,7 +69,24 @@ export interface PeerConfig {
   onPeerLeft?: (peerId: string) => void;
   onChannelOpen?: (peerId: string) => void;
   onRemoteTrack?: (peerId: string, stream: MediaStream) => void;   // live-call media
+  /**
+   * A `posix-net` socket channel (see posix-net.ts) opened with this peer.
+   * Separate from `onChannelOpen`/`onMessage`, which are the chat/relay "qos"
+   * channel — socket traffic never goes through the flood relay, so it gets
+   * its own pair of dedicated channels and its own callbacks.
+   */
+  onSocketChannelOpen?: (peerId: string, kind: SocketChannelKind) => void;
+  onSocketMessage?: (peerId: string, kind: SocketChannelKind, data: string) => void;
 }
+
+/**
+ * The two socket-channel transports posix-net.ts builds TCP-like/UDP-like
+ * sockets on top of — see createPeerConnection/initiateConnection/handleOffer.
+ * "stream" is ordered+reliable (SCTP default); "dgram" is unordered with no
+ * retransmits. Distinct from the chat "qos" channel so socket framing never
+ * mixes with, or rides the flood relay of, ordinary chat/state messages.
+ */
+export type SocketChannelKind = "stream" | "dgram";
 
 /**
  * STUN alone — this file's own fallback when nobody hands it `iceServers`.
@@ -235,6 +252,12 @@ export class QOSPeer {
   private sweepTimer?: ReturnType<typeof setInterval>;
   private leaseTimer?: ReturnType<typeof setInterval>;
   private channels = new Map<string, RTCDataChannel>();
+  // posix-net.ts socket channels — see SocketChannelKind above. Kept separate
+  // from `channels` (the chat "qos" channel) so socket traffic and its
+  // point-to-point-only delivery can never be confused with, or accidentally
+  // routed through, the chat flood relay.
+  private streamChannels = new Map<string, RTCDataChannel>();
+  private dgramChannels = new Map<string, RTCDataChannel>();
   private config: PeerConfig;
   /** What the server is told the room is called — a hash of the token. */
   private wireRoomId = "";
@@ -427,6 +450,8 @@ export class QOSPeer {
     this.ws?.close();
     this.connections.clear();
     this.channels.clear();
+    this.streamChannels.clear();
+    this.dgramChannels.clear();
     for (const t of this.disconnectTimers.values()) clearTimeout(t);
     this.disconnectTimers.clear();
     for (const t of this.pruneTimers.values()) clearTimeout(t);
@@ -607,6 +632,38 @@ export class QOSPeer {
   /// and to that peer everything typed here is silence.
   hasChannel(peerId: string): boolean {
     return this.channels.get(peerId)?.readyState === "open";
+  }
+
+  /// Is a posix-net socket channel of this kind open to this peer? Unlike
+  /// hasChannel/isReachable there is no flood/relay fallback for sockets —
+  /// they are point-to-point by definition (see docs/connection.md's
+  /// posix-net section) — so this is the only way to reach one, and
+  /// posix-net.ts's connect() must pin the peer directly first.
+  hasSocketChannel(peerId: string, kind: SocketChannelKind): boolean {
+    const map = kind === "stream" ? this.streamChannels : this.dgramChannels;
+    return map.get(peerId)?.readyState === "open";
+  }
+
+  /// Send a raw posix-net frame to a peer over its dedicated socket channel.
+  /// Never flood-relayed — returns false if no direct channel is open, so
+  /// posix-net.ts can surface "not connected" rather than silently routing
+  /// socket bytes through unrelated peers.
+  sendSocketFrame(peerId: string, kind: SocketChannelKind, data: string): boolean {
+    const map = kind === "stream" ? this.streamChannels : this.dgramChannels;
+    const ch = map.get(peerId);
+    if (ch?.readyState !== "open") return false;
+    ch.send(data);
+    return true;
+  }
+
+  private setupSocketChannel(peerId: string, ch: RTCDataChannel, kind: SocketChannelKind): void {
+    const map = kind === "stream" ? this.streamChannels : this.dgramChannels;
+    ch.onopen = () => {
+      map.set(peerId, ch);
+      this.config.onSocketChannelOpen?.(peerId, kind);
+    };
+    ch.onclose = () => { map.delete(peerId); };
+    ch.onmessage = (event) => { this.config.onSocketMessage?.(peerId, kind, event.data); };
   }
 
   /// Send to one peer. The control plane: sealed under the room key and
@@ -1067,6 +1124,16 @@ export class QOSPeer {
 
     const ch = pc.createDataChannel("qos");
     this.setupDataChannel(remotePeerId, ch);
+    // posix-net.ts's two socket transports — created alongside the chat
+    // channel so a single offer/answer establishes all three; see
+    // SocketChannelKind. Unused until something actually opens a socket to
+    // this peer, so the cost of always creating them is negligible.
+    this.setupSocketChannel(remotePeerId, pc.createDataChannel("qos-stream"), "stream");
+    this.setupSocketChannel(
+      remotePeerId,
+      pc.createDataChannel("qos-dgram", { ordered: false, maxRetransmits: 0 }),
+      "dgram",
+    );
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -1100,7 +1167,12 @@ export class QOSPeer {
     }
     if (!pc) {
       pc = this.createPeerConnection(fromPeerId);
-      pc.ondatachannel = (event) => this.setupDataChannel(fromPeerId, event.channel);
+      pc.ondatachannel = (event) => {
+        const ch = event.channel;
+        if (ch.label === "qos-stream") this.setupSocketChannel(fromPeerId, ch, "stream");
+        else if (ch.label === "qos-dgram") this.setupSocketChannel(fromPeerId, ch, "dgram");
+        else this.setupDataChannel(fromPeerId, ch);
+      };
     }
 
     // Perfect-negotiation glare handling: the peer with the smaller ID is polite.
@@ -1351,6 +1423,8 @@ export class QOSPeer {
     this.connections.get(peerId)?.close();
     this.connections.delete(peerId);
     this.channels.delete(peerId);
+    this.streamChannels.delete(peerId);
+    this.dgramChannels.delete(peerId);
   }
 
   /**

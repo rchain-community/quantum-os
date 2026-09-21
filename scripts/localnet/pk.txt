@@ -1,18 +1,27 @@
-# pk.txt — private keys for a LOCAL node only.
+# pk.txt — private keys for a DEV node only.
 #
-# THROWAWAY KEYS. They are in the repository on purpose: a local devnet needs a
-# funded key, and a key nobody can read funds nobody. They are worthless on any
+# THROWAWAY KEYS. They are in the repository on purpose: a dev chain needs
+# funded keys, and a key nobody can read funds nobody. They are worthless on any
 # real network, and using them anywhere with value would hand it away.
 #
-#   validator  bonds.txt's validator; also proposes blocks. From rchain-rust's
-#              tools/devnet.sh, where it is published for exactly this use.
-#   deployer   generated for this repo. Point the browser at it with
+#   validator  bonds.txt's validator; also proposes blocks.
+#   deployer   the browser's and the facilitator faucet's default deploy key
+#              (run-agents.sh reads this line). Point the browser at it with
 #              /rholang key <hex>.
+#   alice…dave further funded accounts for multi-party tests (transfers,
+#              exchange, rendezvous) — one per participant.
+#
+# Every key here is funded by wallet.txt (1000000000000 REV each) when the chain is
+# built with run-node.sh --fresh.
 #
 # Regenerate a key with:  node keys.mjs --generate
 # Addresses:              node keys.mjs
 #
-# Format: <name>=<secp256k1 secret key, base16>
+# Format: <name>=<secp256k1 secret, base16>
 
-validator=a68a6e6cca30f81bd24a719f3145d20e8424bd7b396309b0708a16c7d8000b76
-deployer=d3ad764ae57434401de9c39ec9e7c685152ffbd5da348656904e2622125a8f05
+validator=0b5c185184109d8ad6863f904ca4cffa4cfdbe9eb641199120ca1e13c0bef949
+deployer=3554e8762e65c97b0ed5d428b3eada02897db03237be7475628e271c217b6263
+alice=0b60b3ffcc43a607e037c3da3c1ed366261d742288abdf92d53cf80b9e3cf98f
+bob=13487106542b1c1472c4af4bf29031ecbad42464a82e38b6f0e18a09bbf54f12
+carol=babf57fd43a2c5b46596fa24f20e7f4b7892f66c5d0413f146cac2b9ce9ea902
+dave=7707a3e05728428b7a2f4464169eeb3436ea5eda112a4c4a97685d2651bf9895

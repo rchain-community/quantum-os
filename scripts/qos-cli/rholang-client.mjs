@@ -21,7 +21,12 @@ import { blake2b } from "@noble/hashes/blake2.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 
 export const DEFAULT_CONFIG = {
-  url: "http://127.0.0.1:40403",
+  // Matches the browser's default (packages/browser/src/rholang.ts). The
+  // faucet key (agent.mjs --key) is the localnet's genesis-funded deployer, so
+  // it only has REV here if this node's genesis was built from
+  // scripts/localnet/wallet.txt — the same "dev instance" assumption as before,
+  // just no longer pinned to loopback. Never point --key at a key with value.
+  url: "https://rnodeapi.rhobot.net",
   shard: "root",
   phloLimit: 500_000,
   phloPrice: 1,

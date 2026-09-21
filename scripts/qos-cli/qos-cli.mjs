@@ -225,8 +225,18 @@ async function main() {
     if (!polite && !dead && (collision || channels.has(fromId))) return;
 
     const pc = newPeerConnection(fromId);
-    if (pc.onDataChannel?.subscribe) pc.onDataChannel.subscribe((ch) => setupChannel(fromId, ch));
-    else pc.ondatachannel = (ev) => setupChannel(fromId, ev.channel);
+    // Browser peers now also open "qos-stream"/"qos-dgram" (posix-net sockets,
+    // packages/browser/src/posix-net.ts) alongside "qos" in the same offer.
+    // This CLI has no posix-net support, but MUST filter by label regardless:
+    // unfiltered, ondatachannel fires once per channel and each fire
+    // overwrote channels.get(fromId) with whichever one opened, so the real
+    // "qos" channel could lose its slot to an idle socket channel and
+    // setupChannel ran 2-3x per peer — exactly the connect/close "churn"
+    // this file's own glare-handling comment above was written to fix,
+    // resurfacing for a different reason.
+    const bindQos = (ch) => { if (ch.label === "qos") setupChannel(fromId, ch); };
+    if (pc.onDataChannel?.subscribe) pc.onDataChannel.subscribe(bindQos);
+    else pc.ondatachannel = (ev) => bindQos(ev.channel);
     await pc.setRemoteDescription({ type: "offer", sdp });
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);

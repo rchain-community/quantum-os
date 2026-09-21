@@ -50,14 +50,16 @@ PERSIST_DIR="${PERSIST_DIR:-./.qos-memory}"
 STAGGER="${STAGGER:-15}"
 
 # TEST REV faucet (dev shard only — see scripts/qos-cli/README.md's "Test REV
-# faucet" section). The facilitator's --key always deploys against its
-# hardcoded 127.0.0.1:40403 rnode config — there is no way to point it
-# elsewhere — so this is inherently a dev-shard-only key, and defaulting it on
-# here is exactly as safe as scripts/localnet/pk.txt already being committed:
-# genesis-funded, worthless outside that local chain, documented there as
-# throwaway. FACIL_KEY overrides it; FACIL_KEY= (set to empty) disables the
-# faucet without touching this file. Only ever passed to the `facilitator`
-# role — one key in one process, not one per agent.
+# faucet" section). The facilitator's --key deploys against the rnode in
+# rholang-client.mjs's DEFAULT_CONFIG — the dev instance at rnodeapi.rhobot.net,
+# no longer loopback. The key is still the localnet's genesis-funded deployer
+# from scripts/localnet/pk.txt (committed, documented as throwaway), so it has
+# REV on that node only if its genesis was built from scripts/localnet/
+# wallet.txt — and defaulting it on is as safe as pk.txt being committed only
+# for as long as that node stays a dev instance. FACIL_KEY overrides it;
+# FACIL_KEY= (set to empty) disables the faucet without touching this file.
+# Only ever passed to the `facilitator` role — one key in one process, not
+# one per agent.
 FACIL_KEY="${FACIL_KEY-$(grep '^deployer=' ../localnet/pk.txt 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')}"
 
 command -v node >/dev/null || { echo "node not found — install Node 18+."; exit 1; }

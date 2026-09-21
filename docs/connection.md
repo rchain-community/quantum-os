@@ -170,3 +170,71 @@ When the signaling WebSocket drops and reconnects (Render.com sleep, network bli
 - **Async command output belongs to a room (`inRoom`)**: `activeRoom` is aliased state that inbound callbacks swap while they work, so a command answering after an `await` can append its lines to whichever room happened to be current — where they are invisible, or rendered and then wiped by the next transcript repaint (which replays the *viewed* room's log). That is what "the message flashed briefly" is. `inRoom(ctx, fn)` captures the room at command time and restores after, the way the peer callbacks already do; `/ice test` and `/rholang explain` use it.
 - **`app.ts`**: `onPeerLeft` is debounced 6 seconds via `pendingLeaves: Map<string, timer>` and is idempotent (one pending-leave per peer). If the peer rejoins within the window, suppress both "left" and "joined" messages silently
 - **Background-tab recovery + presence polish**: `peer.ts` `wake()` (reconnect now, reset the throttled backoff; floor lowered to 1.5s) is called on `visibilitychange`/`focus`/`pageshow`/`online`, so peers return instantly after a tab switch instead of "eventually"; `app.ts` adds a peer to the roster on **`onChannelOpen`** too (not just signaling-join), so a remote-initiated peer (e.g. an agent that dialed us) shows up; agents are flagged **🤖** in the roster via `peerAgents` (from the `name` envelope's `agent:<role>`); the status line shows a live `connected · N peers` / `reconnecting…`; the "joined" line waits for the peer's **name** (`pendingJoins`, 5s id fallback) so it reads "Jim joined", not a raw id. **Sticky identity caches (survive flaps):** both the display name (`lastKnownNames`) and the agent role (`peerAgents`) are per-`RoomContext` caches that are **never cleared on leave** — only reset when a peer re-announces itself as a non-agent — so a flapping AI daemon keeps its name **and** its 🤖 badge across reconnect churn instead of decaying to a raw hex id (a departed peer's stale entry never renders — the roster only badges ids still in `peers`). Do not re-add a `peerAgents.delete` to the leave-grace timer
+
+## posix-net — POSIX-style sockets over the mesh
+
+**Scope, stated up front: this is not a VPN.** A browser tab cannot create a
+TUN/TAP interface or a raw socket — no amount of code here reroutes the
+OS's or another app's traffic. What this is: `socket()`/`connect()`/
+`send()`/`recv()`/`close()`/`listen()`/`accept()` macros (`posix-net.ts`),
+addressed by `(peerId, port)`, that reach **other quantum-os mesh peers
+only**. A future native runtime (see `scripts/qos-cli`) could someday back
+the same API with real OS sockets and extend `connect()` to arbitrary
+external hosts — that bridge does not exist here and the browser
+implementation must never imply it does.
+
+**Two dedicated data channels per peer connection, not one.** `peer.ts`
+opens `"qos-stream"` (ordered, reliable — TCP-like) and `"qos-dgram"`
+(`ordered: false, maxRetransmits: 0` — UDP-like) alongside the existing
+chat `"qos"` channel, in the same offer/answer as everything else
+(`initiateConnection`'s three `createDataChannel` calls; `handleOffer`'s
+`ondatachannel` dispatches by `event.channel.label`). `QOSPeer.
+hasSocketChannel(peerId, kind)`/`sendSocketFrame(peerId, kind, data)` are
+the only way to reach them — **there is no flood-relay fallback**, unlike
+`send()`/`broadcast()` on the chat channel. A socket is point-to-point by
+definition, so `posix-net.ts`'s `connect()` calls `pinNeighbor()` first
+(the existing "always keep a direct link to this peer" primitive already
+used for calls and `/conn`) rather than relying on ring/skip-overlay luck,
+and a send with no open channel simply fails rather than flooding
+someone else's bytes through peers who have no reason to carry them.
+
+**`posix-net.ts` itself never touches WebRTC.** It talks only to a small
+injected `SocketTransport` interface (`pinNeighbor`/`hasSocketChannel`/
+`sendSocketFrame`), which is what makes its framing and multiplexing
+(`PosixNet` class: a tiny `{port, connId, seq, flag, payload}` frame, a
+SYN/SYN-ACK/DATA/FIN/RST handshake, one listener per `(type, port)`)
+testable with two fake in-memory transports and no browser at all
+(`test/posix-net.test.mjs`).
+
+**`app.ts` wires one `PosixNet` per room, alongside its `QOSPeer`.**
+`connect()` builds `net = new PosixNet({selfId, pinNeighbor,
+hasSocketChannel, sendSocketFrame})` from the same `newPeer` it just
+constructed (a forward-declared `let net` lets the `QOSPeer` config's
+`onSocketChannelOpen`/`onSocketMessage` callbacks close over it, since
+those only fire later, well after both exist) and stores it on
+`RoomContext.posixNet` — same per-room lifetime and `setActiveRoom`
+aliasing as `qpeer`, torn down alongside it on disconnect/tab-close.
+**`/socket`** is the manual command surface: `listen <port> [stream|dgram]`,
+`unlisten`, `connect <peer> <port> [stream|dgram]`, `send <connId> <text>`,
+`close <connId>`, `list`. Like `/ice`/`/conn`, it's excluded from the
+generic `qlf` rebroadcast (`send()`'s exclusion list) — its output is local
+diagnostic/data, not room chat. **No capability gating yet** — anyone can
+`/socket listen` or `connect`; gating `bind`/`connect` behind a
+`cap:socket:<port>`-style token (consistent with everything else in the
+ZFA model — see `note-declare`/`gov-*`'s dyncap-signed-envelope pattern) is
+the next step, tracked but not built.
+
+**Same TURN dependency as calls, for the same reason.** A socket has no
+flood-relay fallback to mask a failed direct pair, so two peers behind
+symmetric NAT/CGNAT need `fetchAutoTurn`/`/ice`'s existing relay exactly as
+a call does — nothing new to configure, since `iceServers` is supplied
+once per `RTCPeerConnection` regardless of which channels ride it.
+
+**NAT/firewall traversal is not censorship resistance.** STUN/TURN gets
+two ordinary networks (corporate NAT, mobile CGNAT) connected; it does
+nothing against an adversary actively fingerprinting and blocking
+WebRTC/TURN traffic itself. That's a materially different, harder problem
+(traffic obfuscation, pluggable-transport-style techniques) and is
+explicitly out of scope for this layer — track it separately if it
+becomes a real requirement, rather than assuming "mesh + TURN" already
+covers it.

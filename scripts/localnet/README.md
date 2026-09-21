@@ -46,10 +46,15 @@ the browser uses) · **40405** admin HTTP.
 | `run-node.sh` | the rnode invocation, with why each flag is there |
 | `../../bin/rnode` | the node binary itself; `RNODE=` overrides it |
 
-The keys are in the repository on purpose: a local devnet needs a funded key, and
-a key nobody can read funds nobody. The validator key is rchain-rust's own
-published devnet key; the deployer key was generated here. Both are worthless on
-any real network, and using either anywhere with value would hand it away.
+The keys are in the repository on purpose: a dev chain needs funded keys, and
+a key nobody can read funds nobody. All of them were generated here — a
+`validator` (bonded in `bonds.txt`), the `deployer` the browser and the
+facilitator faucet default to, and `alice`…`dave` for multi-party tests — and
+`wallet.txt` funds every one of them at genesis. They are worthless on any real
+network, and using any of them anywhere with value would hand it away. This is
+also the genesis for the dev instance at `https://rnodeapi.rhobot.net` (the
+browser's default rnode): bring it up with `run-node.sh --fresh` from these
+files and the same keys work there.
 
 ```bash
 node keys.mjs                              # addresses for the keys in pk.txt
