@@ -659,8 +659,20 @@ export class QOSPeer {
     if (glare) this.makingOffer.set(fromId, false);   // smaller id: abandon ours, answer theirs
 
     const pc = this._newPC(fromId);
-    if (pc.onDataChannel?.subscribe) pc.onDataChannel.subscribe((ch) => this._setupChannel(fromId, ch));
-    else pc.ondatachannel = (ev) => this._setupChannel(fromId, ev.channel);
+    // Browser peers (peer.ts) now open two extra data channels alongside "qos"
+    // — "qos-stream"/"qos-dgram" for posix-net sockets (packages/browser/src/
+    // posix-net.ts). This file has no posix-net support and never will unless
+    // built deliberately (see docs/connection.md's posix-net section, "native
+    // runtime" future work) — but MUST filter by label regardless: with no
+    // filter, ondatachannel fires once per channel, and each fire overwrote
+    // `this.channels[fromId]` with whichever channel opened, so the actual
+    // "qos" chat channel could silently lose the slot to an idle socket
+    // channel, and onChannelOpen fired 2-3x per peer. That is what a browser
+    // running the posix-net-enabled peer.ts saw as reconnect-shaped "churn"
+    // when talking to this file — never a Render/signaling-server issue.
+    const bindQos = (ch) => { if (ch.label === "qos") this._setupChannel(fromId, ch); };
+    if (pc.onDataChannel?.subscribe) pc.onDataChannel.subscribe(bindQos);
+    else pc.ondatachannel = (ev) => bindQos(ev.channel);
     await pc.setRemoteDescription({ type: "offer", sdp });
     this._rejectMedia(pc);
     const answer = await pc.createAnswer();

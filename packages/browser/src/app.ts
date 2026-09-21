@@ -3,6 +3,7 @@ import { loadZfa, generateCapability, validateCapability,
          classifyCoupling, isPairwiseBalanced, signedAction,
          foldsToScalar, COUPLED_BASELINE } from "./zfa.js";
 import { QOSPeer, DEFAULT_ICE } from "./peer.js";
+import { PosixNet, type QosSocket, type SocketType } from "./posix-net.js";
 import { parseNoteLabel, denomination as noteDenomination,
          mintCurrencyToken, mintNote, mintNoteSeries, mintReceipt,
          termsHash8, seriesKey as makeSeriesKey,
@@ -226,6 +227,13 @@ interface ActionProposal { twists: Uint8Array; at: number; }
 interface RoomContext {
   roomId: string;
   qpeer: QOSPeer | null;
+  // posix-net (docs/connection.md "posix-net"): the socket macro layer for
+  // this room's mesh. Live-session state only, like actionProposals/
+  // rhoquHandlers below — sockets don't survive a reload, same as any other
+  // open connection.
+  posixNet: PosixNet | null;
+  socketListeners: Map<string, { port: number; type: SocketType; unlisten: () => void }>;
+  socketConns: Map<string, QosSocket>;
   // Peers + transport
   peers: Set<string>;
   peerNames: Map<string, string>;
@@ -316,6 +324,9 @@ function createRoom(roomId: string): RoomContext {
   return {
     roomId,
     qpeer: null,
+    posixNet: null,
+    socketListeners: new Map(),
+    socketConns: new Map(),
     peers: new Set(),
     peerNames: new Map(),
     lastKnownNames: new Map(),
@@ -384,6 +395,9 @@ function markUnread(ctx: RoomContext): void {
 // active room. JavaScript looks up `let` bindings at call time, so all
 // references see the active room's data automatically.
 let qpeer: QOSPeer | null = null;
+let posixNet: PosixNet | null = null;
+let socketListeners: Map<string, { port: number; type: SocketType; unlisten: () => void }> = new Map();
+let socketConns: Map<string, QosSocket> = new Map();
 let peers: Set<string> = new Set();
 let peerNames: Map<string, string> = new Map();
 let lastKnownNames: Map<string, string> = new Map();
@@ -452,6 +466,9 @@ function setActiveRoom(ctx: RoomContext): void {
   activeRoom = ctx;
   if (!rooms.has(ctx.roomId)) rooms.set(ctx.roomId, ctx);
   qpeer              = ctx.qpeer;
+  posixNet           = ctx.posixNet;
+  socketListeners    = ctx.socketListeners;
+  socketConns        = ctx.socketConns;
   peers              = ctx.peers;
   peerNames          = ctx.peerNames;
   lastKnownNames     = ctx.lastKnownNames;
@@ -494,6 +511,11 @@ function setActiveRoom(ctx: RoomContext): void {
 function setQpeer(p: QOSPeer | null): void {
   qpeer = p;
   activeRoom.qpeer = p;
+}
+
+function setPosixNet(p: PosixNet | null): void {
+  posixNet = p;
+  activeRoom.posixNet = p;
 }
 
 function lemmaToCapToken(name: string, tw: Uint8Array): string {
@@ -1506,6 +1528,7 @@ function closeRoomTab(roomId: string): void {
   const ctx = rooms.get(roomId)!;
   // Tear down the connection if any.
   if (ctx.qpeer) { ctx.qpeer.disconnect(); ctx.qpeer = null; }
+  if (ctx.posixNet) { ctx.posixNet.close(); ctx.posixNet = null; }
   rooms.delete(roomId);
   saveJoinedRooms();
   // If we closed the visible one, pick another to activate.
@@ -1563,7 +1586,9 @@ function promptJoinRoom(): void {
   if (!input) return;
   const roomId = extractRoomCap(input);
   if (!roomId) { alert("Couldn't find a cap:room:… token in that input"); return; }
-  if (!validateCapability(roomId)) { alert("Invalid room cap (not ZFA-balanced)"); return; }
+  // Same reasoning as /room join: a legacy (pre-Pauli-closure) cap is still a
+  // real room — the public room is one — so warn rather than refuse.
+  if (!validateCapability(roomId)) addMessage("", `⚠ room cap is not ZFA-closed (a legacy token?) — joining anyway: ${roomId}`, "system");
   openRoomTab(roomId);
 }
 
@@ -2340,7 +2365,7 @@ const RHOLANG_HELP = [
   "",
   "  Configuration:",
   "  /rholang config               — show all of it",
-  "  /rholang rnode <url>          — rnode HTTP API (default http://127.0.0.1:40403)",
+  "  /rholang rnode <url>          — rnode HTTP API (default https://rnodeapi.rhobot.net; a localnet is http://127.0.0.1:40403)",
   "  /rholang shard <id>           — shard the deploy is valid in (default root)",
   "  /rholang phlo <limit> [price] — what a deploy may spend",
   "  /rholang key generate|<hex>|show|forget — the secp256k1 deploy key (this browser only)",
@@ -2804,7 +2829,17 @@ function runRholangProgram(mode: "eval" | "deploy", source: string): void {
         }
         if (r.blockNumber !== undefined) say("  read against block " + r.blockNumber);
       } catch (e) {
-        say("✗ " + ((e as Error)?.message ?? e));
+        const msg = String((e as Error)?.message ?? e);
+        say("✗ " + msg);
+        // rnode's own wording. A validator refuses explore-deploy outright —
+        // only a read-only observer or --dev-mode node answers it (see the
+        // header of rholang.ts) — so on such a node `eval` can never work and
+        // the only way to run anything is a signed deploy from a funded key.
+        if (/read-only/i.test(msg)) {
+          say("  this rnode is a validator, not a read-only observer, so it refuses every `eval`.");
+          say("  use `/rholang deploy` instead — it needs a REV-funded key (`/rholang key <hex>`) and costs phlo,");
+          say("  or point `eval` at an observer / --dev-mode node with `/rholang rnode <url>`.");
+        }
       }
       return;
     }
@@ -5657,7 +5692,14 @@ function handleCommand(raw: string): string[] {
         const target = rParts.slice(1).join(" ").trim();
         const roomId = extractRoomCap(target);
         if (!roomId) { sys("usage: /room join <cap:room:…> | <share-url>"); break; }
-        if (!validateCapability(roomId)) { sys(`invalid room cap (not ZFA-balanced): ${roomId}`); break; }
+        // Warn, don't refuse: a room minted before v0.17's Pauli-closure
+        // requirement (the public room, cap:room:0521…4721, is one) fails
+        // validateCapability yet is exactly what the share link opens — the
+        // URL-hash path and connect() both only warn, and the agents
+        // "continue" past the same check. Refusing here made the documented
+        // public room unjoinable by command while its link worked, which
+        // read as "0 peers" with no explanation.
+        if (!validateCapability(roomId)) sys(`⚠ room cap is not ZFA-closed (a legacy token?) — joining anyway: ${roomId}`);
         openRoomTab(roomId);
         sys(`joined room ${shortId(roomId)} (switched to new tab)`);
       } else if (sub === "leave") {
@@ -5941,6 +5983,129 @@ function handleCommand(raw: string): string[] {
       }
       sys("  channel open is the only one that means you can talk;");
       sys("  ice 'checking' forever = candidates that never pair · 'failed' = no path (/ice test)");
+      break;
+    }
+
+    case "socket": {
+      // POSIX-style sockets over the mesh (docs/connection.md "posix-net") —
+      // a prototype. connect(peer, port) reaches another quantum-os peer
+      // directly and only: never an arbitrary external host (no browser
+      // ever can), and never through the chat flood relay (a socket is
+      // point-to-point by definition — see peer.ts's SocketChannelKind).
+      // No capability gating yet — anyone can /socket listen or connect.
+      if (!qpeer || !posixNet) { sys("not connected to a room"); break; }
+      const net = posixNet;
+      // accept()/onData/onClose fire later, possibly after the user has
+      // switched tabs — capture the room this command was typed in, the same
+      // way connect()'s QOSPeer callbacks capture `ctx`, so a background
+      // socket event lands in its own room rather than whichever is active.
+      const cmdCtx = activeRoom;
+      const sParts = arg.trim().split(/\s+/).filter(Boolean);
+      const ssub = (sParts[0] || "list").toLowerCase();
+
+      const resolvePeer = (token: string): string | null =>
+        token && peers.has(token) ? token : findPeerByName(token);
+
+      const wireSocket = (socket: QosSocket, label: string): void => {
+        socketConns.set(socket.connId, socket);
+        socket.onData = (payload) => {
+          const prev = activeRoom; setActiveRoom(cmdCtx);
+          try { addMessage("", `[${socket.connId}] ${label}: ${payload}`, "system"); }
+          finally { setActiveRoom(prev); }
+        };
+        socket.onClose = () => {
+          const prev = activeRoom; setActiveRoom(cmdCtx);
+          try { socketConns.delete(socket.connId); addMessage("", `[${socket.connId}] closed`, "system"); }
+          finally { setActiveRoom(prev); }
+        };
+      };
+
+      if (ssub === "listen") {
+        const port = Number(sParts[1]);
+        const type: SocketType = sParts[2] === "dgram" ? "dgram" : "stream";
+        if (!Number.isInteger(port) || port < 0) { sys("usage: /socket listen <port> [stream|dgram]"); break; }
+        const key = `${type}:${port}`;
+        if (socketListeners.has(key)) { sys(`already listening on ${key}`); break; }
+        const unlisten = net.listen(port, type, (socket, fromPeerId) => {
+          const prev = activeRoom; setActiveRoom(cmdCtx);
+          try {
+            addMessage("", `↳ ${peerLabel(fromPeerId)} connected on ${key}  (conn ${socket.connId})`, "system");
+            wireSocket(socket, peerLabel(fromPeerId));
+          } finally { setActiveRoom(prev); }
+        });
+        socketListeners.set(key, { port, type, unlisten });
+        sys(`✓ listening on ${key}`);
+        break;
+      }
+
+      if (ssub === "unlisten") {
+        const port = Number(sParts[1]);
+        const type: SocketType = sParts[2] === "dgram" ? "dgram" : "stream";
+        const key = `${type}:${port}`;
+        const l = socketListeners.get(key);
+        if (!l) { sys(`not listening on ${key}`); break; }
+        l.unlisten();
+        socketListeners.delete(key);
+        sys(`✓ stopped listening on ${key}`);
+        break;
+      }
+
+      if (ssub === "connect") {
+        const targetToken = sParts[1] ?? "";
+        const port = Number(sParts[2]);
+        const type: SocketType = sParts[3] === "dgram" ? "dgram" : "stream";
+        const targetId = resolvePeer(targetToken);
+        if (!targetId || !Number.isInteger(port)) { sys("usage: /socket connect <peer> <port> [stream|dgram]"); break; }
+        const label = peerLabel(targetId);
+        sys(`connecting to ${label}:${port} (${type})…`);
+        void net.connect(targetId, port, type).then((socket) => {
+          const prev = activeRoom; setActiveRoom(cmdCtx);
+          try {
+            wireSocket(socket, label);
+            addMessage("", `✓ connected to ${label}:${port} — conn ${socket.connId}`, "system");
+          } finally { setActiveRoom(prev); }
+        }).catch((e: Error) => {
+          const prev = activeRoom; setActiveRoom(cmdCtx);
+          try { addMessage("", `✗ ${label}:${port} — ${e.message}`, "system"); }
+          finally { setActiveRoom(prev); }
+        });
+        break;
+      }
+
+      if (ssub === "send") {
+        const connId = sParts[1] ?? "";
+        const text = sParts.slice(2).join(" ");
+        const socket = socketConns.get(connId);
+        if (!socket || !text) { sys("usage: /socket send <connId> <text>"); break; }
+        if (!socket.send(text)) sys("✗ send failed — channel not open");
+        break;
+      }
+
+      if (ssub === "close") {
+        const connId = sParts[1] ?? "";
+        const socket = socketConns.get(connId);
+        if (!socket) { sys(`no open socket ${connId}`); break; }
+        socket.close();
+        socketConns.delete(connId);
+        sys(`✓ closed ${connId}`);
+        break;
+      }
+
+      if (ssub === "list") {
+        sys(`listening (${socketListeners.size}):`);
+        for (const { port, type } of socketListeners.values()) sys(`  ${type}:${port}`);
+        sys(`open sockets (${socketConns.size}):`);
+        for (const s of socketConns.values()) sys(`  ${s.connId}  ${peerLabel(s.peerId)}:${s.port} (${s.type})`);
+        break;
+      }
+
+      sys(`unknown subcommand: /socket ${ssub}`);
+      sys("  /socket listen <port> [stream|dgram]        — accept inbound connections");
+      sys("  /socket unlisten <port> [stream|dgram]      — stop accepting them");
+      sys("  /socket connect <peer> <port> [stream|dgram] — open a socket to a mesh peer");
+      sys("  /socket send <connId> <text>                 — send over an open socket");
+      sys("  /socket close <connId>                       — close it");
+      sys("  /socket list                                 — listeners + open sockets");
       break;
     }
 
@@ -6524,6 +6689,10 @@ async function connect(): Promise<void> {
   if (qpeer) {
     qpeer.disconnect();
     setQpeer(null);
+    posixNet?.close();
+    setPosixNet(null);
+    socketListeners.clear();
+    socketConns.clear();
     peers.clear();
     peerNames.clear();
     renderPeers();
@@ -6558,6 +6727,11 @@ async function connect(): Promise<void> {
   const autoTurn = await fetchAutoTurn(signalingUrl);
   connectBtn.disabled = false;
 
+  // Forward-declared: the QOSPeer config below references `net` from its
+  // onSocketChannelOpen/onSocketMessage callbacks, but those only ever fire
+  // after connect() returns — by which point `net` (built just below, from
+  // `newPeer` itself) is assigned. See docs/connection.md "posix-net".
+  let net: PosixNet;
   const newPeer = new QOSPeer({
     signalingUrl,
     roomId,
@@ -7872,8 +8046,29 @@ async function connect(): Promise<void> {
       }
       finally { setActiveRoom(prev); }
     },
+    // posix-net's socket channels — see docs/connection.md "posix-net".
+    // Distinct from onChannelOpen/onMessage above: this traffic never rides
+    // the chat flood relay, so it gets its own dispatch straight into `net`.
+    onSocketChannelOpen(peerId, kind) {
+      const prev = activeRoom; setActiveRoom(ctx);
+      try { net.onTransportChannelOpen(peerId, kind); } finally { setActiveRoom(prev); }
+    },
+    onSocketMessage(peerId, kind, data) {
+      const prev = activeRoom; setActiveRoom(ctx);
+      try { net.onTransportMessage(peerId, kind, data); } finally { setActiveRoom(prev); }
+    },
+  });
+  // Built from newPeer, which now exists — see the forward-declaration note
+  // above. posix-net.ts never touches QOSPeer directly; these three methods
+  // are its entire surface (SocketTransport in posix-net.ts).
+  net = new PosixNet({
+    selfId: newPeer.peerId,
+    pinNeighbor: (peerId) => newPeer.pinNeighbor(peerId),
+    hasSocketChannel: (peerId, kind) => newPeer.hasSocketChannel(peerId, kind),
+    sendSocketFrame: (peerId, kind, data) => newPeer.sendSocketFrame(peerId, kind, data),
   });
   setQpeer(newPeer);
+  setPosixNet(net);
   newPeer.connect();
 }
 
@@ -7978,7 +8173,7 @@ function send(): void {
     if (cmd !== "help" && cmd !== "dump") {
       sessionLog.push({ who: myName || "you", cmd, arg, summary: lines[0] ?? "" });
     }
-    if (lines.length > 0 && cmd !== "help" && cmd !== "grant" && cmd !== "lemma" && cmd !== "note" && cmd !== "rdv" && cmd !== "forget" && cmd !== "remove" && cmd !== "retract" && cmd !== "rm" && cmd !== "gov" && cmd !== "dyncap" && cmd !== "probe" && cmd !== "room" && cmd !== "share" && cmd !== "channel" && cmd !== "script" && cmd !== "persist" && cmd !== "rhoqu" && cmd !== "macro" && cmd !== "macros" && cmd !== "rholang" && cmd !== "estimate" && cmd !== "facil" && cmd !== "facilitator" && cmd !== "scribe" && cmd !== "skeptic" && cmd !== "observer" && cmd !== "greeter" && cmd !== "password" && cmd !== "login" && cmd !== "name" && cmd !== "render" && cmd !== "animate" && cmd !== "record" && cmd !== "ice" && cmd !== "conn" && cmd !== "search" && cmd !== "solve" && cmd !== "reset") {
+    if (lines.length > 0 && cmd !== "help" && cmd !== "grant" && cmd !== "lemma" && cmd !== "note" && cmd !== "rdv" && cmd !== "forget" && cmd !== "remove" && cmd !== "retract" && cmd !== "rm" && cmd !== "gov" && cmd !== "dyncap" && cmd !== "probe" && cmd !== "room" && cmd !== "share" && cmd !== "channel" && cmd !== "script" && cmd !== "persist" && cmd !== "rhoqu" && cmd !== "macro" && cmd !== "macros" && cmd !== "rholang" && cmd !== "estimate" && cmd !== "facil" && cmd !== "facilitator" && cmd !== "scribe" && cmd !== "skeptic" && cmd !== "observer" && cmd !== "greeter" && cmd !== "password" && cmd !== "login" && cmd !== "name" && cmd !== "render" && cmd !== "animate" && cmd !== "record" && cmd !== "ice" && cmd !== "conn" && cmd !== "socket" && cmd !== "search" && cmd !== "solve" && cmd !== "reset") {
       qpeer.broadcast({ kind: "qlf", cmd, arg, lines });
     }
     return;

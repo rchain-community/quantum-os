@@ -78,7 +78,7 @@ const CASES = [
   { call: "delegate bob",             needsDeploy: true },
   { call: "group colab",              needsDeploy: true },
   { call: "multisig n1 proposal 2",   needsDeploy: true },
-  { call: "transfer 10 1111okLpqMQuvZ6u2P9fk6gez96U1De3x7bh1htdZ186MxbEALAnK", needsDeploy: true },
+  { call: "transfer 10 1111bn92xHbttqWHEXqD8PiykFxgeUjizzquT6JRePj2pAoHFAuiK", needsDeploy: true },
 
   // Takes capabilities, which have to exist to be resolved.
   { call: "swap rho:id:a rho:id:b rho:id:c rho:id:d", needsCaps: true },

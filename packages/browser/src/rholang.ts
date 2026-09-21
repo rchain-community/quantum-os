@@ -48,7 +48,10 @@ export interface NodeConfig {
 const CONFIG_KEY = "qos-rnode-config";
 
 export const DEFAULT_CONFIG: NodeConfig = {
-  url: "http://127.0.0.1:40403",
+  // A public node, so /rholang works out of the box from the https deployment
+  // (no mixed-content block, no local rnode to run). `/rholang rnode <url>`
+  // still points at your own — e.g. http://127.0.0.1:40403 for a localnet.
+  url: "https://rnodeapi.rhobot.net",
   shard: "root",
   phloLimit: 500_000,
   phloPrice: 1,

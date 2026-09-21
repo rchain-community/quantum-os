@@ -123,6 +123,12 @@ jobs:
       - name: Peer transport test
         run: node packages/browser/test/peer.test.mjs
 
+      # The posix-net socket macro layer (connect/listen/accept/send/close),
+      # against a fake two-peer mesh — no WebRTC or QOSPeer involved, since
+      # posix-net.ts only ever talks to the injected SocketTransport interface.
+      - name: POSIX-net socket test
+        run: node packages/browser/test/posix-net.test.mjs
+
       # The local /search + /solve enumerator (#119) — possibilities/events
       # shapes, the listener rollups, the /solve cascade, and a conformance
       # block of digests captured from quantum-logical-framework's
