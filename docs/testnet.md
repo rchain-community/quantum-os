@@ -25,7 +25,7 @@ chain that produces a block only when a deploy arrives.
 | Validators | node A (`d3cc3442…`, stake **1000**) + node B (`ec923454…`, stake 100) |
 | Hosts | A `164.90.140.144` (private `10.108.0.3`), B `104.131.176.164` (private `10.108.0.4`) |
 | Cost | 2 × DigitalOcean `s-1vcpu-1gb`, **$12/mo** |
-| Binary | rchain-rust `dev` + the deploy-anchor fix, static musl `d7f5000b…`, on all three hosts |
+| Binary | rchain-rust `dev` (deploy-anchor fix merged as #58), static musl `d7f5000b…`, on all three hosts |
 | Endpoint | **https://testnet.rhobot.net** (nginx → node A's HTTP API) |
 
 A's stake is 1000 against B's 100 on purpose: with no `--autopropose`, A is the only proposer, so A
@@ -112,23 +112,21 @@ was verified twice with node B. DigitalOcean's dashboard also graphs CPU/RAM/dis
 
 ## Upstream references
 
-The node-level knowledge in this document now also lives in `rchain-rust`, where node contributors will
-find it — see [PR #61](https://github.com/rchain-community/rchain-rust/pull/61):
+The node-level knowledge in this document also lives in `rchain-rust` `dev`, where node contributors will
+find it. Where the two overlap, prefer the upstream text: this document is the runbook for **this** net —
+our hosts, keys, genesis, health checks and the incident record (K1–K7).
 
-| upstream | what moved there |
+| upstream | what lives there |
 |---|---|
-| `docs/src/node/running-a-public-testnet.md` (new) | the generalised procedure: stake split, genesis ceremony, joining, admitting a validator to a running chain, monitoring, sizing, rebuilds |
-| `docs/src/node/operating.md` | `--shard-id`, the deploy-anchor rule, reading a term's return value, the three block production modes, finality/withdraw behaviour |
-| `docs/src/node/validator-requirements.md` | host sizing, including the start-up replay floor (K7) |
+| [`docs/src/node/running-a-public-testnet.md`](https://github.com/rchain-community/rchain-rust/blob/dev/docs/src/node/running-a-public-testnet.md) | the generalised procedure: stake split, genesis ceremony, joining, admitting a validator to a running chain, monitoring, sizing, rebuilds |
+| [`docs/src/node/operating.md`](https://github.com/rchain-community/rchain-rust/blob/dev/docs/src/node/operating.md#deploying-and-block-production) | `--shard-id`, the deploy-anchor rule, reading a term's return value, the three block production modes, finality/withdraw behaviour |
+| [`docs/src/node/validator-requirements.md`](https://github.com/rchain-community/rchain-rust/blob/dev/docs/src/node/validator-requirements.md) | host sizing, including the start-up replay floor (K7) |
+| [#60](https://github.com/rchain-community/rchain-rust/issues/60) | the start-up replay issue: measurements, a reproduction, and what is still unattributed |
+| [#39](https://github.com/rchain-community/rchain-rust/issues/39) | the validator lifecycle; this net's verified transcript is posted there |
 
-This document stays what it is: the runbook for **this** net — our hosts, keys, genesis, health checks and
-the incident record (K1–K7). Where the two overlap, prefer the upstream text; the sections below note
-where the general explanation lives.
-
-Related upstream work: [#58](https://github.com/rchain-community/rchain-rust/pull/58) (the deploy-anchor
-fix), [#60](https://github.com/rchain-community/rchain-rust/issues/60) (start-up replay), and
-[#39](https://github.com/rchain-community/rchain-rust/issues/39) (the validator lifecycle, where this
-net's verified transcript is posted).
+The deploy-anchor fix (K1) reached `dev` as
+[#58](https://github.com/rchain-community/rchain-rust/pull/58), and the three docs above came in as
+[#61](https://github.com/rchain-community/rchain-rust/pull/61).
 
 ## Topology
 
@@ -156,8 +154,8 @@ private addresses (`10.108.0.0/20`).
    replayed the same DAG and died again, and the API never came up (K7 — the "unresponsive API" symptom,
    which is *not* the injector). Omitting `--autopropose` and `--deployer-private-key` makes blocks arrive
    only when deploys do, keeping restart cost proportional to real usage. Generalised sizing guidance is
-   upstream in `docs/src/node/validator-requirements.md`
-   ([PR #61](https://github.com/rchain-community/rchain-rust/pull/61)).
+   upstream in
+   [`docs/src/node/validator-requirements.md`](https://github.com/rchain-community/rchain-rust/blob/dev/docs/src/node/validator-requirements.md).
 
 ## Genesis
 
@@ -210,8 +208,8 @@ rnode --profile docker run -s --dev-mode --propose-on-deploy --no-upnp --host <i
 There is **no `--no-autopropose` flag** — you omit `--autopropose`. (`tools/devnet.sh` accepts
 `--no-autopropose` because that is *its* CLI; it only omits the node flag.) Passing it makes the
 node exit 1 in a restart loop. The production-mode matrix and the finality consequences of an idle chain
-are upstream in `docs/src/node/operating.md`
-([PR #61](https://github.com/rchain-community/rchain-rust/pull/61)).
+are upstream in
+[`docs/src/node/operating.md`](https://github.com/rchain-community/rchain-rust/blob/dev/docs/src/node/operating.md#block-production-modes).
 
 ## Adding a node (observer)
 
@@ -241,9 +239,9 @@ A join takes about 15 seconds and ~19 MB, measured.
 ## Onboarding an observer into the validator pool
 
 The generalised procedure — the admission routes, the funding prerequisites and a verified transcript — is
-upstream in `docs/src/node/running-a-public-testnet.md`
-([PR #61](https://github.com/rchain-community/rchain-rust/pull/61)). What follows is this net's version,
-with the keys and addresses actually in play here.
+upstream in
+[`docs/src/node/running-a-public-testnet.md`](https://github.com/rchain-community/rchain-rust/blob/dev/docs/src/node/running-a-public-testnet.md).
+What follows is this net's version, with the keys and addresses actually in play here.
 
 The implementation models the full lifecycle natively (`rholang/src/native_state.rs`):
 
@@ -281,20 +279,16 @@ means a **new genesis and a new chain**.
 2. the newcomer deploys         pos!("bond",  *deployerId, <stake>, *ret)      # 1..100 here
 ```
 
-Two funding prerequisites, both easy to miss, and both now **verified working**:
+Two funding prerequisites, both easy to miss and both **verified working here** (the general form, with
+the reasoning, is upstream):
 
-- the **trusting key must hold REV**, because it pays for the `trust` deploy's phlo from its own vault.
-  A genesis-trusted key that is *not* in `wallets.txt` cannot deploy at all — that is why the trusted
-  set is seeded with a funded key (dave) rather than with the bonded validator keys (K6);
+- the **trusting key must hold REV**, because it pays for the `trust` deploy's phlo from its own vault. A
+  genesis-trusted key that is not in `wallets.txt` cannot deploy at all — which is why **dave** is the
+  trusted key on this net (see K6);
 - the **newcomer must hold REV ≥ stake**, because the bond is deducted from its vault.
 
-A plain transfer funds both:
-`revVault!("transfer", *deployerId, "<its REV address>", <amount>, *ret)` — the reply is `Nil` on
-success and an error string on failure. Verified: a fresh key read `0`, then `100000000000` after a
-1e11 transfer, and it could then deploy. Read a balance with
-`revVault!("getBalance", "<address>", *ret)` — the method is `getBalance`, **not** `balance`. Derive a
-key's vault address with
-`node -e "import('./keys.mjs').then(m=>console.log(m.revAddressOf('<priv>')))"`.
+Funding either one is an ordinary transfer, and a vault balance is readable with `getBalance` — **not**
+`balance`. The terms this net uses are below.
 
 ### The exact terms
 
@@ -402,9 +396,10 @@ throughout.
 The fix (`fix/deploy-expiry-negative`, commit `756f1727d`) makes a negative anchor mean "not
 specified" and resolves it from the node's own status, which already carries `latest_block_number` —
 the same thing the faucet, the browser client, `gateway::current_height` and
-`txn_coordinator::run_phase_at` do. All three nodes now run a binary that includes it
-(`d7f5000b…`, which also carries the upstream registry-lookup fix), so `rnode deploy` works with no
-extra flags. Rollbacks are kept in place as `/usr/local/bin/rnode.old-<sha>`.
+`txn_coordinator::run_phase_at` do. The fix is merged to `dev` as
+[#58](https://github.com/rchain-community/rchain-rust/pull/58), and all three nodes run a binary that
+includes it (`d7f5000b…`, which also carries the upstream registry-lookup fix), so `rnode deploy` works
+with no extra flags. Rollbacks are kept in place as `/usr/local/bin/rnode.old-<sha>`.
 **A binary built before that commit still needs `--valid-after-block-number <height>`.**
 
 **K2 — an earlier diagnosis in this document was wrong; corrected.** It blamed the dummy-deploy
