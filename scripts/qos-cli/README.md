@@ -451,6 +451,41 @@ client-side) — never pass `--key` for anything holding real value. Fund the
 facilitator's own address (logged at startup) via `scripts/localnet`'s genesis
 wallet or a transfer from an already-funded key.
 
+**The faucet over HTTP (`--faucet-http <port>`, needs `--key`).** The room
+command is a chat message over the mesh — fine for a person in the room,
+useless to a wallet (r-wallet on the playground/testnet) that only speaks
+HTTP. `faucet-http.mjs` gives the same faucet an HTTP face, calling the same
+`faucetSend` (one function moves REV, whichever door it comes through):
+
+```
+POST /faucet   {"address": "1111…"}      → 200 {"ok":true,"amount":"10","address":…}
+GET  /faucet?address=1111…               (the same)
+GET  /health                             → the terms: amount, funding address, limits
+```
+
+CORS is open (a wallet is a web page). What the room command deliberately
+lacks, this one must have: the room is reachable only by whoever holds its
+cap, a port by anyone on the internet, and an unlimited faucet on a public
+port is a drained faucet. So: **one grant per address per day, five per
+client per hour** (`429` with `retryAfterMs`); a failed deploy is `502` and
+still spends the address's grant, so a failing chain cannot be hammered.
+The client is the first `X-Forwarded-For` hop when present — the port is
+meant to sit behind a TLS proxy (`https://<host>/faucet`), and it trusts that
+proxy. Limits live in memory; a restart forgets them, which on a test system
+is the right failure. `run-agents.sh` passes it through as
+`FAUCET_HTTP=<port>`. `faucet-http.selftest.mjs` covers every path against a
+stub `send` — no chain, no key.
+
+**Which chain (`--rnode <url>`, `FACIL_RNODE=` in `run-agents.sh`).** The
+same key holds REV separately on every chain its address was funded on, so a
+faucet is always a faucet *for one chain*: the one it deploys to. Default is
+`rholang-client.mjs`'s (the rhobot.net dev instance); the playground and
+testnet are two chains, so they are two facilitators with two `--rnode`
+values, and `/health` reports which (`rnode`) so a wallet can tell them
+apart. On the node's own host `--rnode http://127.0.0.1:40403` skips the
+proxy. The shard needs no flag — the deploy path asks the node its `shardId`
+first (`/root` on rhobot.net) and signs for that.
+
 **Chaired deliberation (`/facil chair <topic>`, needs `--ai`).** The facilitator
 becomes the room's **single neutral chair** and walks the group through six phases —
 **define → alternatives → evaluate → disagreements → agreements → closure** — posting

@@ -36,6 +36,7 @@ import { ROLES, DEFAULT_ROLE, resolveRole, dutiesOf } from "./agent-roles.mjs";
 import { trustLevels, discreditedMembers, isMember, groupHasRatings, normalizeGroup, TRUST_MAX } from "./gov.mjs";
 import { MACROS } from "./rholang-macros.mjs";
 import { DEFAULT_CONFIG as REV_DEFAULT_CONFIG, revAddressOf, deployTerm as revDeployTerm } from "./rholang-client.mjs";
+import { createFaucetServer } from "./faucet-http.mjs";
 
 const DEFAULT_SIGNAL = "wss://quantum-os-signaling.onrender.com";
 // "name" is always signed. When this agent carries the room's memory
@@ -84,6 +85,21 @@ Options:
                      request. This agent then HOLDS A SIGNING KEY IN MEMORY —
                      a deliberate exception to "an agent never holds a key"
                      (see rholang-agent.mjs). Never use a key with real value.
+  --faucet-http <port>
+                     Also serve the faucet over HTTP (needs --key):
+                     POST /faucet {"address"} or GET /faucet?address=… →
+                     the same transfer. For a wallet that cannot join the
+                     room. Rate-limited — one grant per address per day,
+                     5 per client per hour — because unlike the room command
+                     a port is reachable by anyone. Behind a TLS proxy
+                     (X-Forwarded-For is honoured); a wallet calls
+                     https://<host>/faucet.
+  --rnode <url>      The rnode the faucet deploys to (default: rholang-
+                     client.mjs's — the rhobot.net dev instance). The same
+                     key holds REV separately on every chain, so a faucet
+                     for the playground and one for testnet are two
+                     facilitators with two --rnode values. On the node's
+                     own host, http://127.0.0.1:40403 skips the proxy.
   --verbose          Log every inbound message + suppressed nudges.
   --help, -h         Show this help.
 
@@ -114,6 +130,8 @@ export function parseArgs(argv) {
     else if (x === "--about") a.about = argv[++i];
     else if (x === "--turn") a.turn = true;
     else if (x === "--key") a.key = argv[++i];
+    else if (x === "--faucet-http") a.faucetHttp = Number(argv[++i]);
+    else if (x === "--rnode") a.rnode = argv[++i];
     else if (x === "--verbose") a.verbose = true;
     else if (x === "--help" || x === "-h") a.help = true;
   }
@@ -210,7 +228,24 @@ export async function run(args) {
     facilKey = k;
     console.log(`${TAG} TEST REV FAUCET ACTIVE — funding address ${facilAddr}. Fund it via scripts/localnet's genesis wallet, or a transfer; never point --key at a key holding real value.`);
   }
-  const revCfg = () => ({ ...REV_DEFAULT_CONFIG, key: facilKey });
+  const rnodeUrl = (args.rnode ?? REV_DEFAULT_CONFIG.url).replace(/\/+$/, "");
+  if (args.rnode !== undefined && !/^https?:\/\//.test(rnodeUrl)) { console.error(`${TAG} --rnode needs an http(s) URL, got ${args.rnode}`); process.exit(1); }
+  if (facilKey) console.log(`${TAG} faucet deploys to ${rnodeUrl} — the key's REV on THAT chain is what it hands out`);
+  const revCfg = () => ({ ...REV_DEFAULT_CONFIG, url: rnodeUrl, key: facilKey });
+  // ONE function moves REV, for the room command and the HTTP endpoint alike.
+  // A deterministic action — never the advisor's call (see handleFaucet).
+  async function faucetSend(addr) {
+    const term = MACROS.transfer.expand({ amount: FAUCET_AMOUNT, to: addr });
+    const out = await revDeployTerm(revCfg(), term);
+    if (!out.ok) return { ok: false, message: String(out.message ?? "") };
+    const v = String(out.value ?? "");
+    if (/transfer ok/i.test(v)) return { ok: true, confirmed: true, message: v };
+    return { ok: true, confirmed: false, message: v };
+  }
+  if (args.faucetHttp !== undefined) {
+    if (!Number.isInteger(args.faucetHttp) || args.faucetHttp <= 0) { console.error(`${TAG} --faucet-http needs a port number`); process.exit(1); }
+    if (!facilKey) { console.error(`${TAG} --faucet-http needs --key — there is no faucet to serve without one`); process.exit(1); }
+  }
 
   const advisor = makeAdvisor({ ai: args.ai, backend: args.aiBackend, model: args.aiModel, persona: role.persona, roleName: role.name, cmd: CMD, faucetActive: !!facilKey, log: console.log });
 
@@ -463,12 +498,10 @@ export async function run(args) {
     }
     directReply(fromId, `Sending ${FAUCET_AMOUNT} test REV to ${addr}… (may take a few seconds to confirm)`);
     try {
-      const term = MACROS.transfer.expand({ amount: FAUCET_AMOUNT, to: addr });
-      const out = await revDeployTerm(revCfg(), term);
-      if (!out.ok) { directReply(fromId, `Deploy failed: ${String(out.message).slice(0, 300)}`); return; }
-      const v = String(out.value ?? "");
-      if (/transfer ok/i.test(v)) directReply(fromId, `✅ Sent ${FAUCET_AMOUNT} test REV to ${addr}.`);
-      else if (v) directReply(fromId, `⚠️ Deploy landed but the transfer didn't confirm: ${v.slice(0, 300)}`);
+      const out = await faucetSend(addr);
+      if (!out.ok) { directReply(fromId, `Deploy failed: ${out.message.slice(0, 300)}`); return; }
+      if (out.confirmed) directReply(fromId, `✅ Sent ${FAUCET_AMOUNT} test REV to ${addr}.`);
+      else if (out.message) directReply(fromId, `⚠️ Deploy landed but the transfer didn't confirm: ${out.message.slice(0, 300)}`);
       else directReply(fromId, `Deploy accepted, but I couldn't confirm the transfer within the wait window — check your balance (\`/rholang eval\`, \`$balance(me)\`) in a bit.`);
     } catch (e) { directReply(fromId, `Faucet error: ${e?.message ?? e}`); }
   }
@@ -1079,7 +1112,13 @@ export async function run(args) {
   peer.connect();
   console.log(`${TAG} running as "${myName}" [role=${role.name}]  budget=${MAX_POSTS}/5min  min-gap=${Math.round(MIN_GAP_MS / 1000)}s  silent=${Math.round(SILENT_MS / 60000)}min  AI=${advisor.enabled ? advisor.model : "off"}. Ctrl-C to stop.`);
 
-  const shutdown = () => { console.log(`\n${TAG} shutting down…`); try { if (games?.current) games.stop(); } catch {} try { clearInterval(timer); saveIdentity(); saveKnown(); mem?.flush(); } catch {} try { peer.disconnect(); } catch {} setTimeout(() => process.exit(0), 200); };
+  let faucetHttp = null;
+  if (args.faucetHttp !== undefined) {
+    faucetHttp = createFaucetServer({ send: faucetSend, amount: FAUCET_AMOUNT, fundingAddress: facilAddr, rnode: rnodeUrl, log: (m) => console.log(`${TAG} ${m}`) }).server;
+    faucetHttp.listen(args.faucetHttp, () => console.log(`${TAG} faucet HTTP on :${args.faucetHttp} — POST /faucet {"address"} · GET /health`));
+    faucetHttp.on("error", (e) => { console.error(`${TAG} faucet HTTP failed: ${e?.message ?? e}`); process.exit(1); });
+  }
+  const shutdown = () => { console.log(`\n${TAG} shutting down…`); try { faucetHttp?.close(); } catch {} try { if (games?.current) games.stop(); } catch {} try { clearInterval(timer); saveIdentity(); saveKnown(); mem?.flush(); } catch {} try { peer.disconnect(); } catch {} setTimeout(() => process.exit(0), 200); };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 }
