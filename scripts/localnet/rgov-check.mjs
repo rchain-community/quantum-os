@@ -281,10 +281,101 @@ async function tier2() {
   mkdirSync(CACHE, { recursive: true });
   writeFileSync(out, JSON.stringify({ node: NODE, at: new Date().toISOString(), uris }, null, 2));
   console.log(`\n${ok} installed, ${bad} failed — uris written to ${out}`);
-  if (ok) {
-    console.log("\nnext: the master contract directory, then the ~25 needs-bootstrap actions against these uris.");
+  if (!uris.Directory) {
+    console.log("\nno Directory class — the master directory needs it, stopping here.");
+    process.exit(1);
   }
-  process.exit(bad === 0 ? 0 : 1);
+
+  // --- 2b: the master contract directory ---------------------------------
+  //
+  // A port of bootstrap/master-contract-directory, which is a bash script that
+  // greps the deploy log for `["#define $Name", uri]` lines and generates this
+  // program. We already hold those uris, so we generate it directly.
+  //
+  // Faithful except for one thing: the original ends with a join
+  // `for (final_X <- ret_X; … ; last <- lastUri)` whose `lastUri` is declared
+  // and never written, so that join can never fire and its "Finished with…"
+  // lines can never print. Reproducing dead code would only add noise, so it
+  // is left out — and recorded here as a finding about the original.
+  console.log("\n— master contract directory —");
+  const names = Object.keys(uris);
+  const entries = names.map((n) => `
+         | lookup!(URI_${n}, *lookCh_${n})
+         | for (C_${n} <- lookCh_${n}) {
+            stdout!(["writing class to dictionary: ${n}", URI_${n}, *C_${n}])
+            | @write!("${n}", *C_${n}, *ret_${n})
+         }`).join("");
+  const directoryProgram = `match [${names.map((n) => "`" + uris[n] + "`").join(", ")}] {[${names.map((n) => "URI_" + n).join(", ")}] => {
+new
+   lookup(\`rho:registry:lookup\`)
+   ,deployerId(\`rho:rchain:deployerId\`)
+   ,deployId(\`rho:rchain:deployId\`)
+   ,stdout(\`rho:io:stdout\`)
+   ,insertArbitrary(\`rho:registry:insertArbitrary\`)
+   ,lookCh ,insertCh ,caps
+${names.map((n) => `   ,lookCh_${n} ,ret_${n}`).join("\n")}
+in {
+   lookup!(URI_Directory, *lookCh)
+   | for (Dir <- lookCh) {
+      Dir!(*caps)
+      | for (@{"read": read, "write": write, "grant": grant} <- caps) {
+         @[*deployerId, "MasterContractAdmin"]!({"read": read, "write": write, "grant": grant})
+         | insertArbitrary!(read, *insertCh)
+         | for (URI <- insertCh) {
+            stdout!({ "ReadcapURI": *URI})
+            | deployId!({ "ReadcapURI": *URI })
+         }${entries}
+      }
+   }
+}
+}}`;
+  if (VERBOSE) console.log(directoryProgram);
+
+  const dirDep = await deployTerm(cfg, directoryProgram, { waitAttempts: 0 }).catch((e) => ({ ok: false, message: String(e?.message ?? e) }));
+  if (!dirDep.ok) { console.log(`${status.fail}directory        ${String(dirDep.message).slice(0, 200)}`); process.exit(1); }
+  const dirRes = await deployResult(dirDep.sig);
+  if (!dirRes.ok) { console.log(`${status.fail}directory        ${dirRes.error}`); process.exit(1); }
+  const readcap = JSON.stringify(dirRes.result).match(/rho:id:[a-z0-9]+/)?.[0];
+  if (!readcap) {
+    console.log(`${status.fail}directory        deployed, but no ReadcapURI came back  ${JSON.stringify(dirRes.result).slice(0, 160)}`);
+    process.exit(1);
+  }
+  console.log(`${status.ok}directory        ReadcapURI ${readcap}`);
+  writeFileSync(join(CACHE, "directory.json"), JSON.stringify({ node: NODE, at: new Date().toISOString(), readcap, uris }, null, 2));
+
+  // --- 2c/2d: claim an identity, then run the client actions --------------
+  //
+  // Every action is run as a signed deploy, as one identity, with the default
+  // arguments its own `match [...]` header carries and `$masterURI` replaced by
+  // the ReadcapURI just published. newInbox goes first because it is what
+  // populates `@[*deployerId, lockerTag]`, which the rest read.
+  console.log("\n— governance actions (signed, as " + KEY_NAME + ") —");
+  const ordered = [["newInbox", "src/actions/newinbox.rho"],
+    ...ACTIONS.filter(([n]) => n !== "newInbox" && !/orphan|createInboxandCastVote/.test(n))];
+  let aOk = 0, aBad = 0;
+  for (const [name, path] of ordered) {
+    if (ONLY && !name.toLowerCase().includes(ONLY.toLowerCase())) continue;
+    const label = name.padEnd(20);
+    const src = await source(path);
+    if (src === null) { console.log(`${status.miss}${label}${path}`); continue; }
+    const program = applyRawRgov(src.replace(/\$masterURI/g, readcap));
+    const dep = await deployTerm(cfg, program, { waitAttempts: 0 }).catch((e) => ({ ok: false, message: String(e?.message ?? e) }));
+    if (!dep.ok) { console.log(`${status.fail}${label}${String(dep.message).slice(0, 140)}`); aBad++; continue; }
+    const r = await deployResult(dep.sig);
+    if (!r.ok) { console.log(`${status.fail}${label}${r.error.slice(0, 140)}`); aBad++; continue; }
+    const blob = JSON.stringify(r.result);
+    if (r.result.length === 0) {
+      // Landed and said nothing. For these actions that means it blocked —
+      // a `for` that never received — rather than that it did its job.
+      console.log(`${status.fail}${label}no answer (blocked before its deployId!)`);
+      aBad++;
+    } else {
+      console.log(`${status.ok}${label}${blob.slice(0, 110)}`);
+      aOk++;
+    }
+  }
+  console.log(`\nclasses: ${ok} installed, ${bad} failed · actions: ${aOk} answered, ${aBad} did not`);
+  process.exit(bad === 0 && aBad === 0 ? 0 : 1);
 }
 
 if (TIER === 2) await tier2();

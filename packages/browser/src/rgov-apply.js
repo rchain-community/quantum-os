@@ -78,18 +78,50 @@ export function apply(body, fields, args) {
   return `match [${prepared.join(", ")}] {\n` + code + "\n}";
 }
 
+/** Braces that actually structure the program — not ones inside a string, a
+ *  line comment or a block comment. Counting raw `{` would miscount any file
+ *  containing `"{"` or a braced example in a comment. */
+function structuralBraces(src) {
+  let open = 0, close = 0;
+  let inLine = false, inBlock = false, inStr = false, esc = false;
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i], next = src[i + 1];
+    if (inLine) { if (c === "\n") inLine = false; continue; }
+    if (inBlock) { if (c === "*" && next === "/") { inBlock = false; i++; } continue; }
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === "/" && next === "/") { inLine = true; i++; continue; }
+    if (c === "/" && next === "*") { inBlock = true; i++; continue; }
+    if (c === '"') { inStr = true; continue; }
+    if (c === "{") open++;
+    else if (c === "}") close++;
+  }
+  return { open, close };
+}
+
 /**
  * An rgov `.rho` file as it sits in the repo → a complete program.
  *
- * Those files already carry their own `match [defaults] {` header with example
- * arguments baked in, and are missing the closing brace. So for a first-pass
- * audit — "does this still parse and run at all" — the whole substitution is
- * just supplying the brace. Argument substitution over these files means
- * rewriting their header, which is `apply` above once a template has been
- * converted to the r-wallet shape.
+ * These files carry their own `match [defaults] {` header with example
+ * arguments baked in. SOME are missing the closing brace, because rgov's
+ * harness appends it — and some are not: `getRoll.rho` ends `}} // end of
+ * match` and is already complete. So this BALANCES rather than assuming.
+ * Appending a brace unconditionally silently corrupts every already-complete
+ * file, which is a way to make a healthy script look broken (it did, until
+ * this was fixed).
+ *
+ * Argument substitution over these files means rewriting their header, which
+ * is `apply` above, once a template has been converted to the r-wallet shape.
  */
 export function applyRawRgov(source) {
-  return String(source).replace(/\s*$/, "") + "\n}\n";
+  const body = String(source).replace(/\s*$/, "");
+  const { open, close } = structuralBraces(body);
+  const missing = Math.max(0, open - close);
+  return body + (missing ? "\n" + "}".repeat(missing) : "") + "\n";
 }
 
 /** Do a template's pattern variables line up with its declared fields?
@@ -102,6 +134,12 @@ export function patternArity(body) {
 }
 
 // ---------------------------------------------------------------------------
+
+/** open-minus-close, for the selftest. */
+function structuralBracesProbe(src) {
+  const { open, close } = structuralBraces(src);
+  return open - close;
+}
 
 export function selftest() {
   let pass = 0, total = 0;
@@ -142,11 +180,23 @@ export function selftest() {
   ok("a missing number arg yields an empty slot (r-wallet parity)", missing.startsWith('match ["x", ] {'), missing);
 
   // Raw rgov files: header present, closing brace missing.
-  const raw = 'match [3] {\n  [height] => {\n    Nil\n  }\n';
-  const closed = applyRawRgov(raw);
   const braces = (s, c) => s.split(c).length - 1;
-  ok("applyRawRgov balances an rgov file's braces",
+  const shortOne = 'match [3] {\n  [height] => {\n    Nil\n  }\n';
+  const closed = applyRawRgov(shortOne);
+  ok("a brace-short rgov file gets the missing brace",
     braces(closed, "{") === braces(closed, "}"), `{=${braces(closed, "{")} }=${braces(closed, "}")}`);
+  // getRoll.rho's real shape: already complete. Appending regardless is what
+  // made a working script look like a parse failure.
+  const complete = 'match [] {\n[] => {\n  Nil\n}\n}} // end of match\n';
+  ok("an already-complete rgov file is left alone",
+    braces(applyRawRgov(complete), "}") === braces(complete, "}"), applyRawRgov(complete));
+  // Both snippets are balanced, so open-minus-close is 0. That is the
+  // discriminating value: if string or comment braces leaked into the count
+  // these would read 3 and -3.
+  ok("a brace inside a string is not counted",
+    structuralBracesProbe('match [] {\n  stdout!("{{{") \n}') === 0);
+  ok("a brace inside a comment is not counted",
+    structuralBracesProbe('match [] { // }}}\n}') === 0);
 
   // Pattern/field parity.
   ok("patternArity counts two binders", patternArity("[a, b] => { Nil }") === 2);
