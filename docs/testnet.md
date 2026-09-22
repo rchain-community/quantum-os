@@ -110,6 +110,26 @@ was verified twice with node B. DigitalOcean's dashboard also graphs CPU/RAM/dis
 
 # Part 2 — For maintainers
 
+## Upstream references
+
+The node-level knowledge in this document now also lives in `rchain-rust`, where node contributors will
+find it — see [PR #61](https://github.com/rchain-community/rchain-rust/pull/61):
+
+| upstream | what moved there |
+|---|---|
+| `docs/src/node/running-a-public-testnet.md` (new) | the generalised procedure: stake split, genesis ceremony, joining, admitting a validator to a running chain, monitoring, sizing, rebuilds |
+| `docs/src/node/operating.md` | `--shard-id`, the deploy-anchor rule, reading a term's return value, the three block production modes, finality/withdraw behaviour |
+| `docs/src/node/validator-requirements.md` | host sizing, including the start-up replay floor (K7) |
+
+This document stays what it is: the runbook for **this** net — our hosts, keys, genesis, health checks and
+the incident record (K1–K7). Where the two overlap, prefer the upstream text; the sections below note
+where the general explanation lives.
+
+Related upstream work: [#58](https://github.com/rchain-community/rchain-rust/pull/58) (the deploy-anchor
+fix), [#60](https://github.com/rchain-community/rchain-rust/issues/60) (start-up replay), and
+[#39](https://github.com/rchain-community/rchain-rust/issues/39) (the validator lifecycle, where this
+net's verified transcript is posted).
+
 ## Topology
 
 ```
@@ -130,11 +150,14 @@ private addresses (`10.108.0.0/20`).
    dead. `withdraw` is not an immediate escape either: the stake is escrowed until the quarantine
    deadline, so it goes on diluting the pool. 1000 tolerates about four joiners at stake 100.
 2. **The previous chain outgrew the host.** It ran `--autopropose` plus an injected dummy deploy,
-   about one block every 2.5 s. Start-up replay retains roughly **1 MB per block**, so by ~1140
-   blocks every restart needed 700+ MB on a 957 MB host: the kernel OOM-killed rnode, the next start
-   replayed the same DAG and died again, and the API never came up (K7 — the "unresponsive API"
-   symptom, which is *not* the injector). Omitting `--autopropose` and `--deployer-private-key`
-   makes blocks arrive only when deploys do, keeping restart cost proportional to real usage.
+   about one block every 2.5 s. Start-up replay costs roughly **0.25 MB and ~0.2 s per existing block**
+   before the API opens at all, so by ~1140 blocks every restart needed ~285 MB plus minutes of silence,
+   on a 957 MB host that was also running nginx and do-agent: the kernel OOM-killed rnode, the next start
+   replayed the same DAG and died again, and the API never came up (K7 — the "unresponsive API" symptom,
+   which is *not* the injector). Omitting `--autopropose` and `--deployer-private-key` makes blocks arrive
+   only when deploys do, keeping restart cost proportional to real usage. Generalised sizing guidance is
+   upstream in `docs/src/node/validator-requirements.md`
+   ([PR #61](https://github.com/rchain-community/rchain-rust/pull/61)).
 
 ## Genesis
 
@@ -186,7 +209,9 @@ rnode --profile docker run -s --dev-mode --propose-on-deploy --no-upnp --host <i
 
 There is **no `--no-autopropose` flag** — you omit `--autopropose`. (`tools/devnet.sh` accepts
 `--no-autopropose` because that is *its* CLI; it only omits the node flag.) Passing it makes the
-node exit 1 in a restart loop.
+node exit 1 in a restart loop. The production-mode matrix and the finality consequences of an idle chain
+are upstream in `docs/src/node/operating.md`
+([PR #61](https://github.com/rchain-community/rchain-rust/pull/61)).
 
 ## Adding a node (observer)
 
@@ -214,6 +239,11 @@ INFO [casper.engine.NodeLaunch] Making a transition to Running state.
 A join takes about 15 seconds and ~19 MB, measured.
 
 ## Onboarding an observer into the validator pool
+
+The generalised procedure — the admission routes, the funding prerequisites and a verified transcript — is
+upstream in `docs/src/node/running-a-public-testnet.md`
+([PR #61](https://github.com/rchain-community/rchain-rust/pull/61)). What follows is this net's version,
+with the keys and addresses actually in play here.
 
 The implementation models the full lifecycle natively (`rholang/src/native_state.rs`):
 
