@@ -21,11 +21,11 @@ chain that produces a block only when a deploy arrives.
 
 | | |
 |---|---|
-| Chain | `testnet` network id, shard `/root`, genesis `26bf2328…19a9` |
-| Validators | node A (`d3cc3442…`, stake **1000**) + node B (`ec923454…`, stake 100) |
+| Chain | `testnet` network id, shard `/root`, genesis `aab081c7…b044` |
+| Validators | node A (`cf360190…`, stake **1000**) + node B (`a1ca9c6e…`, stake 100), plus one admitted live (`alice`, 100 — the K6 proof) |
 | Hosts | A `164.90.140.144` (private `10.108.0.3`), B `104.131.176.164` (private `10.108.0.4`) |
 | Cost | 2 × DigitalOcean `s-1vcpu-1gb`, **$12/mo** |
-| Binary | rchain-rust `dev` + the deploy-anchor fix, static musl `d7f5000b…`, on all three hosts |
+| Binary | rchain-rust `dev` @ `f6477eba3` (deploy-anchor #58 + `if`-in-a-`Par` C21), static musl `d5d8b650…`, on all three hosts |
 | Endpoint | **https://testnet.rhobot.net** (nginx → node A's HTTP API) |
 
 A's stake is 1000 against B's 100 on purpose: with no `--autopropose`, A is the only proposer, so A
@@ -110,6 +110,24 @@ was verified twice with node B. DigitalOcean's dashboard also graphs CPU/RAM/dis
 
 # Part 2 — For maintainers
 
+## Upstream references
+
+The node-level knowledge in this document also lives in `rchain-rust` `dev`, where node contributors will
+find it. Where the two overlap, prefer the upstream text: this document is the runbook for **this** net —
+our hosts, keys, genesis, health checks and the incident record (K1–K7).
+
+| upstream | what lives there |
+|---|---|
+| [`docs/src/node/running-a-public-testnet.md`](https://github.com/rchain-community/rchain-rust/blob/dev/docs/src/node/running-a-public-testnet.md) | the generalised procedure: stake split, genesis ceremony, joining, admitting a validator to a running chain, monitoring, sizing, rebuilds |
+| [`docs/src/node/operating.md`](https://github.com/rchain-community/rchain-rust/blob/dev/docs/src/node/operating.md#deploying-and-block-production) | `--shard-id`, the deploy-anchor rule, reading a term's return value, the three block production modes, finality/withdraw behaviour |
+| [`docs/src/node/validator-requirements.md`](https://github.com/rchain-community/rchain-rust/blob/dev/docs/src/node/validator-requirements.md) | host sizing, including the start-up replay floor (K7) |
+| [#60](https://github.com/rchain-community/rchain-rust/issues/60) | the start-up replay issue: measurements, a reproduction, and what is still unattributed |
+| [#39](https://github.com/rchain-community/rchain-rust/issues/39) | the validator lifecycle; this net's verified transcript is posted there |
+
+The deploy-anchor fix (K1) reached `dev` as
+[#58](https://github.com/rchain-community/rchain-rust/pull/58), and the three docs above came in as
+[#61](https://github.com/rchain-community/rchain-rust/pull/61).
+
 ## Topology
 
 ```
@@ -130,11 +148,14 @@ private addresses (`10.108.0.0/20`).
    dead. `withdraw` is not an immediate escape either: the stake is escrowed until the quarantine
    deadline, so it goes on diluting the pool. 1000 tolerates about four joiners at stake 100.
 2. **The previous chain outgrew the host.** It ran `--autopropose` plus an injected dummy deploy,
-   about one block every 2.5 s. Start-up replay retains roughly **1 MB per block**, so by ~1140
-   blocks every restart needed 700+ MB on a 957 MB host: the kernel OOM-killed rnode, the next start
-   replayed the same DAG and died again, and the API never came up (K7 — the "unresponsive API"
-   symptom, which is *not* the injector). Omitting `--autopropose` and `--deployer-private-key`
-   makes blocks arrive only when deploys do, keeping restart cost proportional to real usage.
+   about one block every 2.5 s. Start-up replay costs roughly **0.25 MB and ~0.2 s per existing block**
+   before the API opens at all, so by ~1140 blocks every restart needed ~285 MB plus minutes of silence,
+   on a 957 MB host that was also running nginx and do-agent: the kernel OOM-killed rnode, the next start
+   replayed the same DAG and died again, and the API never came up (K7 — the "unresponsive API" symptom,
+   which is *not* the injector). Omitting `--autopropose` and `--deployer-private-key` makes blocks arrive
+   only when deploys do, keeping restart cost proportional to real usage. Generalised sizing guidance is
+   upstream in
+   [`docs/src/node/validator-requirements.md`](https://github.com/rchain-community/rchain-rust/blob/dev/docs/src/node/validator-requirements.md).
 
 ## Genesis
 
@@ -147,8 +168,14 @@ Built once with `scripts/localnet/keys.mjs`; the exact files are on each node:
 /etc/rnode/deployer.env             DEPLOYER_PRIVATE_KEY=… (kept on disk, now unused: no injector)
 ```
 
-Genesis hash `26bf2328190ab2d7b580a868e63cd71b34c8a7a33a89ecbff19f9c8abb8819a9`; A's node id
-`d3cc3442ebcbc633edf950b579caf3f0a259ac76`, B's `ec92345441deaf20250e881fe890c65e1a596b7f`.
+Genesis hash `aab081c7371a66112a5fa6186272862ad56ef387b93a9423a13c1d9210ebb044`; A's node id
+`cf360190cba54f705f0f43d99ecd06cfe81f296c`, B's `a1ca9c6ee6c3d42bbdfbe326ab4c7ab66e132f54`.
+
+A node id is **not** derived from the validator key — a rebuilt data directory gets a fresh node
+identity, so any `--bootstrap` URI pointing at the master has to be updated after a rebuild. The
+chain of 2026-09-22 was rebuilt with the current binary for exactly this reason: the previous chain
+predated C21 and the governance fixes (`d9567c3ff`, `b92288f35`), and genesis artefacts are produced
+once, at genesis.
 
 Both nodes start with `--pos-multi-sig-public-keys <dave's pubkey> --pos-multi-sig-quorum 1`, which
 puts **dave** — a `wallets.txt`-funded key that can actually pay phlo — into the trusted set at
@@ -186,7 +213,9 @@ rnode --profile docker run -s --dev-mode --propose-on-deploy --no-upnp --host <i
 
 There is **no `--no-autopropose` flag** — you omit `--autopropose`. (`tools/devnet.sh` accepts
 `--no-autopropose` because that is *its* CLI; it only omits the node flag.) Passing it makes the
-node exit 1 in a restart loop.
+node exit 1 in a restart loop. The production-mode matrix and the finality consequences of an idle chain
+are upstream in
+[`docs/src/node/operating.md`](https://github.com/rchain-community/rchain-rust/blob/dev/docs/src/node/operating.md#block-production-modes).
 
 ## Adding a node (observer)
 
@@ -196,7 +225,7 @@ anywhere:
 ```bash
 rnode --profile docker run --host <its-ip> --data-dir /var/lib/rnode \
   --pos-multi-sig-public-keys <dave pubkey> --pos-multi-sig-quorum 1 \
-  --bootstrap rnode://d3cc3442ebcbc633edf950b579caf3f0a259ac76@164.90.140.144?protocol=40400&discovery=40404
+  --bootstrap rnode://cf360190cba54f705f0f43d99ecd06cfe81f296c@164.90.140.144?protocol=40400&discovery=40404
 ```
 
 (The multi-sig flags must match the genesis master's, or the joiner's own view of the genesis PoS
@@ -214,6 +243,11 @@ INFO [casper.engine.NodeLaunch] Making a transition to Running state.
 A join takes about 15 seconds and ~19 MB, measured.
 
 ## Onboarding an observer into the validator pool
+
+The generalised procedure — the admission routes, the funding prerequisites and a verified transcript — is
+upstream in
+[`docs/src/node/running-a-public-testnet.md`](https://github.com/rchain-community/rchain-rust/blob/dev/docs/src/node/running-a-public-testnet.md).
+What follows is this net's version, with the keys and addresses actually in play here.
 
 The implementation models the full lifecycle natively (`rholang/src/native_state.rs`):
 
@@ -251,20 +285,16 @@ means a **new genesis and a new chain**.
 2. the newcomer deploys         pos!("bond",  *deployerId, <stake>, *ret)      # 1..100 here
 ```
 
-Two funding prerequisites, both easy to miss, and both now **verified working**:
+Two funding prerequisites, both easy to miss and both **verified working here** (the general form, with
+the reasoning, is upstream):
 
-- the **trusting key must hold REV**, because it pays for the `trust` deploy's phlo from its own vault.
-  A genesis-trusted key that is *not* in `wallets.txt` cannot deploy at all — that is why the trusted
-  set is seeded with a funded key (dave) rather than with the bonded validator keys (K6);
+- the **trusting key must hold REV**, because it pays for the `trust` deploy's phlo from its own vault. A
+  genesis-trusted key that is not in `wallets.txt` cannot deploy at all — which is why **dave** is the
+  trusted key on this net (see K6);
 - the **newcomer must hold REV ≥ stake**, because the bond is deducted from its vault.
 
-A plain transfer funds both:
-`revVault!("transfer", *deployerId, "<its REV address>", <amount>, *ret)` — the reply is `Nil` on
-success and an error string on failure. Verified: a fresh key read `0`, then `100000000000` after a
-1e11 transfer, and it could then deploy. Read a balance with
-`revVault!("getBalance", "<address>", *ret)` — the method is `getBalance`, **not** `balance`. Derive a
-key's vault address with
-`node -e "import('./keys.mjs').then(m=>console.log(m.revAddressOf('<priv>')))"`.
+Funding either one is an ordinary transfer, and a vault balance is readable with `getBalance` — **not**
+`balance`. The terms this net uses are below.
 
 ### The exact terms
 
@@ -372,17 +402,18 @@ throughout.
 The fix (`fix/deploy-expiry-negative`, commit `756f1727d`) makes a negative anchor mean "not
 specified" and resolves it from the node's own status, which already carries `latest_block_number` —
 the same thing the faucet, the browser client, `gateway::current_height` and
-`txn_coordinator::run_phase_at` do. All three nodes now run a binary that includes it
-(`d7f5000b…`, which also carries the upstream registry-lookup fix), so `rnode deploy` works with no
-extra flags. Rollbacks are kept in place as `/usr/local/bin/rnode.old-<sha>`.
+`txn_coordinator::run_phase_at` do. The fix is merged to `dev` as
+[#58](https://github.com/rchain-community/rchain-rust/pull/58), and all three nodes run a binary that
+includes it (`d5d8b650…`, which also carries the upstream registry-lookup fix), so `rnode deploy` works
+with no extra flags. Rollbacks are kept in place as `/usr/local/bin/rnode.old-<sha>`.
 **A binary built before that commit still needs `--valid-after-block-number <height>`.**
 
 **K2 — an earlier diagnosis in this document was wrong; corrected.** It blamed the dummy-deploy
 injector and claimed that removing it left A's HTTP API unresponsive. K1 shows the injector has
 nothing to do with deploy inclusion, and the unresponsive-API observation is better explained by
 start-up latency: a healthy restart took ~55s before `/api/status` answered, and the check that
-appeared to hang was made ~25s in. The injector stays on because it is what keeps blocks flowing for
-joiners. **Do not treat the injector as a suspect for deploy problems.**
+appeared to hang was made ~25s in. The injector is now **off** — this net runs `--propose-on-deploy` with no `--autopropose`, so a block
+appears when a deploy arrives and an idle chain stays idle. **Do not treat the injector as a suspect for deploy problems.**
 
 **K3 — transfers credit a spendable vault; an earlier claim here was wrong and is retracted.**
 Phlo is charged against the deployer's vault (`native_state.rs::pre_charge`, which derives the address
@@ -412,7 +443,7 @@ registry result-slot pattern the browser client uses: `scripts/qos-cli/rholang-c
 An earlier revision warned that this read-back "lags by about one deploy". That was wrong: the lag was
 dev's registry-lookup divergence (C18 — the native handler wrapped its reply in `(uri, value)` while
 the genesis `Registry.rho` forwards it unwrapped, so a client's `for (X <- ch) { X!(…) }` silently did
-nothing, with no error and no result). It is fixed in the binary these nodes run (`d7f5000b…`), and
+nothing, with no error and no result). It is fixed in the binary these nodes run (`d5d8b650…`), and
 with it deploy result values are readable — which is what unblocked the whole diagnosis.
 
 **K5 — disk and memory growth.** Disk now grows only with real usage (~6.6 KB/block) since the injector
@@ -440,6 +471,10 @@ genesis bond keys are not in `wallets.txt`, so the trusted set is seeded with da
 `--pos-multi-sig-public-keys <hex> --pos-multi-sig-quorum 1` — on every node, so a joiner's own view
 of the genesis PoS spec matches the chain it is joining.
 
+Re-verified on the 2026-09-22 rebuilt chain (`aab081c7…`): dave's `trust` returns `(true)`, alice's
+`bond 100` returns `(true)`, the bond pool goes 2 → 3 and the active set 2 → 3 — and A still holds
+83 % of the pool, above the ⅔ threshold, so admitting a validator does not stall finality.
+
 **K7 — start-up replay is the expensive part of a node's life, and it is invisible while it runs.
 This is the most important operational constraint here. Now tracked upstream as
 [rchain-rust#60](https://github.com/rchain-community/rchain-rust/issues/60).**
@@ -452,6 +487,12 @@ Measured on the same 1142-block state, on a 4 GB host so the replay could actual
 | replay, read-only | 57 → 284 MB (oscillating) | **225 s** |
 | replay, `-s --dev-mode --propose-on-deploy` | 52 → 285 MB (oscillating) | **210 s** |
 | an isolated chain *producing* blocks (`--autopropose` + injector) | 20 → 23 MB while going 10 → 141 blocks | — |
+
+Confirmed again in production on 2026-09-22: redeploying the rhobot **playground** node to pick up C21
+cost **~11 minutes** before its API answered, RSS peaking above 1.4 GB on a 3.9 GB box — on a chain
+that is only **16 MB** on disk. The restart is the cost, not the data, which is why a rebuild that
+starts from an empty data directory (as this testnet does) comes up in seconds while a restart of the
+same node does not.
 
 So the cost is all in start-up — **roughly 0.25 MB of RSS and ~0.2 s per existing block** — while
 producing blocks is nearly free (~0.02 MB/block). An earlier revision of this section said "about 1 MB
