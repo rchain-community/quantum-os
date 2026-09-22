@@ -219,7 +219,12 @@ export async function run(args) {
   // A fixed amount, no rate limit (test systems only, by design — see CLAUDE.md).
   // Bad hex is rejected loudly at startup (like numOpt above): a faucet that
   // silently never sends because the key never parsed would just look broken.
-  const FAUCET_AMOUNT = 10n;
+  // The vault counts in dust (1 REV = 10^8 dust — wallet.txt, the node's own
+  // faucet and r-wallet all use it); the macro's `amount` is dust too. This
+  // used to pass 10n straight through, i.e. 10 dust while saying "10 REV".
+  const FAUCET_REV = 10n;
+  const DUST_PER_REV = 100_000_000n;
+  const FAUCET_AMOUNT = FAUCET_REV * DUST_PER_REV;   // what actually moves
   let facilKey = null, facilAddr = null;
   if (args.key) {
     const k = String(args.key).trim().replace(/^0x/, "");
@@ -239,8 +244,10 @@ export async function run(args) {
     const out = await revDeployTerm(revCfg(), term);
     if (!out.ok) return { ok: false, message: String(out.message ?? "") };
     const v = String(out.value ?? "");
-    if (/transfer ok/i.test(v)) return { ok: true, confirmed: true, message: v };
-    return { ok: true, confirmed: false, message: v };
+    // deployId is what rnode calls the deploy's signature — the id r-wallet
+    // polls `/api/v1/deploy-status/<id>` with.
+    if (/transfer ok/i.test(v)) return { ok: true, confirmed: true, message: v, deployId: out.sig };
+    return { ok: true, confirmed: false, message: v, deployId: out.sig };
   }
   if (args.faucetHttp !== undefined) {
     if (!Number.isInteger(args.faucetHttp) || args.faucetHttp <= 0) { console.error(`${TAG} --faucet-http needs a port number`); process.exit(1); }
@@ -457,7 +464,7 @@ export async function run(args) {
   }
 
   const askHint = advisor.enabled ? "" : " (needs --ai)";
-  const faucetHint = facilKey ? ` · \`/${CMD} faucet [address]\` (sends ${FAUCET_AMOUNT} TEST REV to a REV address — test systems only)` : "";
+  const faucetHint = facilKey ? ` · \`/${CMD} faucet [address]\` (sends ${FAUCET_REV} TEST REV to a REV address — test systems only)` : "";
   const helpText = () => `I'm ${myName}, ${role.blurb} Commands: \`/${CMD}\` (am I here?) · \`/${CMD} help\` · \`/${CMD} ask <question>\`${askHint} · \`/${CMD} optimize <problem>\`${askHint} (facilitate an annealing-style optimization round) · \`/${CMD} chair <topic>\`${askHint} (chair a structured deliberation → define · alternatives · evaluate · disagreements · agreements · closure, then record the decision; \`/${CMD} next\`/\`back\`/\`close\`/\`cancel\` to steer) · \`/${CMD} start <label> [payoffs a,b,c,d] [stag=…] [hare=…] [predict: …]\` / \`/${CMD} stop\` (record a live game: every poll, estimate, lemma and message, timestamped and signed → a structured record; \`/${CMD} games\`, \`/${CMD} summarize\`${askHint}, \`/${CMD} publish\`) · \`/${CMD} list [n]\` (the room's screen history, oldest→newest — default 25, max 500) · \`/${CMD} trust\` (my standing) · \`/${CMD} health\` (uptime, peers, budget, CPU) · \`/${CMD} off\` / \`/${CMD} on\` (mute/unmute)${faucetHint}. I'm a full member — \`/gov trust\` me up or \`/gov censure\` me down. About this room (and how to make your own): ${ABOUT_URL}`;
   const statusText = () => `👋 Yes, I'm here — ${myName} (${role.name})${muted ? ` — currently muted (\`/${CMD} on\` to wake me)` : ""}.${standing.governed ? ` Trust ${standing.level}${standing.discredited ? " — stood down" : ` (≤${standing.budget}/5min)`}.` : ""} \`/${CMD} help\` · \`/${CMD} trust\`.`;
   const introText = () => `Hi — I'm ${myName}, ${role.blurb} Say \`/${CMD}\` or \`/${CMD} help\` to reach me${advisor.enabled ? `, or \`/${CMD} ask <q>\` to ask me anything` : ""}. I'm a full room member — \`/gov trust\`/\`/gov censure\` me; \`/${CMD} trust\` shows my standing. About this room: ${ABOUT_URL}`;
@@ -489,18 +496,18 @@ export async function run(args) {
     }
     const addr = explicit || (known[fromId]?.revAddress ?? "");
     if (!addr) {
-      directReply(fromId, `I can send ${FAUCET_AMOUNT} test REV — what's your REV address? \`/${CMD} faucet <address>\` (find yours via \`/rholang key show\`).`);
+      directReply(fromId, `I can send ${FAUCET_REV} test REV — what's your REV address? \`/${CMD} faucet <address>\` (find yours via \`/rholang key show\`).`);
       return;
     }
     if (explicit && known[fromId]?.revAddress !== explicit) {
       (known[fromId] ??= { firstSeen: Date.now() }).revAddress = explicit;
       saveKnown();
     }
-    directReply(fromId, `Sending ${FAUCET_AMOUNT} test REV to ${addr}… (may take a few seconds to confirm)`);
+    directReply(fromId, `Sending ${FAUCET_REV} test REV to ${addr}… (may take a few seconds to confirm)`);
     try {
       const out = await faucetSend(addr);
       if (!out.ok) { directReply(fromId, `Deploy failed: ${out.message.slice(0, 300)}`); return; }
-      if (out.confirmed) directReply(fromId, `✅ Sent ${FAUCET_AMOUNT} test REV to ${addr}.`);
+      if (out.confirmed) directReply(fromId, `✅ Sent ${FAUCET_REV} test REV to ${addr}.`);
       else if (out.message) directReply(fromId, `⚠️ Deploy landed but the transfer didn't confirm: ${out.message.slice(0, 300)}`);
       else directReply(fromId, `Deploy accepted, but I couldn't confirm the transfer within the wait window — check your balance (\`/rholang eval\`, \`$balance(me)\`) in a bit.`);
     } catch (e) { directReply(fromId, `Faucet error: ${e?.message ?? e}`); }
@@ -1114,7 +1121,7 @@ export async function run(args) {
 
   let faucetHttp = null;
   if (args.faucetHttp !== undefined) {
-    faucetHttp = createFaucetServer({ send: faucetSend, amount: FAUCET_AMOUNT, fundingAddress: facilAddr, rnode: rnodeUrl, log: (m) => console.log(`${TAG} ${m}`) }).server;
+    faucetHttp = createFaucetServer({ send: faucetSend, amount: FAUCET_AMOUNT, amountRev: FAUCET_REV, fundingAddress: facilAddr, rnode: rnodeUrl, log: (m) => console.log(`${TAG} ${m}`) }).server;
     faucetHttp.listen(args.faucetHttp, () => console.log(`${TAG} faucet HTTP on :${args.faucetHttp} — POST /faucet {"address"} · GET /health`));
     faucetHttp.on("error", (e) => { console.error(`${TAG} faucet HTTP failed: ${e?.message ?? e}`); process.exit(1); });
   }
