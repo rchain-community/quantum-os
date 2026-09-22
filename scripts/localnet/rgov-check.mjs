@@ -149,6 +149,16 @@ const CLASSES = [
   ["Kudos", "rholang/core/Kudos.rho"],
   ["RevIssuer", "rholang/core/RevIssuer.rho"],
   ["memberIdGovRev", "rholang/core/memberIdGovRev.rho"],
+];
+
+// Deployed AFTER the master directory, because they register themselves INTO
+// it: MemberDirectory reads `@[*deployerId, "MasterContractAdmin"]` and does
+// `MCAwrite!("GetMe", …)` / `MCAwrite!("SendThem", …)`. Deploy it with the core
+// batch and that read never matches, so it blocks and `GetMe` is never written
+// — which then blocks newInbox and every action behind it. rgov's own
+// bootstrap/deploy-all has the same ordering: core, propose, directory, then
+// `find ../rholang/feature`.
+const FEATURES = [
   ["MemberDirectory", "rholang/feature/MemberDirectory.rho"],
 ];
 
@@ -232,6 +242,30 @@ async function tier2() {
     .split("\n").find((l) => l.startsWith(`${KEY_NAME}=`));
   if (!keyLine) { console.error(`no ${KEY_NAME}= in scripts/localnet/pk.txt`); process.exit(2); }
   const cfg = { ...DEFAULT_CONFIG, url: NODE, key: keyLine.split("=")[1].trim(), phloLimit: PHLO };
+
+  // A bootstrap is NOT idempotent and cannot be made so from here.
+  // `@[*deployerId, "MasterContractAdmin"]!({read, write, grant})` is a linear
+  // send, so a second run leaves a SECOND value on that one channel; every
+  // consumer peeks it with `<<-` and binds an arbitrary one. Measured on this
+  // chain: two values, comparing unequal — two live directory instances, with
+  // MemberDirectory writing GetMe into one while the published ReadcapURI read
+  // the other. Nothing errors; the system just wires itself to the wrong
+  // directory.
+  //
+  // Draining the channel first is not available: rholang has no non-blocking
+  // receive, so a speculative `for` that finds nothing lingers as a waiting
+  // continuation and swallows the NEXT value — worse than the disease. The
+  // channel is keyed by deployerId, so the sound move is a virgin identity per
+  // bootstrap, and refusing to reuse one.
+  const ledgerPath = join(CACHE, "bootstrapped.json");
+  const ledger = existsSync(ledgerPath) ? JSON.parse(readFileSync(ledgerPath, "utf8")) : [];
+  const dirty = ledger.find((e) => e.key === KEY_NAME && e.node === NODE);
+  if (dirty && !process.argv.includes("--force")) {
+    console.error(`${KEY_NAME} already bootstrapped this node on ${dirty.at}.`);
+    console.error(`Re-using it would add a second MasterContractAdmin and silently split the directory.`);
+    console.error(`Pick an unused identity: --key-name bob|carol|dave  (or --force to accept a split state).`);
+    process.exit(2);
+  }
 
   console.log(`rgov-check (tier 2 — installing classes) — ${NODE}`);
   console.log(`deploying as ${KEY_NAME}, phloLimit ${PHLO}\n`);
@@ -341,9 +375,28 @@ in {
     process.exit(1);
   }
   console.log(`${status.ok}directory        ReadcapURI ${readcap}`);
-  writeFileSync(join(CACHE, "directory.json"), JSON.stringify({ node: NODE, at: new Date().toISOString(), readcap, uris }, null, 2));
+  writeFileSync(join(CACHE, "directory.json"), JSON.stringify({ node: NODE, at: new Date().toISOString(), key: KEY_NAME, readcap, uris }, null, 2));
+  ledger.push({ key: KEY_NAME, node: NODE, at: new Date().toISOString(), readcap });
+  writeFileSync(ledgerPath, JSON.stringify(ledger, null, 2));
 
-  // --- 2c/2d: claim an identity, then run the client actions --------------
+  // --- 2c: the features, which register themselves into the directory ----
+  console.log("\n— features (after the directory, they write into it) —");
+  for (const [name, path] of FEATURES) {
+    if (ONLY && !name.toLowerCase().includes(ONLY.toLowerCase())) continue;
+    const label = name.padEnd(18);
+    const src = await source(path);
+    if (src === null) { console.log(`${status.miss}${label}${path}`); continue; }
+    const dep = await deployTerm({ ...cfg, phloLimit: Math.max(PHLO, 8_000_000) }, src, { waitAttempts: 0 }).catch((e) => ({ ok: false, message: String(e?.message ?? e) }));
+    if (!dep.ok) { console.log(`${status.fail}${label}${String(dep.message).slice(0, 160)}`); bad++; continue; }
+    const r = await deployResult(dep.sig);
+    // It reports nothing to deployId, so "processed without error" is all we
+    // can see here. Whether it really wrote GetMe is proven by newInbox below.
+    if (!r.ok) { console.log(`${status.fail}${label}${r.error.slice(0, 160)}`); bad++; continue; }
+    console.log(`${status.ok}${label}processed — newInbox is the proof it registered GetMe`);
+    ok++;
+  }
+
+  // --- 2d: claim an identity, then run the client actions ----------------
   //
   // Every action is run as a signed deploy, as one identity, with the default
   // arguments its own `match [...]` header carries and `$masterURI` replaced by
