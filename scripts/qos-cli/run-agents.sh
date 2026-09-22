@@ -76,10 +76,20 @@ for role in "${ROLES[@]}"; do
   if [ -z "${NO_MEMORY:-}" ] && [ "$role" = "${ROLES[0]}" ]; then persist=(--persist "$PERSIST_DIR"); fi
   keyflag=()
   if [ "$role" = "facilitator" ] && [ -n "$FACIL_KEY" ]; then keyflag=(--key "$FACIL_KEY"); fi
+  # FAUCET_HTTP=<port> also serves the faucet over HTTP (agent.mjs
+  # --faucet-http) — for a wallet (r-wallet) on the playground/testnet that
+  # cannot join the room. Rate-limited in agent.mjs; put a TLS proxy in front.
+  httpflag=()
+  if [ "$role" = "facilitator" ] && [ -n "$FACIL_KEY" ] && [ -n "${FAUCET_HTTP:-}" ]; then httpflag=(--faucet-http "$FAUCET_HTTP"); fi
+  # FACIL_RNODE=<url> is the chain the faucet's REV is on (agent.mjs --rnode;
+  # default rholang-client.mjs's). Playground and testnet are two chains, so
+  # two facilitators with two values — the same key is funded on each.
+  rnodeflag=()
+  if [ "$role" = "facilitator" ] && [ -n "${FACIL_RNODE:-}" ]; then rnodeflag=(--rnode "$FACIL_RNODE"); fi
   nohup node agent.mjs --room "$ROOM" --role "$role" --ai --ai-backend claude-code \
-    --state "./.qos-$role" "${persist[@]}" "${keyflag[@]}" >> ".agents/$role.log" 2>&1 &
+    --state "./.qos-$role" "${persist[@]}" "${keyflag[@]}" "${httpflag[@]}" "${rnodeflag[@]}" >> ".agents/$role.log" 2>&1 &
   echo $! > "$pidf"
-  echo "✓ started $role (pid $!)${keyflag[*]:+ [test-REV faucet active]} → scripts/qos-cli/.agents/$role.log"
+  echo "✓ started $role (pid $!)${keyflag[*]:+ [test-REV faucet active]}${httpflag[*]:+ [faucet HTTP :$FAUCET_HTTP]} → scripts/qos-cli/.agents/$role.log"
   sleep "$STAGGER"   # keep joins off each other's heels; see the ceiling note above
 done
 

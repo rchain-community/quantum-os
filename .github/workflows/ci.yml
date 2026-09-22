@@ -79,6 +79,13 @@ jobs:
       - name: Capability macro selftest
         run: node scripts/qos-cli/rholang-macros.mjs --selftest
 
+      # The faucet's HTTP face (faucet-http.mjs) against a stub send — the
+      # per-address cooldown, the per-client hourly cap, X-Forwarded-For as
+      # the client, the JSON/CORS shape a wallet codes against. Dependency-
+      # free, so it runs here without scripts/qos-cli's npm install.
+      - name: Faucet HTTP selftest
+        run: node scripts/qos-cli/faucet-http.selftest.mjs
+
       - name: Locker selftest
         run: node packages/browser/src/locker.js --selftest
 
