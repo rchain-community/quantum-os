@@ -100,8 +100,10 @@ was verified twice with node B. DigitalOcean's dashboard also graphs CPU/RAM/dis
 - **A rebuild resets everything.** Changing `bonds.txt`/`wallets.txt` means a new genesis and a new
   chain.
 - Disk now grows with real usage only (~6.6 KB per block) instead of ~140 MB/day.
-- **Restart cost grows with chain length** — roughly 1 MB of RAM per replayed block, so a 1 GB host
-  gives out somewhere around 1000 blocks. See [K7](#known-issues).
+- **Start-up is the expensive part.** Replay costs about **0.25 MB of RAM and ~0.2 s per existing
+  block** before the API opens at all (a 1142-block chain: ~285 MB, ~3.5 minutes), while *producing*
+  blocks is nearly free. Budget ≥2 GB for ~1k blocks, ≥4 GB to be comfortable — see
+  [K7](#known-issues) and [rchain-rust#60](https://github.com/rchain-community/rchain-rust/issues/60).
 - No SLA, no backups of chain state beyond the genesis files.
 
 ---
@@ -438,27 +440,44 @@ genesis bond keys are not in `wallets.txt`, so the trusted set is seeded with da
 `--pos-multi-sig-public-keys <hex> --pos-multi-sig-quorum 1` — on every node, so a joiner's own view
 of the genesis PoS spec matches the chain it is joining.
 
-**K7 — start-up replay memory grows with chain length, capping a 1 GB host at roughly 1000 blocks.
-This is what broke the previous chain, and it is the most important operational constraint here.**
+**K7 — start-up replay is the expensive part of a node's life, and it is invisible while it runs.
+This is the most important operational constraint here. Now tracked upstream as
+[rchain-rust#60](https://github.com/rchain-community/rchain-rust/issues/60).**
 
-Measured: a chain at 1142 blocks needed a start-up replay that climbed to **738 MB** on a 957 MB host
-(`Out of memory: Killed process … (rnode) … anon-rss:738604kB`, exit `status=9/KILL`), while the
-persisted state was only **4.5 MB**. The replay inflates by roughly 150× — about **1 MB per block**,
-essentially independent of what is on disk. After the OOM kill every restart repeated the same replay,
-grew the same way and died again: the API never answered the health check (`api-unreachable no-blocks`)
-while `systemctl is-active` still reported `active`. That, not the injector, is the real explanation of
-the "removing the injector left the API unresponsive" observation in K2.
+Measured on the same 1142-block state, on a 4 GB host so the replay could actually finish:
 
-What was done about it:
+| configuration | start-up RSS | API reachable after |
+|---|---|---|
+| fresh chain (≤6 blocks) | 18–20 MB | **15 s** |
+| replay, read-only | 57 → 284 MB (oscillating) | **225 s** |
+| replay, `-s --dev-mode --propose-on-deploy` | 52 → 285 MB (oscillating) | **210 s** |
+| an isolated chain *producing* blocks (`--autopropose` + injector) | 20 → 23 MB while going 10 → 141 blocks | — |
+
+So the cost is all in start-up — **roughly 0.25 MB of RSS and ~0.2 s per existing block** — while
+producing blocks is nearly free (~0.02 MB/block). An earlier revision of this section said "about 1 MB
+per block"; that was arithmetic from the OOM below, and the measurement does not support it.
+
+What actually killed the previous chain: on a 957 MB host that was also running nginx, do-agent and
+certbot, rnode was OOM-killed while replaying, at **738 MB `anon-rss`** — higher than the ~285 MB the
+same state needs in isolation, and the extra several hundred MB is *not yet explained* (issue #60 lists
+the candidates: a bonded validator identity, the running injector, a peer that is itself replaying,
+concurrent LFS state transfer). After the kill, every restart replayed the same DAG and died again, in a
+loop: the API never answered (`api-unreachable no-blocks`) while `systemctl is-active` still reported
+`active`. That, not the injector, is the real explanation of the "removing the injector left the API
+unresponsive" observation in K2.
+
+What was done about it here, and what it means for operators:
 
 - the rebuilt chain runs **without `--autopropose` and without `--deployer-private-key`**, so blocks
-  arrive only when deploys do, and restart cost tracks real usage instead of wall-clock time;
-- a fresh chain starts in **15 s at 18–20 MB** (measured), where the 1142-block chain never started;
+  arrive only when deploys do and restart cost tracks real usage instead of wall-clock time;
+- a fresh chain starts in **15 s at 18–20 MB**, where the 1142-block chain could not restart usefully;
 - the health check no longer fails on a missing finalised fringe — an idle chain has none, and joiners
   restore from the approved genesis fringe instead;
-- if this testnet is meant to carry sustained traffic this belongs in the node: replay should not
-  retain a per-block working set proportional to the whole chain. More RAM only moves the wall (2 GB
-  would put it near ~2000 blocks), it does not remove it.
+- **host sizing:** 1 GB is fine for a few hundred blocks, but budget ≥2 GB for ~1k blocks and ≥4 GB to
+  be comfortable — and expect ~30 s per 150 blocks of unavailability after every restart, with no
+  readiness signal until the API appears;
+- if a long chain does fail to come up, check whether the PID's RSS is *growing* before assuming a hang:
+  replay is silent, and restarting faster does not help.
 
 ## Housekeeping
 
