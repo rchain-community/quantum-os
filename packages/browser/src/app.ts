@@ -2365,7 +2365,7 @@ const RHOLANG_HELP = [
   "",
   "  Configuration:",
   "  /rholang config               — show all of it",
-  "  /rholang rnode <url>          — rnode HTTP API (default https://rnodeapi.rhobot.net; a localnet is http://127.0.0.1:40403)",
+  "  /rholang rnode <url>          — rnode HTTP API (default: the rholang playground, https://rnodeapi.rhobot.net · the testnet is https://testnet.rhobot.net · a localnet is http://127.0.0.1:40403)",
   "  /rholang shard <id>           — shard the deploy is valid in (default root)",
   "  /rholang phlo <limit> [price] — what a deploy may spend",
   "  /rholang key generate|<hex>|show|forget — the secp256k1 deploy key (this browser only)",

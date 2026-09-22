@@ -105,7 +105,9 @@ name** — only its author can change or remove it for everyone; anyone else's
 ## Part 2 — reading a little rholang
 
 The second half of MacRhoLang reaches a **chain** (an RChain *rnode*). By
-default that is the public node at `https://rnodeapi.rhobot.net`; to use your
+default that is the **rholang playground**, the public node at
+`https://rnodeapi.rhobot.net` (the multi-validator testnet is a separate
+chain, `https://testnet.rhobot.net`); to use your
 own instead — `bash scripts/localnet/run-node.sh`, then
 `/rholang rnode http://127.0.0.1:40403`. A room works completely without one;
 this half is opt‑in.
