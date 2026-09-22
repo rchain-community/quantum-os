@@ -8,3 +8,5 @@ packages/zfa-core-wasm/
 
 # localnet helper deps (installed with its own npm install, like scripts/qos-cli)
 scripts/localnet/node_modules/
+# rgov sources fetched by rgov-check.mjs (audit input, not ours to vendor)
+scripts/localnet/.rgov-cache/

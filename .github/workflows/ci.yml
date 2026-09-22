@@ -89,6 +89,13 @@ jobs:
       - name: Locker selftest
         run: node packages/browser/src/locker.js --selftest
 
+      # rgov's argument-substitution convention (rgov-apply.js) — the one
+      # r-wallet's snippet_apply implements and scripts/localnet/rgov-check.mjs
+      # audits against. Pure string work, so it runs here; the audit itself
+      # needs a live node and does not.
+      - name: rgov substitution selftest
+        run: node packages/browser/src/rgov-apply.js --selftest
+
       # The room key and hashed room id (room-crypto.js) — the one file the
       # browser and the Node agents both run, so one derivation, not two.
       - name: Room crypto selftest
