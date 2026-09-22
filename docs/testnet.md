@@ -4,10 +4,13 @@ A small public RChain testnet run on [rchain-rust](../) for the rholang playgrou
 agents and experiments. Two bonded validators on two hosts, funded dev wallets, and an **idle**
 chain that produces a block only when a deploy arrives.
 
-> **Status: reads, writes and validator onboarding all work — verified end to end.** A brand-new key
-> can be funded by transfer, deploy, be trusted, and bond into the validator pool (transcript in
-> [Status](#status-of-the-verified-path)). `/api/status`, `/api/explore-deploy`, `getBonds`,
-> `getActiveValidators`, `/health`, and `rnode deploy` with no extra flags all work. The chain is
+> **Status: reads, writes and validator onboarding all work — re-verified on the current chain on
+> 2026-09-22** (evidence in [Status](#status-of-the-verified-path); the chain was rebuilt that day, so
+> the older transcript there is labelled as such). A brand-new key can be funded by transfer, deploy,
+> be trusted, and bond into the validator pool. `/api/status`, `/api/explore-deploy`, `getBonds`,
+> `getActiveValidators`, `/health`, and `rnode deploy` with no extra flags all work — note that a CLI
+> deploy does need a **funded** key, or it is accepted and mined and then reports `processedWithError`
+> for phlo. The chain is
 > deliberately **idle** (no `--autopropose`): blocks appear when a deploy arrives. A
 > continuously-producing chain cannot be restarted on a 1 GB host — that is what broke the previous
 > chain, and it is [K7](#known-issues), the most important operational constraint here. Not
@@ -351,7 +354,29 @@ Two easy-to-miss details:
 
 ### Status of the verified path
 
-Everything below was run against this chain, with the deploys signed through
+#### Re-verified on the current chain — 2026-09-22, genesis `aab081c7…`, height 3 → 7
+
+The chain was rebuilt on 2026-09-22 from a fresh genesis, so the transcript further down describes the
+chain *before* that rebuild. These claims were therefore re-run against the current one, through
+`https://testnet.rhobot.net`:
+
+| step | result |
+|---|---|
+| `GET /api/status` | ✅ node `cf360190…`, peers 1, nodes 2 |
+| `getBonds` / `getActiveValidators` | ✅ `{A: 1000, B: 100, alice: 100}`, active set 3 — the key admitted below is still in the pool |
+| fund a brand-new key: `getBalance` → transfer 1e11 → `getBalance` | ✅ `0` → `100000000000` (fresh key `1111PXDQTD…`) |
+| the new key deploys `return!(1)` | ✅ accepted, `Success!` |
+| `rnode deploy` with no `--valid-after-block-number`, funded key | ✅ `processedWithSuccess` in block 6 |
+| the same with an *unfunded* key | ✅ accepted and mined in block 5, then `processedWithError` for phlo — included, not dropped |
+| height during the run | ✅ 3 → 7 |
+
+Everything in that table was run against the current chain. The transcript below was run against the
+previous one and is kept because the code paths are the same — but it is **not** evidence about the
+current chain, and the current chain is young (single-digit height), so treat the two separately.
+
+#### Original transcript — previous chain, 2026-09-21
+
+Everything below was run against **that** chain, with the deploys signed through
 `scripts/qos-cli/rholang-client.mjs` (which wraps each term in a result slot, so the term's *return
 value* is readable) and with dev's registry-lookup fix in the running binary:
 
