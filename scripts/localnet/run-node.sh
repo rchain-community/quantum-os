@@ -19,6 +19,16 @@
 #   --dev-mode           lets `/rholang eval` work. Exploratory deploy is refused
 #                        on a validating node unless dev mode is on. It does not
 #                        affect block production — measured, both ways.
+#   --deployer-private-key
+#                        turns on the node's NATIVE faucet, POST /api/faucet
+#                        {"address"} → {deployId, amount, to}, signed by the
+#                        node from this key. r-wallet's faucet button calls
+#                        exactly this; without the flag the node answers
+#                        "faucet requires --dev-mode --deployer-private-key"
+#                        (seen live on rhobot.net). pk.txt's `deployer` — the
+#                        same throwaway key the facilitator faucet uses, so
+#                        both draw one account. DEPLOYER_KEY= (empty) leaves it
+#                        off; the node's own rate limit applies.
 #
 # NOT set: --min-phlo-price 0. At price 0 the charge is zero and pre_charge
 # returns before it looks at any balance, which makes it look like a shortcut. It
@@ -37,6 +47,7 @@ cd "$(dirname "$0")"
 DATA_DIR="${QOS_RNODE_DATA:-$HOME/.rnode-local}"
 RNODE="${RNODE:-$(cd ../.. && pwd)/bin/rnode}"
 KEY="$(grep '^validator=' pk.txt | cut -d= -f2)"
+DEPLOYER_KEY="${DEPLOYER_KEY-$(grep '^deployer=' pk.txt | cut -d= -f2)}"
 
 if [ ! -x "$RNODE" ]; then
   echo "run-node.sh: no executable rnode at $RNODE" >&2
@@ -65,8 +76,11 @@ mkdir -p "$DATA_DIR/genesis"
 cp bonds.txt "$DATA_DIR/genesis/bonds.txt"
 cp wallet.txt "$DATA_DIR/genesis/wallets.txt"
 
+faucet=()
+if [ -n "$DEPLOYER_KEY" ]; then faucet=(--deployer-private-key "$DEPLOYER_KEY"); fi
+
 exec "$RNODE" run -s \
-  --dev-mode \
+  --dev-mode "${faucet[@]}" \
   --autopropose \
   --no-upnp \
   --host 127.0.0.1 \
