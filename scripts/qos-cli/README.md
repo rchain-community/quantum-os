@@ -458,12 +458,23 @@ HTTP. `faucet-http.mjs` gives the same faucet an HTTP face, calling the same
 `faucetSend` (one function moves REV, whichever door it comes through):
 
 ```
-POST /faucet   {"address": "1111…"}      → 200 {"ok":true,"amount":"10","address":…}
+POST /faucet   {"address": "1111…"}      → 200 {"deployId":…,"amount":1000000000,"to":…, "ok":true,…}
+POST /api/faucet                          (the same — rnode's own path, see below)
 GET  /faucet?address=1111…               (the same)
-GET  /health                             → the terms: amount, funding address, limits
+GET  /health                             → the terms: amount (dust) + amountRev, funding address, rnode, limits
 ```
 
-CORS is open (a wallet is a web page). What the room command deliberately
+**Wire-compatible with rnode's own faucet.** A rchain-rust node in dev mode
+has a native `POST /api/faucet {"address"}` → `{deployId, amount, to}` (amount
+in dust, 1 REV = 10⁸), and r-wallet already calls exactly that against the
+node it is pointed at. This endpoint answers in that shape (its own fields
+after) and is served at `/api/faucet` too, so a reverse proxy in front of the
+node can route `/api/faucet` here and a wallet needs no change at all — it
+just meets a faucet that also rate-limits. `deployId` is the deploy's
+signature, the id `/api/v1/deploy-status/<id>` takes. (The amount moved is
+`FAUCET_REV × 10⁸` dust: the vault counts in dust, and the room command used
+to pass `10` straight through — ten dust while saying "10 REV".) CORS is open
+(a wallet is a web page). What the room command deliberately
 lacks, this one must have: the room is reachable only by whoever holds its
 cap, a port by anyone on the internet, and an unlimited faucet on a public
 port is a drained faucet. So: **one grant per address per day, five per

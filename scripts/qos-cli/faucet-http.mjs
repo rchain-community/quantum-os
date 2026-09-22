@@ -4,7 +4,14 @@
 // fine for a person in the room, useless to a wallet that only speaks HTTP.
 // This is the same faucet with an HTTP face: `POST /faucet {"address"}` (or
 // `GET /faucet?address=`) → the agent's `send(address)`, which deploys the
-// same `$transfer` from the same throwaway key. What the room command
+// same `$transfer` from the same throwaway key.
+//
+// WIRE-COMPATIBLE WITH RNODE'S OWN FAUCET. rchain-rust's dev-mode node has a
+// native `POST /api/faucet {"address"}` → `{deployId, amount, to}` (amount in
+// dust), and r-wallet already calls exactly that. This endpoint answers in
+// that shape (plus its own fields) and is served at `/api/faucet` as well as
+// `/faucet`, so a reverse proxy can route `/api/faucet` here and a wallet
+// needs no change — it just sees a faucet that also rate-limits. What the room command
 // deliberately lacks — a rate limit — this one must have: the room command is
 // reachable only by whoever holds the room cap, an HTTP port by anyone on the
 // internet, and an unlimited faucet on a public port is a drained faucet.
@@ -26,8 +33,9 @@ const REV_ADDR_RE = /^[1-9A-HJ-NP-Za-km-z]{20,60}$/;   // base58 shape sanity ch
 const HOUR_MS = 3_600_000;
 
 export function createFaucetServer({
-  send,                           // async (address) => { ok, message? }
-  amount,                         // bigint/number, for the reply and /health
+  send,                           // async (address) => { ok, message?, deployId? }
+  amount,                         // in dust (what moves), for the reply and /health
+  amountRev = null,               // the same in REV, for people
   fundingAddress = "",            // the faucet's own address, for /health
   rnode = "",                     // which chain the REV is on, for /health
   addrCooldownMs = 24 * HOUR_MS,
@@ -83,10 +91,10 @@ export function createFaucetServer({
     const url = new URL(req.url ?? "/", "http://faucet");
     if (req.method === "OPTIONS") { json(res, 204, {}); return; }
     if (url.pathname === "/" || url.pathname === "/health") {
-      json(res, 200, { ok: true, faucet: true, amount: String(amount), fundingAddress, rnode, addrCooldownMs, ipPerHour });
+      json(res, 200, { ok: true, faucet: true, amount: Number(amount), amountRev: amountRev === null ? undefined : String(amountRev), fundingAddress, rnode, addrCooldownMs, ipPerHour });
       return;
     }
-    if (url.pathname !== "/faucet") { json(res, 404, { ok: false, error: "not found" }); return; }
+    if (url.pathname !== "/faucet" && url.pathname !== "/api/faucet") { json(res, 404, { ok: false, error: "not found" }); return; }
     if (req.method !== "POST" && req.method !== "GET") { json(res, 405, { ok: false, error: "method not allowed" }); return; }
 
     let address = url.searchParams.get("address") ?? "";
@@ -111,7 +119,8 @@ export function createFaucetServer({
       json(res, 502, { ok: false, error: "deploy failed", detail: String(out?.message ?? "").slice(0, 300) });
       return;
     }
-    json(res, 200, { ok: true, amount: String(amount), address, detail: out.message ?? "" });
+    // rnode's shape first (deployId, amount in dust, to), then ours.
+    json(res, 200, { deployId: out.deployId ?? "", amount: Number(amount), to: address, ok: true, address, detail: out.message ?? "" });
   });
 
   return { server, admit };

@@ -16,10 +16,10 @@ const check = (label, cond, detail = "") => {
 
 let clock = 1_000_000;
 const sent = [];
-let sendResult = { ok: true, confirmed: true, message: "transfer ok" };
+let sendResult = { ok: true, confirmed: true, message: "transfer ok", deployId: "3045deadbeef" };
 const { server, admit } = createFaucetServer({
   send: async (a) => { sent.push(a); return sendResult; },
-  amount: 10n, fundingAddress: "1111faucet", rnode: "https://rnode.example", ipPerHour: 3, now: () => clock,
+  amount: 1_000_000_000n, amountRev: 10n, fundingAddress: "1111faucet", rnode: "https://rnode.example", ipPerHour: 3, now: () => clock,
 });
 await new Promise((r) => server.listen(0, "127.0.0.1", r));
 const base = `http://127.0.0.1:${server.address().port}`;
@@ -33,7 +33,7 @@ const D = "1111pJu4TJaJDNJDTinnftr2fcHvMfnDeTRXRzwgPfwuKmGMa5juj";
 // --- shape ------------------------------------------------------------------
 {
   const h = await call("/health");
-  check("/health answers with the faucet's terms, including which chain", h.status === 200 && h.body.amount === "10" && h.body.fundingAddress === "1111faucet" && h.body.rnode === "https://rnode.example", JSON.stringify(h.body));
+  check("/health answers with the faucet's terms, including which chain", h.status === 200 && h.body.amount === 1_000_000_000 && h.body.amountRev === "10" && h.body.fundingAddress === "1111faucet" && h.body.rnode === "https://rnode.example", JSON.stringify(h.body));
   const o = await call("/faucet", { method: "OPTIONS" });
   check("OPTIONS preflight is allowed (a wallet is a web page)", o.status === 204 && o.headers.get("access-control-allow-origin") === "*");
   const nf = await call("/nope");
@@ -46,24 +46,30 @@ const D = "1111pJu4TJaJDNJDTinnftr2fcHvMfnDeTRXRzwgPfwuKmGMa5juj";
 {
   const r = await post(A);
   check("POST /faucet grants", r.status === 200 && r.body.ok && r.body.address === A && sent.length === 1, JSON.stringify(r.body));
+  check("…in rnode's own shape: deployId, amount in dust, to", r.body.deployId === "3045deadbeef" && r.body.amount === 1_000_000_000 && r.body.to === A, JSON.stringify(r.body));
+  const viaApi = await call("/api/faucet", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ address: B }) });
+  check("POST /api/faucet — rnode's path — is the same endpoint", viaApi.status === 200 && viaApi.body.to === B && sent.length === 2, JSON.stringify(viaApi.body));
   const again = await post(A);
-  check("the same address again is 429 with a retryAfterMs", again.status === 429 && again.body.retryAfterMs > 0 && sent.length === 1, JSON.stringify(again.body));
+  check("the same address again is 429 with a retryAfterMs", again.status === 429 && again.body.retryAfterMs > 0 && sent.length === 2, JSON.stringify(again.body));
   clock += 24 * 3_600_000 + 1;
   const later = await post(A);
-  check("…and grants again once the day has passed", later.status === 200 && sent.length === 2);
+  check("…and grants again once the day has passed", later.status === 200 && sent.length === 3);
 }
 
 // --- the per-client hourly cap, and what a client is ------------------------
 {
   // Two grants from this client so far (A twice); the cap is 3 per hour, but
   // the first was over a day ago — only the second is inside the hour.
-  const r1 = await post(B); check("second distinct address inside the hour: granted", r1.status === 200);
-  const r2 = await post(C); check("third: granted (that's the cap)", r2.status === 200);
-  const r3 = await post(D); check("fourth distinct address from the same client is 429", r3.status === 429 && /client/.test(r3.body.error), JSON.stringify(r3.body));
-  const proxied = await post(D, { "x-forwarded-for": "203.0.113.9, 10.0.0.1" });
+  // Inside this hour so far: A's second grant (its first was a day ago) and
+  // B (granted through /api/faucet above, before the clock moved — a day ago
+  // too). So this hour holds one grant; the cap is 3.
+  const r1 = await post(C); check("second distinct address inside the hour: granted", r1.status === 200, JSON.stringify(r1.body));
+  const r2 = await post(D); check("third: granted (that's the cap)", r2.status === 200, JSON.stringify(r2.body));
+  const r3 = await post(D.replace(/.$/, "m")); check("fourth distinct address from the same client is 429", r3.status === 429 && /client/.test(r3.body.error), JSON.stringify(r3.body));
+  const proxied = await post(D.replace(/.$/, "m"), { "x-forwarded-for": "203.0.113.9, 10.0.0.1" });
   check("a different X-Forwarded-For hop is a different client — granted", proxied.status === 200, JSON.stringify(proxied.body));
   clock += 3_600_000 + 1;
-  const fresh = await post(D.replace(/.$/, "k") /* another address */);
+  const fresh = await post(D.replace(/.$/, "k") /* yet another address */);
   check("the hour passing frees the cap", fresh.status === 200, `status ${fresh.status}`);
 }
 
