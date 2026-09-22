@@ -22,6 +22,21 @@
 //   --no-stub       do not stub the identity urns (see stubIdentity below)
 //   --verbose       print each program and rnode's raw answer
 //
+// TIER 2 — `--tier 2`, needs a funded key:
+//
+//   node scripts/localnet/rgov-check.mjs --tier 2 --node https://rnodeapi.rhobot.net
+//
+// Tier 1 can only ask whether a script parses and reduces. Tier 2 installs
+// rgov's contract classes for real — signed deploys, phlo, blocks — and
+// records the registry uri each one returns, which is what every client action
+// needs before it can be run at all.
+//
+// It can do that remotely because of how rgov's classes are written: each one
+// ends with `deployId!(["#define $Name", uri])`, so the uri comes back in the
+// deploy's own result. rgov's own bootstrap instead greps the node's log for
+// `ReadcapURI` (bootstrap/deploy-all), which only works on the machine running
+// the node; the deployId path works from anywhere.
+//
 // Like macro-check.mjs, every case here is an EXPLORATORY deploy: unsigned,
 // free, no block, nothing written. Same two consequences, and they are SKIPS
 // rather than failures because neither is a defect in the script:
@@ -54,6 +69,9 @@ const VERBOSE = process.argv.includes("--verbose");
 // be reached unsigned (see stubIdentity). --no-stub reports them as skips
 // instead, which is the stricter, less informative reading.
 const STUB = !process.argv.includes("--no-stub");
+const TIER = Number(arg("--tier", "1"));
+const KEY_NAME = arg("--key-name", "alice");
+const PHLO = Number(arg("--phlo", "5000000"));
 
 const RAW = "https://raw.githubusercontent.com/rchain-community/rgov/master/";
 const CACHE = join(import.meta.dirname, ".rgov-cache");
@@ -190,6 +208,87 @@ const status = { ok: "ok       ", fail: "FAIL     ", skip: "skipped  ", miss: "m
 let pass = 0, fail = 0, skipped = 0, missing = 0;
 const findings = [];
 
+
+// ---------------------------------------------------------------------------
+// Tier 2 — install the classes, and learn their uris
+// ---------------------------------------------------------------------------
+
+/** Poll the deploy's own status for the result it sent to `rho:rchain:deployId`.
+ *  Externally tagged: ProcessedWithSuccess | ProcessedWithError | NotProcessed. */
+async function deployResult(sig, attempts = 20) {
+  for (let i = 0; i < attempts; i++) {
+    await new Promise((r) => setTimeout(r, 3000));
+    let j;
+    try { j = await (await fetch(`${NODE}/api/v1/deploy-status/${sig}`)).json(); } catch { continue; }
+    if (j?.ProcessedWithSuccess) return { ok: true, result: j.ProcessedWithSuccess.deployResult ?? [] };
+    if (j?.ProcessedWithError) return { ok: false, error: JSON.stringify(j.ProcessedWithError.deployError ?? j.ProcessedWithError).slice(0, 240) };
+  }
+  return { ok: false, error: "still not processed after 60s" };
+}
+
+async function tier2() {
+  const { DEFAULT_CONFIG, deployTerm } = await import("../qos-cli/rholang-client.mjs");
+  const keyLine = readFileSync(join(import.meta.dirname, "pk.txt"), "utf8")
+    .split("\n").find((l) => l.startsWith(`${KEY_NAME}=`));
+  if (!keyLine) { console.error(`no ${KEY_NAME}= in scripts/localnet/pk.txt`); process.exit(2); }
+  const cfg = { ...DEFAULT_CONFIG, url: NODE, key: keyLine.split("=")[1].trim(), phloLimit: PHLO };
+
+  console.log(`rgov-check (tier 2 — installing classes) — ${NODE}`);
+  console.log(`deploying as ${KEY_NAME}, phloLimit ${PHLO}\n`);
+
+  const uris = {};
+  let ok = 0, bad = 0;
+  for (const [name, path] of CLASSES) {
+    if (ONLY && !name.toLowerCase().includes(ONLY.toLowerCase())) continue;
+    const label = name.padEnd(18);
+    const src = await source(path);
+    if (src === null) { console.log(`${status.miss}${label}${path}`); bad++; continue; }
+
+    // Deployed as written — no stubbing. Tier 2 is the signed path, which is
+    // where deployId/deployerId actually exist.
+    const dep = await deployTerm(cfg, src, { waitAttempts: 0 }).catch((e) => ({ ok: false, message: String(e?.message ?? e) }));
+    if (!dep.ok) { console.log(`${status.fail}${label}${String(dep.message).slice(0, 160)}`); bad++; continue; }
+
+    const res = await deployResult(dep.sig);
+    if (!res.ok) { console.log(`${status.fail}${label}${res.error}`); bad++; continue; }
+
+    const blob = JSON.stringify(res.result);
+    const uri = blob.match(/rho:id:[a-z0-9]+/)?.[0];
+    const defined = blob.match(/#define \$(\w+)/)?.[1];
+    if (uri) {
+      uris[defined ?? name] = uri;
+      console.log(`${status.ok}${label}${defined ? "$" + defined + " " : ""}${uri}`);
+      ok++;
+    } else if (!/deployId\s*!/.test(src)) {
+      // It registers, but only ever tells the node's LOG. rgov's own bootstrap
+      // greps `ReadcapURI` out of the log for exactly this reason — which means
+      // the class can only be installed by someone sitting on the node. Adding
+      // one `deployId!(uri)` would make it installable by anyone; that is a
+      // redesign note, not a failure to run.
+      console.log(`${status.fail}${label}installed, but reports its uri only to stdout — unrecoverable off-node`);
+      findings.push({ kind: "class", name, verdict: "log-only-uri" });
+      bad++;
+    } else {
+      // It has a `deployId!(uri)` and still returned nothing, so something
+      // stopped it before that send. Reported, not diagnosed.
+      console.log(`${status.fail}${label}deployed; its deployId!(uri) never fired  ${blob.slice(0, 80)}`);
+      findings.push({ kind: "class", name, verdict: "silent" });
+      bad++;
+    }
+  }
+
+  const out = join(CACHE, "classes.json");
+  mkdirSync(CACHE, { recursive: true });
+  writeFileSync(out, JSON.stringify({ node: NODE, at: new Date().toISOString(), uris }, null, 2));
+  console.log(`\n${ok} installed, ${bad} failed — uris written to ${out}`);
+  if (ok) {
+    console.log("\nnext: the master contract directory, then the ~25 needs-bootstrap actions against these uris.");
+  }
+  process.exit(bad === 0 ? 0 : 1);
+}
+
+if (TIER === 2) await tier2();
+
 console.log(`rgov-check (tier 1 — no bootstrap${STUB ? ", identity stubbed" : ""}) — ${NODE}\n`);
 try {
   const s = await (await fetch(NODE + "/api/status")).json();
@@ -249,5 +348,5 @@ if (workarounds.length) {
   console.log(`\n${workarounds.length} carry possible #19/#21 workarounds (both bugs are fixed — these can likely be simplified):`);
   for (const w of workarounds) console.log(`  ${w.name.padEnd(24)}${w.hints.join(" · ")}`);
 }
-console.log("\ntier 2 (deploy the classes, then run the client actions) is not built yet.");
+console.log("\ntier 2 installs the classes: --tier 2 --node <url> (needs a funded key from pk.txt).");
 process.exit(fail === 0 ? 0 : 1);
