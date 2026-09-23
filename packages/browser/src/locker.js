@@ -37,6 +37,22 @@
  * right compartments, bind/resolve are isolated per identity (resolving another
  * identity's name returns Nil), and a granted facet writes exactly one key.
  *
+ * Re-verified 2026-09-23 against rnodeapi.rhobot.net with signed deploys, by
+ * `scripts/localnet/locker-check.mjs` — install, register, register again,
+ * bind, resolve, bob resolving alice's name (empty), read, grant, and an
+ * unknown verb: 9 of 9. That run exists because two things here were broken
+ * and neither showed up in a test that never left the browser:
+ *
+ *   - the call unwrapped a `(_, caps)` tuple from `rho:registry:lookup`, which
+ *     is the Scala shape. This node answers the BARE value, so every call fell
+ *     to the default branch and reported `["no locker at", uri]` for a locker
+ *     that was present and healthy.
+ *   - the answer went only to `return`, which the deploy wrapper forwards to
+ *     the key's registry result slot — and that slot is not written on every
+ *     node. Every verb now answers on `rho:rchain:deployId` as well.
+ *
+ * Both were found while building `rgov-core.js`, which hit the same two.
+ *
  * Two shape rules, and the first one is not a preference:
  *
  *   1. Every contract takes at least two parameters. A one-binder persistent
@@ -51,7 +67,8 @@
  */
 export const LOCKER_RHO = `new records, names,
     doRegister, doSetSelf, doAddCred, doRead, doBind, doResolve, doGrant,
-    insertArbitrary(\`rho:registry:insertArbitrary\`), ret
+    insertArbitrary(\`rho:registry:insertArbitrary\`),
+    deployId(\`rho:rchain:deployId\`), ret
 in {
   records!({}) | names!({}) |
 
@@ -136,11 +153,26 @@ const FACETS = `{
  */
 export function installProgram() {
   return LOCKER_RHO.replace("CAPS", `insertArbitrary!(${FACETS}, *ret) |
-  for (@uri <- ret) { return!(uri) }`);
+  for (@uri <- ret) { return!(uri) | deployId!(uri) }`);
 }
 
 /** A rholang string literal — JSON.stringify produces one. */
 const q = (s) => JSON.stringify(String(s));
+
+/**
+ * What `rho:registry:lookup` answers with, normalised.
+ *
+ * MEASURED, not assumed. On rchain-rust a lookup of an `insertArbitrary` value
+ * answers **the bare value**: `rec.keys().toList()` gives the facet names and
+ * matching it against `(_, caps)` reports "not a tuple". The Scala node's shape
+ * was the `(uri, value)` tuple this file used to unwrap — which meant every
+ * locker call here fell to its own default branch and reported
+ * `["no locker at", uri]` for a locker that was present and healthy.
+ *
+ * Both shapes are accepted and funnelled into one channel, so neither node's
+ * spelling is baked in. Found while building `rgov-core.js`, which does the same.
+ */
+const UNWRAP_LOOKUP = `match record { (_, c) => { capsCh!(c) } c => { capsCh!(c) } }`;
 
 /**
  * One locker call, as a complete program.
@@ -159,25 +191,38 @@ const q = (s) => JSON.stringify(String(s));
  */
 export function lockerCall(lockerUri, verb, args = []) {
   const extra = args.length ? ", " + args.join(", ") : "";
-  // `lookup` answers with the whole record the registry keeps for a uri.
-  // The facet is bound out of the map with `match` before it is called.
-  // Sending straight through the lookup — `@(caps.get("register"))!(…)` —
+  // The facet is bound out of the map BY A PATTERN and then quoted back to a
+  // name. Sending straight through the lookup — `@(caps.get("register"))!(…)` —
   // silently reaches nothing: a bundle taken from a map is not callable in
   // place, though the same bundle bound to a name is.
-  return `new lookup(\`rho:registry:lookup\`), deployerId(\`rho:rchain:deployerId\`), stored, ret in {
+  //
+  // The match is a pattern rather than a `.get`, because `.get` on something
+  // that is not a map is an error rather than a Nil, and what a lookup answers
+  // with is not the same on every node (see UNWRAP_LOOKUP). A map missing the
+  // verb, a tuple and an integer all fall to `_` here — verified on the node,
+  // along with the fact that a map pattern needs at least one key before its
+  // remainder (`{...rest}` alone is "expected variable, got Ellipsis").
+  return `new lookup(\`rho:registry:lookup\`), deployerId(\`rho:rchain:deployerId\`),
+    deployId(\`rho:rchain:deployId\`), stored, capsCh, ret in {
   lookup!(\`${lockerUri}\`, *stored) |
   for (@record <- stored) {
-    match record {
-      (_, caps) => {
-        match caps.get(${q(verb)}) {
-          Nil  => { return!(["no verb", ${q(verb)}]) }
-          verb => {
-            @verb!(*deployerId${extra}, *ret) |
-            for (@answer <- ret) { return!(answer) }
-          }
+    ${UNWRAP_LOOKUP} |
+    for (@caps <- capsCh) {
+      match caps {
+        {${q(verb)}: found, ..._} => {
+          @found!(*deployerId${extra}, *ret) |
+          // Both channels. \`return\` is what the deploy wrapper forwards to the
+          // key's registry result slot; \`deployId\` comes back inside the
+          // deploy's own status. The slot is not written on every node — a
+          // ProcessedWithSuccess deploy left it empty on the rebuilt playground,
+          // so a locker that worked perfectly reported nothing at all.
+          for (@answer <- ret) { return!(answer) | deployId!(answer) }
+        }
+        _ => {
+          return!(["no verb", ${q(verb)}, "at", ${q(lockerUri)}]) |
+          deployId!(["no verb", ${q(verb)}, "at", ${q(lockerUri)}])
         }
       }
-      _ => { return!(["no locker at", ${q(lockerUri)}]) }
     }
   }
 }`;
@@ -259,10 +304,18 @@ export function selftest() {
 
   const reg = registerProgram(URI, "1111alice");
   ok("register is well-formed", balanced(reg));
-  ok("register passes deployerId first", /!\(\*deployerId, "1111alice", \*ret\)/.test(reg), reg);
-  ok("register names the register facet", reg.includes('caps.get("register")'));
-  ok("the facet is bound before it is called", /match caps\.get\("register"\)/.test(reg) && /@verb!\(\*deployerId/.test(reg), reg.slice(-300));
-  ok("a call unwraps what lookup answers with", /match record \{\s*\(_, caps\)/.test(reg), reg.slice(0, 200));
+  ok("register passes deployerId first", /@found!\(\*deployerId, "1111alice", \*ret\)/.test(reg), reg);
+  ok("register names the register facet", reg.includes('{"register": found, ..._}'));
+  ok("the facet is bound before it is called",
+     /\{"register": found, \.\.\._\}/.test(reg) && /@found!\(\*deployerId/.test(reg), reg.slice(-300));
+  // Both shapes, because a lookup does not answer the same way on every node.
+  ok("a call accepts either shape lookup may answer with",
+     /match record \{ \(_, c\) => \{ capsCh!\(c\) \} c => \{ capsCh!\(c\) \} \}/.test(reg), reg.slice(0, 260));
+  ok("a call never uses .get on what lookup answered", !/caps\.get\(/.test(reg),
+     ".get on a non-map is an error, not a Nil");
+  ok("a call answers on both return and deployId",
+     /return!\(answer\) \| deployId!\(answer\)/.test(reg),
+     "the registry result slot is not written on every node");
 
   const bind = bindProgram(URI, "ballot", "rho:id:xyz");
   ok("bind carries name then uri", /!\(\*deployerId, "ballot", "rho:id:xyz", \*ret\)/.test(bind), bind);
