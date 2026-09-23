@@ -519,8 +519,11 @@ so the two do not drift.
 ### Deployment
 
 - **GitHub Pages**: auto-deploys on every push to `main` via `.github/workflows/pages.yml`
-- **Signaling server**: auto-deploys on every push to `main` via `render.yaml` (Render.com watches the repo)
-- No manual deploy steps needed
+- **Signaling server**: **redeployed by hand**, from the Render dashboard. `render.yaml` describes
+  the service but does not drive it — the running service was created by hand rather than from the
+  blueprint, so Render neither watches the repo for it nor reads that file (the same reason
+  `SIGNAL_RATE_LIMIT` in `render.yaml` is not what the service actually enforces). A push to `main`
+  therefore deploys Pages and nothing else; a signaling change is live only once somebody redeploys it.
 
 ### CI
 
