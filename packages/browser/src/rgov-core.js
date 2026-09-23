@@ -193,7 +193,29 @@ const INBOX_VERBS = `contract doSelf(@me, @verb, @args, ret) = {
         // message, so "from" cannot be forged even though the send is public.
         ["send", [to, tag, msg]] => {
           match s.getOrElse(to, {}).getOrElse(tag, Nil) {
-            Nil => { state!(s) | ret!(("gov-error", "no such locker", to, tag)) }
+            // Onboarding has to work in BOTH directions (requirement 5), so a
+            // first message to somebody who has never acted must not bounce —
+            // otherwise the push half of onboarding needs the pull half to have
+            // happened first, which is the chicken-and-egg rgov never escaped.
+            // A sender cannot call newLocker for somebody else (it is
+            // self-scoped), so the default locker is created here.
+            //
+            // ONLY the default tag. Any other tag is the owner's to make, or
+            // one sender could litter an identity with lockers it never wanted.
+            Nil => {
+              match tag == "inbox" {
+                false => { state!(s) | ret!(("gov-error", "no such locker", to, tag)) }
+                true  => {
+                  let @m <- msg.set("from", me) in {
+                    let @ty <- m.getOrElse("type", "") in {
+                      state!(s.set(to, s.getOrElse(to, {}).set(tag,
+                        {"policy": "open", "msgs": {ty: [m]}}))) |
+                      ret!(("sent", to, tag, ty, "locker created"))
+                    }
+                  }
+                }
+              }
+            }
             box => {
               match box.getOrElse("policy", "open") {
                 "invite" => { state!(s) | ret!(("gov-error", "invite-only locker", to, tag)) }
@@ -302,7 +324,7 @@ const INBOX_VERBS = `contract doSelf(@me, @verb, @args, ret) = {
     }
   } |`;
 
-export const INBOX_RHO = preamble("Inbox/1").replace("HELPERS\n", "").replace("VERBS", INBOX_VERBS);
+export const INBOX_RHO = preamble("Inbox/2").replace("HELPERS\n", "").replace("VERBS", INBOX_VERBS);
 
 // ---------------------------------------------------------------------------
 // 2. Group — the state the natives read
@@ -624,6 +646,27 @@ const ISSUE_VERBS = `contract doSelf(@me, @verb, @args, ret) = {
           }
         }
 
+        // The roll is a SNAPSHOT the opener supplies, and "open" is idempotent,
+        // so without this the electorate freezes at whoever had published a
+        // chain address the moment the issue was first pushed — and anyone who
+        // publishes one later could never cast. Opener-only, and refused once
+        // the issue is closed so an electorate cannot be edited after a vote.
+        ["setRoll", [iid, voters]] => {
+          match s.getOrElse(iid, Nil) {
+            Nil => { state!(s) | ownerIdx!(idx) | ret!(("gov-error", "no such issue", iid)) }
+            i => {
+              match [i.getOrElse("by", Nil) == me, i.getOrElse("status", "open") == "closed"] {
+                [false, _] => { state!(s) | ownerIdx!(idx) | ret!(("gov-error", "not the opener", iid)) }
+                [_, true]  => { state!(s) | ownerIdx!(idx) | ret!(("gov-error", "closed", iid)) }
+                _ => {
+                  state!(s.set(iid, i.set("voters", voters))) | ownerIdx!(idx) |
+                  ret!(("roll", iid, voters.keys().toList().length()))
+                }
+              }
+            }
+          }
+        }
+
         ["addOption", [iid, opt]] => {
           match s.getOrElse(iid, Nil) {
             Nil => { state!(s) | ownerIdx!(idx) | ret!(("gov-error", "no such issue", iid)) }
@@ -748,7 +791,7 @@ const ISSUE_VERBS = `contract doSelf(@me, @verb, @args, ret) = {
     }
   } |`;
 
-export const ISSUE_RHO = preamble("Issue/1")
+export const ISSUE_RHO = preamble("Issue/2")
   .replace("HELPERS\n", "")
   .replace("new state, ownerCh,", "new state, ownerIdx, ownerCh,")
   .replace("state!({}) |", "state!({}) | ownerIdx!({}) |")
@@ -907,6 +950,8 @@ export const openIssueProgram = (uri, iid, gid, title, mode, options, voters) =>
 export const castProgram      = (uri, iid, choices) => writeProgram(uri, "self", "cast", [q(iid), `[${choices.map(q).join(", ")}]`]);
 export const enrollProgram    = (uri, iid, addr) => writeProgram(uri, "self", "enroll", [q(iid), q(addr)]);
 export const closeIssueProgram = (uri, iid) => writeProgram(uri, "self", "close", [q(iid)]);
+export const setRollProgram = (uri, iid, voters) =>
+  writeProgram(uri, "self", "setRoll", [q(iid), `{${voters.map((v) => `${q(v)}: true`).join(", ")}}`]);
 export const ballotsOfProgram = (uri, iid) => readProgram(uri, "ballotsOf", [q(iid)]);
 export const issuesOfProgram  = (uri, gid) => readProgram(uri, "issuesOf", [q(gid)]);
 
@@ -989,6 +1034,15 @@ export function selftest() {
      "a non-consuming read of a vault of capabilities is the dangerous one");
   ok("Inbox: a locker indexes by type rather than scanning",
      /\.getOrElse\("msgs", \{\}\)\.getOrElse\(type, \[\]\)/.test(INBOX_RHO));
+  ok("Inbox: a first send creates the DEFAULT locker, so push-onboarding works",
+     /match tag == "inbox" \{/.test(INBOX_RHO) && /"sent", to, tag, ty, "locker created"/.test(INBOX_RHO),
+     "requirement 5 — neither direction of onboarding may require the other first");
+  ok("Inbox: only the default tag is auto-created",
+     /false => \{ state!\(s\) \| ret!\(\("gov-error", "no such locker", to, tag\)\) \}/.test(INBOX_RHO),
+     "or one sender could litter an identity with lockers it never wanted");
+  ok("Issue: the electorate can be refreshed after open",
+     /\["setRoll", \[iid, voters\]\]/.test(ISSUE_RHO) && /"gov-error", "closed", iid/.test(ISSUE_RHO),
+     "open is idempotent, so a roll set at first push would freeze the electorate");
   ok("Inbox: send stamps the sender and does not take it",
      /msg\.set\("from", me\)/.test(INBOX_RHO));
 

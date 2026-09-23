@@ -361,9 +361,9 @@ not free — but it is the difference between an address you can derive and one 
 
 [`packages/browser/src/rgov-core.js`](packages/browser/src/rgov-core.js) — the three contract
 sources, their install programs and every call-site builder, plain JS in the `locker.js` /
-`wrapped-token.js` shape. `node packages/browser/src/rgov-core.js --selftest` is **81/81** and runs
+`wrapped-token.js` shape. `node packages/browser/src/rgov-core.js --selftest` is **84/84** and runs
 in CI. The live half, `scripts/localnet/rgov-core-check.mjs`, installed all three on
-`rnodeapi.rhobot.net` and walked a scenario: **69 ok, 0 failed** across 3 identities.
+`rnodeapi.rhobot.net` and walked a scenario: **76 ok, 0 failed** across 3 identities.
 
 What that run actually established, beyond "it parses":
 
@@ -380,6 +380,9 @@ What that run actually established, beyond "it parses":
 | `enroll`'s bearer ballot | cast under **the guest's** address, not the enroller's |
 | bob calls `admin` | `("gov-error", "not the installer")` |
 | `load` over live state | `("gov-error", "not empty")` |
+| a first send to an identity that has **never acted** | `("sent", …, "locker created")` — the push half of onboarding does not need the pull half |
+| a first send to a **non-default** tag | `("gov-error", "no such locker", …)` — only `inbox` is auto-created |
+| the opener refreshes an issue's roll; a non-opener tries | `("roll", iid, 3)` / `("gov-error", "not the opener")` |
 | `ratingsOf` → `trustLevels` → `resolveWeights` → `tally` → `censure` | `{alice: 5, bob: 3}` → `{bob: 4}` → `"yes"` |
 
 That last row is the design working end to end, and the weights confirm the contracts match
@@ -402,9 +405,7 @@ established here; it is worth a look before anyone relies on `/rholang register|
    it holds** (see *Verified live* above), with the `Nil` guard as the one amendment it forced.
 2. ~~**`packages/browser/src/rgov-core.js`**~~ **Done** — 78/78 selftest, in CI.
 3. ~~**Deploy to the playground**~~ **Done** — `scripts/localnet/rgov-core-check.mjs`, 28/28 live.
-   Still owed: a scenario for the verbs the walk did not reach (`grantRead`/`grantSend`, `take`,
-   `setPolicy`, `censure`/`uncensure`, per-issue `delegate`, `enroll`'s ballot cap, `dump`/`load`),
-   and the negative case that needs a second installer — a non-installer calling `admin`.
+   Every verb is now covered, including the capability-delivery path end to end and the negatives.
 4. ~~**Wire `/gov`**~~ **Done** — `/gov chain` (`install` · `push` · `pull` · `inbox|group|issue
    <uri>`), carried between peers on the existing `group-meta` envelope, plus a self-signed
    `gov-chain` envelope for a member's own REV address. See
