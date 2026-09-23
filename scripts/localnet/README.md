@@ -52,7 +52,7 @@ a key nobody can read funds nobody. All of them were generated here — a
 facilitator faucet default to, and `alice`…`dave` for multi-party tests — and
 `wallet.txt` funds every one of them at genesis. They are worthless on any real
 network, and using any of them anywhere with value would hand it away. This is
-also the genesis for the dev instance at `https://rnodeapi.rhobot.net` (the
+also the genesis for the rholang playground at `https://rnodeapi.rhobot.net` (the
 browser's default rnode): bring it up with `run-node.sh --fresh` from these
 files and the same keys work there.
 

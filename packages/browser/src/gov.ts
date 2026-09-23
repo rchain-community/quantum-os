@@ -16,7 +16,25 @@ export type IssueStatus = "open" | "closed";
 // that survives across browsers — recorded so membership follows the *identity*,
 // not the ephemeral per-tab peerId. Optional for backward compatibility with
 // groups created before identity recovery; self-asserted when the member signs.
-export interface Member { peerId: string; role: Role; label: string; at: number; anchor?: string }
+// `revAddr` is the member's REV address, which is the id the ON-CHAIN
+// governance contracts key every row by (rgov-core.js derives it from the
+// caller's deployer id and never accepts it as an argument). A room knows
+// peerIds and dyncap anchors, not chain addresses, so a member who wants their
+// delegations and ratings mirrored on chain publishes theirs here — self-signed
+// and self-asserted, like `anchor`. Without it a delegation cannot be pushed,
+// because the delegate would have no on-chain name to point at.
+export interface Member { peerId: string; role: Role; label: string; at: number; anchor?: string; revAddr?: string }
+
+/**
+ * Where a group's on-chain governance lives: one registry uri per contract.
+ *
+ * Recorded rather than derived, exactly as `Group.uri` and `Group.locker` are —
+ * the deploy happened in someone's browser with someone's key, and only they
+ * can say where it landed. Three uris rather than one because the three
+ * contracts upgrade separately; a directory registration replaces this later
+ * with a single constant and three names.
+ */
+export interface ChainRefs { inbox?: string; group?: string; issue?: string }
 
 // A member's password-encrypted identity, replicated in the group so they can
 // recover it (with the password) by rejoining the group's room in a new browser.
@@ -56,6 +74,8 @@ export interface Group {
   // kudos (reputation) currency. The admin declares them; balances are bearer
   // notes held privately by each member.
   treasury?: string;
+  /** The group's on-chain governance contracts, if it has any. See ChainRefs. */
+  chain?: ChainRefs;
   // The group's on-chain record, if it has one: a registry URI written by
   // /rholang. A room is ephemeral and a registry entry is not, so this is the
   // group's durable name — the thing to look it up by after every browser here

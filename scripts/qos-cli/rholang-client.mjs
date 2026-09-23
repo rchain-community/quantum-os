@@ -21,11 +21,12 @@ import { blake2b } from "@noble/hashes/blake2.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 
 export const DEFAULT_CONFIG = {
-  // Matches the browser's default (packages/browser/src/rholang.ts). The
-  // faucet key (agent.mjs --key) is the localnet's genesis-funded deployer, so
-  // it only has REV here if this node's genesis was built from
-  // scripts/localnet/wallet.txt — the same "dev instance" assumption as before,
-  // just no longer pinned to loopback. Never point --key at a key with value.
+  // The rholang playground, matching the browser's default
+  // (packages/browser/src/rholang.ts) — not `testnet.rhobot.net`, which is a
+  // separate multi-validator chain. The faucet key (agent.mjs --key) is the
+  // localnet's genesis-funded deployer, so it only has REV on a chain whose
+  // genesis was built from scripts/localnet/wallet.txt. Never point --key at a
+  // key with value.
   url: "https://rnodeapi.rhobot.net",
   shard: "root",
   phloLimit: 500_000,

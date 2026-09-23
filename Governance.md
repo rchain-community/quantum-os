@@ -18,10 +18,10 @@ Membership, delegation, trust, censure, and vote tallying are all **off-chain**
 — a group and its liquid-democracy graph exist entirely as signed state its own
 peers hold and replicate, so who trusts whom and who delegated to whom is never
 public ledger data. Treasury and kudos ride `/note` (also off-chain, bearer
-tokens). The only optional touch of a chain is `/gov uri`/`/gov locker`, where
-an admin *records* (never derives) a URI or directory the group separately
-chose to deploy to — a pointer a group can add later, not a prerequisite for
-governing.
+tokens). A chain is optional and always additive: `/gov uri`/`/gov locker`
+*record* (never derive) a URI or directory the group separately chose to deploy
+to, and **`/gov chain`** mirrors a group onto the three governance contracts —
+pointers and records a group can add later, never a prerequisite for governing.
 
 ---
 
@@ -68,6 +68,16 @@ collective-intelligence findings.
 ---
 
 ## Why not run the `.rho` directly?
+
+> **The on-chain half is now built.** A 2026-09 audit of rgov's rholang found that four of the five
+> core governance capabilities — trust, delegation, tallying, censure — are already node powerbox
+> natives (`rho:gov:*`), leaving three contracts that hold nothing but durable state: **Inbox,
+> Group, Issue**. They are in [`rgov-core.js`](packages/browser/src/rgov-core.js), verified live, and
+> reachable from a room through **`/gov chain`** (below). They match the shapes on *this* page, not
+> rgov's 2021 ones. Design and evidence: **[RGov_Core.md](RGov_Core.md)**.
+>
+> Everything else on this page still runs off-chain and needs no node. The chain is where a group
+> records what it decided, not where it decides.
 
 rgov uses full RChain Rholang — persistent `contract`s, the RSpace tuplespace with
 `for`/COMM matching, pattern destructuring, the registry, `rho:` system processes
@@ -230,6 +240,40 @@ delegations and ballots. Overriding is just voting; delegation is revocable with
 `/gov undelegate`.
 
 ---
+
+## The group on chain — `/gov chain`
+
+Optional, additive, and off by default. A room decides; the chain is where a group *records* what
+it decided, for the readers who were not in the room and the browsers that have all since closed.
+
+The contracts are [`rgov-core.js`](packages/browser/src/rgov-core.js) — **Inbox, Group, Issue** —
+and they hold state and nothing else. The trust metric, delegation resolution, tallying and censure
+are node natives (`rho:gov:*`) that compute over what the contracts hold, which is why every read
+verb is named after the argument of the native it feeds. Full design: [RGov_Core.md](RGov_Core.md).
+
+| | |
+|---|---|
+| `/gov chain` | what the group has recorded, your chain address, how many members have published one |
+| `/gov chain install` | *(admin)* deploy Inbox, Group and Issue and record the three uris for everyone |
+| `/gov chain inbox\|group\|issue <uri>` | *(admin)* record one somebody already deployed |
+| `/gov chain push` | write **your own** rows: join, your delegation, your ratings, your censures |
+| `/gov chain pull` | report what the contracts hold — a report, never a merge |
+
+**Push is per-member by construction, not by policy.** `delegate`, `rate` and `censure` are `self`
+verbs on the contract: the caller's identity is *derived* inside it from their deployer id, so an
+admin cannot write a member's row and a member needs no admin to write their own. That is the same
+rule the room already follows for `gov-delegate`/`gov-trust`/`gov-censure` — self-signed only —
+arriving at the chain by a different road.
+
+**A member has to publish a chain address first.** The contracts key every row by REV address; a
+room knows peerIds and dyncap anchors. So `/gov chain push` publishes yours to the group as a
+self-signed `gov-chain` envelope, and skips — out loud — any delegation or rating whose *target*
+has not published one. Nothing is guessed: a delegation pointed at the wrong address would be a
+silent misdirection of a vote.
+
+**Pull reports rather than merges.** The room's state is live and the chain's is a record; silently
+overwriting the first with the second would make a stale contract the last word on a group that has
+since moved on.
 
 ## Scope
 

@@ -48,9 +48,13 @@ export interface NodeConfig {
 const CONFIG_KEY = "qos-rnode-config";
 
 export const DEFAULT_CONFIG: NodeConfig = {
-  // A public node, so /rholang works out of the box from the https deployment
-  // (no mixed-content block, no local rnode to run). `/rholang rnode <url>`
-  // still points at your own — e.g. http://127.0.0.1:40403 for a localnet.
+  // The **rholang playground** — a public, single-node dev chain that proposes
+  // on every deploy, so /rholang works out of the box from the https
+  // deployment (no mixed-content block, no local rnode to run). Deliberately
+  // NOT `testnet.rhobot.net`: that is a separate, multi-validator chain that
+  // only produces a block when a deploy arrives, and it is not the place to
+  // learn on. `/rholang rnode <url>` points at either, or at your own — e.g.
+  // http://127.0.0.1:40403 for a localnet.
   url: "https://rnodeapi.rhobot.net",
   shard: "root",
   phloLimit: 500_000,
@@ -700,6 +704,33 @@ export async function deployFate(cfg: NodeConfig, sig: string, depth = 12): Prom
         systemDeployError: hit.systemDeployError || undefined,
       };
     }
+  }
+  return null;
+}
+
+/**
+ * What a deploy answered on `rho:rchain:deployId`, read from its own status.
+ *
+ * The other way to read a deploy's answer is the key's registry result slot,
+ * which `readResults` uses and which the deploy wrapper writes through
+ * `insertSigned`. That path is not reliable everywhere: on the rebuilt
+ * playground a `ProcessedWithSuccess` deploy left the slot at `nonce: null`, so
+ * a program whose answer went only to `return` read back as nothing at all.
+ *
+ * This path has none of that in the way — the value comes back inside the
+ * deploy's own status, keyed by its signature, so it cannot be confused with
+ * another deploy's answer or lost to a slot that was never written. A program
+ * that wants to be read this way sends to `rho:rchain:deployId`; `rgov-core.js`
+ * sends to both.
+ */
+export async function deployAnswer(cfg: NodeConfig, sig: string, attempts = 20): Promise<string[] | null> {
+  for (let i = 0; i < attempts; i++) {
+    await new Promise((r) => setTimeout(r, 3000));
+    let j: unknown;
+    try { j = await getJson(cfg, `/api/v1/deploy-status/${sig}`); } catch { continue; }
+    const o = j as { ProcessedWithSuccess?: { deployResult?: unknown[] }; ProcessedWithError?: unknown };
+    if (o?.ProcessedWithError) return [renderExpr(o.ProcessedWithError)];
+    if (o?.ProcessedWithSuccess) return (o.ProcessedWithSuccess.deployResult ?? []).map(renderExpr);
   }
   return null;
 }
