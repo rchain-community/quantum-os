@@ -2888,7 +2888,16 @@ function runRholangProgram(mode: "eval" | "deploy", source: string): void {
             if (fate.systemDeployError) say(`     ${fate.systemDeployError}`);
             else say(`     no reason recorded — this node predates rchain-rust#15`);
           } else if (fate) {
-            say(`  it ran in block ${fate.blockNumber} but has not reported — /rholang read collects it whenever`);
+            // The registry result slot is not written on every node — a
+            // ProcessedWithSuccess deploy left it empty on the rebuilt
+            // playground, so a program that ran perfectly reported nothing. A
+            // program that also sends to `rho:rchain:deployId` (locker.js and
+            // rgov-core.js both do) carries its answer inside the deploy's own
+            // status, which is not subject to that. Ask there before reporting
+            // silence, and only then say it has not reported.
+            const direct = r.sig ? await deployAnswer(cfg, r.sig, 2).catch(() => null) : null;
+            if (direct?.length) for (const v of direct) say("  → " + v);
+            else say(`  it ran in block ${fate.blockNumber} but has not reported — /rholang read collects it whenever`);
           } else {
             say(`  not in a block yet — normal, this can take minutes. /rholang read collects it whenever; it waits on the name.`);
           }
