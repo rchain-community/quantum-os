@@ -295,15 +295,50 @@ did not earn.
 
 ## Naming, addressing, migration
 
-Each contract is deployed once and registered **by name** in the genesis directory through that
-name's own `grant` facet — per-name authority, not one all-powerful admin cap
-([`Directory.rho:22`](https://github.com/rchain-community/rgov)). A client holds one constant,
-`PORT_READ_CAP`, asks the directory for `"Inbox"`, and gets `{read, self}`.
+**The design wants names. The node does not currently allow them.** This section records what was
+measured on 2026-09-23, because the gap matters more than the intention.
 
-Upgrading is therefore: deploy v2, `dump` v1 through its `admin` facet, `load` into v2, re-point the
-name. **No client changes and no uri to redistribute** — which is requirement 3, and the reason no
-application needs to be frozen in genesis to be findable. A client that wants to pin a specific
-version pins the unforgeable it resolved instead of re-resolving the name.
+What works: `PORT_READ_CAP` **is the master directory's `read` facet**, and its two-argument form
+resolves a single name — `read("Inbox", ret)` answers a live capability. So a client really can hold
+one public constant and ask for a name, which is the whole point of the design.
+
+What does not: **that map is genesis content and nothing can be added to it.** Only `read` is
+published; the master's `write` and `grant` are held by whoever built genesis and are reachable from
+nowhere. So a deployed contract cannot be registered under a name by its installer.
+
+### `Directory` is a factory, not a directory
+
+The `Directory` entry in the genesis map is `bundle+{*directory}`, and
+[`Directory.rho`](https://github.com/rchain-community/rchain-rust/blob/dev/casper/src/genesis/resources/rgov/Directory.rho)
+opens a fresh `new mapCh, read, write, grant in { mapCh!({}) … }` on **every call**. So calling it
+mints a brand-new empty directory with its own `{read, write, grant}`.
+
+That is easy to misread as an unrestricted global registry, and it was misread here: granting a key
+and writing to it succeeds, reports `"added"`, and changes nothing anybody else can see. Measured
+directly — write into instance A, read the same key from instance B: `Nil`. The write went into a
+throwaway. **There is no open write path to the shared namespace; there is no write path at all.**
+
+A group *can* mint its own directory, and `directory(ParentReadCap, capabilities)` chains reads to a
+parent, which is clearly the intended shape for a namespace. But the new directory's `read` cap is
+an unforgeable, and an unforgeable has no source syntax — it cannot be written down in a room,
+stored, and resolved again next week. Publishing it means `insertArbitrary`, which mints a uri.
+
+### So, uris — for now, and under protest
+
+`/gov chain` records one uri per contract. That is the rgov failure mode this audit set out to
+remove: an address that must be handed around out of band, with no migration path. It is what the
+node currently permits.
+
+**What the node owes this design**, and the one upstream ask that unblocks it: a *restricted* grant
+on the master directory — per-name authority, so a name's owner can write it and nobody else can.
+With that, registration replaces every uri here, upgrading becomes "deploy v2, `dump`, `load`,
+re-point the name", and requirement 3's migration story falls out. `rho:gov:directory` as a
+powerbox name would do the same job.
+
+Until then a client that wants a stable address has one other option worth noting: `insertSigned`,
+whose uri is **derived from a public key** and so is computable rather than communicated. It is one
+slot per key, and it collides with the slot a deploy's answer goes to (see `locker.js`), so it is
+not free — but it is the difference between an address you can derive and one you must be told.
 
 ## What is deliberately absent
 

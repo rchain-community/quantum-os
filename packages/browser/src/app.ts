@@ -3730,7 +3730,10 @@ function handleCommand(raw: string): string[] {
           break;
         }
 
-        if (verb === "inbox" || verb === "group" || verb === "issue") {
+        // `inbox|group|issue <uri>` records a contract. Bare `inbox` is the
+        // receive verb below, so this branch requires the argument rather than
+        // swallowing the word.
+        if ((verb === "inbox" || verb === "group" || verb === "issue") && parts.length > 1) {
           const want = parts.slice(1).join(" ").trim();
           if (!isAdmin(g, meId, meAnchor)) { sys("only an admin records the group's contracts"); whoIsAdmin(g, meId, meAnchor, sys); break; }
           if (!looksLikeRegistryUri(want)) { sys(`not a registry URI: ${want}`); break; }
@@ -3808,6 +3811,28 @@ function handleCommand(raw: string): string[] {
               const to = addrOf(target);
               if (to) steps.push([`censure ${peerLabel(target)}`, rgov.censureProgram(refs.group!, g.id, to)]);
             }
+            // Issues and ballots, if the group has an Issue contract. An issue is
+            // opened by whoever opened it in the room, and a ballot is cast by
+            // whoever cast it — the same self-only rule as everything above, and
+            // for the same reason: `open` records `by` from the derived address
+            // and `cast` keys the ballot by it, so neither can be done on
+            // somebody else's behalf however much an admin might want to.
+            if (refs.issue) {
+              const roll = Object.values(g.members).map((m) => m.revAddr).filter((a): a is string => !!a);
+              for (const iss of g.issues) {
+                const poll = iss.pollId ? pollStore.get(iss.pollId) : undefined;
+                const opts = poll ? poll.options.map((o) => o.id) : [];
+                if (iss.by === (mine ?? meId)) {
+                  steps.push([`open issue “${iss.title}”`,
+                    rgov.openIssueProgram(refs.issue!, iss.id, g.id, iss.title,
+                      poll?.method === "ranked" ? "ranked" : "approval", opts, roll)]);
+                }
+                const myBallot = poll?.ballots?.[mine ?? meId];
+                if (myBallot?.length) {
+                  steps.push([`ballot on “${iss.title}”`, rgov.castProgram(refs.issue!, iss.id, myBallot)]);
+                }
+              }
+            }
             addMessage("", `pushing ${steps.length} row${steps.length === 1 ? "" : "s"}, one deploy each…`, "system");
             for (const [what, program] of steps) {
               const r = await deployTerm(cfg, program);
@@ -3839,13 +3864,67 @@ function handleCommand(raw: string): string[] {
             await one("delegations", rgov.delegationsOfProgram(refs.group!, g.id, null));
             await one("ratings", rgov.ratingsOfProgram(refs.group!, g.id));
             await one("censures", rgov.censuresOfProgram(refs.group!, g.id));
-            if (refs.issue) await one("issues", rgov.issuesOfProgram(refs.issue, g.id));
+            if (refs.issue) {
+              await one("issues", rgov.issuesOfProgram(refs.issue, g.id));
+              // The ballots are the authoritative state on chain; a result is
+              // only ever a claim about them (see RGov_Core.md). Show a few
+              // rather than every one, so a long-lived group still prints.
+              for (const iss of g.issues.slice(0, 5)) {
+                await one(iss.id.slice(0, 12), rgov.ballotsOfProgram(refs.issue!, iss.id));
+              }
+            }
             say("  (a report, not a merge — the room's own state is untouched)");
           })();
           break;
         }
 
-        sys("usage: /gov chain · install · push · pull · inbox|group|issue <uri>");
+        // The inbox is the one part of this that is not a mirror of room state.
+        // A room message is already replicated among the peers who were there;
+        // an on-chain locker is for what must reach somebody who was NOT —
+        // and, because a message body may be a capability, for handing over
+        // authority rather than text. Hence send/receive rather than /gov say.
+        if (verb === "send" || verb === "inbox") {
+          if (!refs.inbox) { sys("no inbox contract — an admin: /gov chain install"); break; }
+          if (!cfg.key) { sys("no key — /rholang key generate first"); break; }
+          if (verb === "inbox") {
+            sys("opening your locker if needed, then receiving…");
+            void (async () => {
+              const seq: [string, string][] = [
+                ["locker", rgov.newLockerProgram(refs.inbox!, "inbox", "open")],
+                ["receive", rgov.receiveProgram(refs.inbox!, "inbox")],
+              ];
+              for (const [what, program] of seq) {
+                const r = await deployTerm(cfg, program);
+                if (!r.ok || !r.sig) { addMessage("", `✗ ${what}: ${r.message}`, "system"); return; }
+                const answer = await deployAnswer(cfg, r.sig);
+                addMessage("", `  ${what}: ${(answer ?? ["(no answer)"]).join(" ")}`, "system");
+              }
+              // `receive` CONSUMES. That is the point — a capability read twice
+              // by two readers who each think they hold it is the bug an inbox
+              // of capabilities must not have — but it means the lines above are
+              // the only copy, so say so rather than let it surprise anyone.
+              addMessage("", "  (receive consumes — what printed above is no longer in the locker)", "system");
+            })();
+            break;
+          }
+          const who = parts[1] ?? "";
+          const text = parts.slice(2).join(" ");
+          if (!who || !text) { sys("usage: /gov chain send <peer> <message>"); break; }
+          const pid = findPeerByName(who) ?? who;
+          const k = memberKeyFor(g, pid, meAnchor);
+          const to = k ? g.members[k].revAddr : undefined;
+          if (!to) { sys(`no chain address for ${who} — they run /gov chain push first`); break; }
+          void (async () => {
+            const msg = `{"type": "msg", "body": ${JSON.stringify(text)}}`;
+            const r = await deployTerm(cfg, rgov.sendProgram(refs.inbox!, to, "inbox", msg));
+            if (!r.ok || !r.sig) { addMessage("", `✗ ${r.message}`, "system"); return; }
+            const answer = await deployAnswer(cfg, r.sig);
+            addMessage("", `  ${(answer ?? ["(no answer)"]).join(" ")}`, "system");
+          })();
+          break;
+        }
+
+        sys("usage: /gov chain · install · push · pull · inbox · send <peer> <msg> · inbox|group|issue <uri>");
         break;
       }
       if (gsub === "say") {
