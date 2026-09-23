@@ -24,9 +24,13 @@ import { tally, liveCounts, summarizeWinners, optionId, sortedOptions,
 import { canonLemma, parseRefTokens, parseLemmaDecl, splitLemmaNameArg } from "./lemma-parse.js";
 import { issueId, isMember, isAdmin, memberLabel, findIssue, resolveWeights, delegatorsOf,
          delegationMapFor, trustWeightsFor, trustLevels, discreditedMembers, TRUST_MAX, govCurrency,
-         rekeyMember, type Group, type Issue, type Role, type VaultRecord } from "./gov.js";
+         rekeyMember, memberKeyFor, type Group, type Issue, type Role, type VaultRecord,
+         type ChainRefs } from "./gov.js";
 import { installProgram, registerProgram, bindProgram, resolveProgram,
          readProgram, grantProgram } from "./locker.js";
+// The three on-chain governance contracts. `readProgram` is already taken by
+// the locker's, so rgov-core's call-site builders come in under a namespace.
+import * as rgov from "./rgov-core.js";
 import { parseDefinition, parseInvocation, expandCommand, expandCallSites,
          formatDefinition, findMacros, bodyKind, MacroError,
          MACRO_NAME_RE, MAX_BODY } from "./macro-lang.js";
@@ -47,7 +51,7 @@ import { loadConfig as loadNodeConfig, saveConfig as saveNodeConfig, describeCon
          generateKey as generateDeployKey, revAddressOf, nodeStatus, evalTerm, deployTerm,
          readResultsFresh, readName, deployFate, wrapProgram, powerboxNames, powerboxSpec,
          registryUriOf, powerboxUsed, DEFAULT_CONFIG as DEFAULT_NODE_CONFIG,
-         readResult, readResultRecord, syncResultNonce,
+         readResult, readResultRecord, syncResultNonce, deployAnswer,
          type NodeConfig } from "./rholang.js";
 import { qucalcSearch, qucalcSolve,
          type SearchDone as QucalcSearchDone } from "./qucalc-search.js";
@@ -3653,6 +3657,146 @@ function handleCommand(raw: string): string[] {
         sys(`📇 ${g.name} on chain: ${want}  — every member now has it; /rholang read ${want} to fetch it`);
         break;
       }
+      if (gsub === "chain") {
+        // The group's governance on chain (RGov_Core.md). Three contracts that
+        // hold state and nothing else — the trust metric, delegation, tallying
+        // and censure are node natives that compute over what they hold.
+        const parts = grest.trim().split(/\s+/).filter(Boolean);
+        const verb = (parts[0] ?? "").toLowerCase();
+        const cfg = loadNodeConfig();
+        const refs = g.chain ?? {};
+        const myAddr = cfg.key ? revAddressOf(cfg.key) : undefined;
+
+        if (!verb) {
+          sys(`${g.name} on chain:`);
+          for (const k of ["inbox", "group", "issue"] as const) {
+            sys(`  ${k.padEnd(6)} ${refs[k] ?? "— not recorded"}`);
+          }
+          sys(myAddr ? `  you are ${myAddr}` : "  you have no deploy key — /rholang key generate");
+          const known = Object.values(g.members).filter((m) => m.revAddr).length;
+          sys(`  ${known}/${Object.keys(g.members).length} members have published a chain address`);
+          sys("  /gov chain install · push · pull · <inbox|group|issue> <uri>");
+          break;
+        }
+
+        if (verb === "inbox" || verb === "group" || verb === "issue") {
+          const want = parts.slice(1).join(" ").trim();
+          if (!isAdmin(g, meId)) { sys("only an admin records the group's contracts"); break; }
+          if (!looksLikeRegistryUri(want)) { sys(`not a registry URI: ${want}`); break; }
+          g.chain = { ...refs, [verb]: want };
+          saveGroups(); refreshGroupCard(g);
+          signedBroadcast({ kind: "group-meta", groupId: g.id, chain: g.chain });
+          sys(`📇 ${g.name}'s ${verb} contract: ${want}`);
+          break;
+        }
+
+        if (verb === "install") {
+          if (!isAdmin(g, meId)) { sys("only an admin installs the group's contracts"); break; }
+          if (!cfg.key) { sys("no key — /rholang key generate first"); break; }
+          sys("installing Inbox, Group and Issue — three deploys, one each…");
+          sys("  each uri is minted by the registry, so it comes back as that deploy's answer");
+          void (async () => {
+            const jobs: [keyof ChainRefs, string][] = [
+              ["inbox", rgov.installInboxProgram()],
+              ["group", rgov.installGroupProgram()],
+              ["issue", rgov.installIssueProgram()],
+            ];
+            const found: ChainRefs = {};
+            for (const [which, program] of jobs) {
+              const r = await deployTerm(cfg, program);
+              if (!r.ok || !r.sig) { addMessage("", `✗ ${which}: ${r.message}`, "system"); return; }
+              const answer = await deployAnswer(cfg, r.sig);
+              const uri = (answer ?? []).join(" ").match(/rho:id:[a-z0-9]+/)?.[0];
+              if (!uri) { addMessage("", `✗ ${which}: deployed, but no uri came back`, "system"); return; }
+              found[which] = uri;
+              addMessage("", `✓ ${which} at ${uri}`, "system");
+            }
+            const gg = groupStore.get(g.id); if (!gg) return;
+            gg.chain = { ...gg.chain, ...found };
+            saveGroups(); refreshGroupCard(gg);
+            signedBroadcast({ kind: "group-meta", groupId: gg.id, chain: gg.chain });
+            addMessage("", `📇 ${gg.name}'s governance is on chain — members: /gov chain push`, "system");
+          })();
+          break;
+        }
+
+        if (verb === "push") {
+          // What a push can and cannot do is the design showing through, not a
+          // limitation: `delegate`, `rate` and `censure` are SELF verbs, so an
+          // admin cannot push a member's rows and a member does not need one to
+          // push their own. Everybody pushes themselves; an admin additionally
+          // creates the group, because somebody has to.
+          if (!refs.group) { sys("no group contract — an admin: /gov chain install"); break; }
+          if (!cfg.key) { sys("no key — /rholang key generate first"); break; }
+          if (!isMember(g, meId)) { sys("only members push"); break; }
+          const mine = memberKeyFor(g, meId);
+          if (mine && g.members[mine].revAddr !== myAddr && myAddr) {
+            g.members[mine].revAddr = myAddr; saveGroups();
+            signedBroadcast({ kind: "gov-chain", groupId: g.id, member: meId, revAddr: myAddr });
+            sys(`published your chain address to the group: ${myAddr}`);
+          }
+          const addrOf = (pid: string): string | undefined => {
+            const k = memberKeyFor(g, pid); return k ? g.members[k].revAddr : undefined;
+          };
+          void (async () => {
+            const steps: [string, string][] = [];
+            if (isAdmin(g, meId)) steps.push(["create the group", rgov.createGroupProgram(refs.group!, g.id, g.name, "open")]);
+            steps.push(["join", rgov.joinGroupProgram(refs.group!, g.id, memberLabel(g, meId))]);
+            const del = g.delegations[mine ?? meId];
+            if (del) {
+              const to = addrOf(del.delegate);
+              if (to) steps.push([`delegate to ${peerLabel(del.delegate)}`, rgov.delegateProgram(refs.group!, g.id, to, null)]);
+              else addMessage("", `  skipping your delegation — ${peerLabel(del.delegate)} has not published a chain address`, "system");
+            }
+            for (const [ratee, lvl] of Object.entries(g.trustRatings?.[mine ?? meId] ?? {})) {
+              const to = addrOf(ratee);
+              if (to) steps.push([`rate ${peerLabel(ratee)} ${lvl}`, rgov.rateProgram(refs.group!, g.id, to, lvl)]);
+              else addMessage("", `  skipping your rating of ${peerLabel(ratee)} — no chain address published`, "system");
+            }
+            for (const target of Object.keys(g.censures?.[mine ?? meId] ?? {})) {
+              const to = addrOf(target);
+              if (to) steps.push([`censure ${peerLabel(target)}`, rgov.censureProgram(refs.group!, g.id, to)]);
+            }
+            addMessage("", `pushing ${steps.length} row${steps.length === 1 ? "" : "s"}, one deploy each…`, "system");
+            for (const [what, program] of steps) {
+              const r = await deployTerm(cfg, program);
+              if (!r.ok || !r.sig) { addMessage("", `✗ ${what}: ${r.message}`, "system"); return; }
+              const answer = await deployAnswer(cfg, r.sig);
+              addMessage("", `  ${what}: ${(answer ?? ["(no answer)"]).join(" ")}`, "system");
+            }
+            addMessage("", "✓ pushed — /gov chain pull to read it back", "system");
+          })();
+          break;
+        }
+
+        if (verb === "pull") {
+          // Read-only, and it REPORTS rather than merges: the chain is one
+          // record of what the group decided, not an authority over the room's
+          // own state, and silently overwriting a live group with it would make
+          // a stale contract the last word.
+          if (!refs.group) { sys("no group contract recorded"); break; }
+          sys(`reading ${g.name} from ${refs.group}…`);
+          void (async () => {
+            const say = (l: string) => addMessage("", l, "system");
+            const one = async (label: string, program: string) => {
+              const r = await evalTerm(cfg, program);
+              say(`  ${label.padEnd(14)} ${r.values.length ? r.values.join(" | ") : "—"}`);
+              return r;
+            };
+            await one("members", rgov.readProgram(refs.group!, "membersOf", [JSON.stringify(g.id)]));
+            await one("admins", rgov.adminsOfProgram(refs.group!, g.id));
+            await one("delegations", rgov.delegationsOfProgram(refs.group!, g.id, null));
+            await one("ratings", rgov.ratingsOfProgram(refs.group!, g.id));
+            await one("censures", rgov.censuresOfProgram(refs.group!, g.id));
+            if (refs.issue) await one("issues", rgov.issuesOfProgram(refs.issue, g.id));
+            say("  (a report, not a merge — the room's own state is untouched)");
+          })();
+          break;
+        }
+
+        sys("usage: /gov chain · install · push · pull · inbox|group|issue <uri>");
+        break;
+      }
       if (gsub === "say") {
         if (!isMember(g, meId)) { sys("only members can post to the group"); break; }
         if (!grest) { sys("usage: /gov say <message>"); break; }
@@ -3660,7 +3804,7 @@ function handleCommand(raw: string): string[] {
         addMessage("", `🏛 ${g.name}: ${grest}`, "self");
         break;
       }
-      sys("usage: /gov new <name> · show <name> · member add|remove <peer> · issue <title> · delegate <peer> [on <issue>] · undelegate [on <issue>] · vote <issue> | opts [ranked] · treasury declare|grant <m> <n>|balance · kudos <m> <n>|balance · say <msg> · status · list");
+      sys("usage: /gov new <name> · show <name> · member add|remove <peer> · issue <title> · delegate <peer> [on <issue>] · undelegate [on <issue>] · vote <issue> | opts [ranked] · treasury declare|grant <m> <n>|balance · kudos <m> <n>|balance · say <msg> · chain · status · list");
       break;
     }
 
@@ -7709,7 +7853,24 @@ async function connect(): Promise<void> {
           if (typeof d.kudos === "string") g.kudos = d.kudos;
           if (typeof d.uri === "string" && looksLikeRegistryUri(d.uri)) g.uri = d.uri;
           if (typeof d.locker === "string" && looksLikeRegistryUri(d.locker)) g.locker = d.locker;
+          if (d.chain && typeof d.chain === "object") g.chain = { ...g.chain, ...sanitizeChain(d.chain as Record<string, unknown>) };
           saveGroups(); renderGroups(); refreshGroupCard(g);
+          return;
+        }
+        // A member's own REV address — the id the on-chain contracts key by.
+        // Self-signed only: nobody publishes somebody else's chain identity,
+        // and a wrong one would silently misdirect a delegation.
+        if (d.kind === "gov-chain") {
+          const status = await verifyDyncapIfPresent(from, d); setActiveRoom(ctx);
+          if (status.startsWith("  · refused")) return;
+          const g = groupStore.get(String(d.groupId ?? ""));
+          const who = String(d.member ?? from);
+          if (!g || from !== who || !isMember(g, who)) return;
+          const addr = String(d.revAddr ?? "");
+          const key = memberKeyFor(g, who);
+          if (!key || !/^1111[1-9A-HJ-NP-Za-km-z]{20,60}$/.test(addr)) return;
+          g.members[key].revAddr = addr;
+          saveGroups(); refreshGroupCard(g);
           return;
         }
         if (d.kind === "gov-delegate") {
@@ -8731,12 +8892,27 @@ function looksLikeRegistryUri(s: string): boolean {
   return /^rho:id:[a-z0-9]{40,60}$/.test(s.trim());
 }
 
+/**
+ * The three contract uris a group may carry, keeping only what is actually a
+ * registry uri. Everything here arrives from a peer, so every field is checked
+ * on the way in — a bad uri would send a member's delegation to a contract that
+ * is not the group's, and nothing downstream would notice.
+ */
+function sanitizeChain(raw: Record<string, unknown>): ChainRefs {
+  const out: ChainRefs = {};
+  for (const k of ["inbox", "group", "issue"] as const) {
+    const v = raw[k];
+    if (typeof v === "string" && looksLikeRegistryUri(v)) out[k] = v.trim();
+  }
+  return out;
+}
+
 function mergeGroupFromSync(raw: unknown): boolean {
   if (!raw || typeof raw !== "object") return false;
   const r = raw as Record<string, unknown>;
   const id = String(r.id ?? "");
   if (!id || isRetracted("group", id)) return false;
-  const inMembers = (r.members && typeof r.members === "object") ? r.members as Record<string, { peerId?: string; role?: string; label?: string; at?: number; anchor?: string }> : {};
+  const inMembers = (r.members && typeof r.members === "object") ? r.members as Record<string, { peerId?: string; role?: string; label?: string; at?: number; anchor?: string; revAddr?: string }> : {};
   const inVaults = (r.vaults && typeof r.vaults === "object") ? r.vaults as Record<string, { handle?: string; anchor?: string; blob?: string; at?: number }> : {};
   const inDeleg = (r.delegations && typeof r.delegations === "object") ? r.delegations as Record<string, { delegate?: string; at?: number }> : {};
   const inTopic = (r.topicDelegations && typeof r.topicDelegations === "object") ? r.topicDelegations as Record<string, Record<string, { delegate?: string; at?: number }>> : {};
@@ -8761,6 +8937,7 @@ function mergeGroupFromSync(raw: unknown): boolean {
       ...(typeof r.kudos === "string" ? { kudos: r.kudos } : {}),
       ...(typeof r.uri === "string" && looksLikeRegistryUri(r.uri) ? { uri: r.uri } : {}),
       ...(typeof r.locker === "string" && looksLikeRegistryUri(r.locker) ? { locker: r.locker } : {}),
+      ...(r.chain && typeof r.chain === "object" ? { chain: sanitizeChain(r.chain as Record<string, unknown>) } : {}),
       ...(Object.keys(vaults).length ? { vaults } : {}), issues,
     });
     return true;
@@ -8771,12 +8948,22 @@ function mergeGroupFromSync(raw: unknown): boolean {
   if (typeof r.kudos === "string" && !existing.kudos) { existing.kudos = r.kudos; changed = true; }
   if (typeof r.uri === "string" && looksLikeRegistryUri(r.uri) && !existing.uri) { existing.uri = r.uri; changed = true; }
   if (typeof r.locker === "string" && looksLikeRegistryUri(r.locker) && !existing.locker) { existing.locker = r.locker; changed = true; }
+  if (r.chain && typeof r.chain === "object") {
+    const inc = sanitizeChain(r.chain as Record<string, unknown>);
+    for (const k of ["inbox", "group", "issue"] as const) {
+      if (inc[k] && !existing.chain?.[k]) { existing.chain = { ...existing.chain, [k]: inc[k] }; changed = true; }
+    }
+  }
   for (const [pid, m] of Object.entries(inMembers)) {
     const cur = existing.members[pid];
     const at = typeof m.at === "number" ? m.at : 0;
     const anchor = typeof m.anchor === "string" && m.anchor.length === 64 ? m.anchor : undefined;
-    if (!cur || at > cur.at) { existing.members[pid] = { peerId: pid, role: m.role === "admin" ? "admin" : "member", label: String(m.label ?? pid.slice(0, 8)), at, ...((anchor ?? cur?.anchor) ? { anchor: anchor ?? cur?.anchor } : {}) }; changed = true; }
-    else if (anchor && !cur.anchor) { cur.anchor = anchor; changed = true; }   // stamp a newly-learned anchor without a full replace
+    const revAddr = typeof m.revAddr === "string" && /^1111[1-9A-HJ-NP-Za-km-z]{20,60}$/.test(m.revAddr) ? m.revAddr : undefined;
+    if (!cur || at > cur.at) { existing.members[pid] = { peerId: pid, role: m.role === "admin" ? "admin" : "member", label: String(m.label ?? pid.slice(0, 8)), at, ...((anchor ?? cur?.anchor) ? { anchor: anchor ?? cur?.anchor } : {}), ...((revAddr ?? cur?.revAddr) ? { revAddr: revAddr ?? cur?.revAddr } : {}) }; changed = true; }
+    else {
+      if (anchor && !cur.anchor) { cur.anchor = anchor; changed = true; }   // stamp a newly-learned anchor without a full replace
+      if (revAddr && !cur.revAddr) { cur.revAddr = revAddr; changed = true; }
+    }
   }
   // Union vaults (LWW by `at`; same-anchor overwrite only — squat-proof).
   for (const [h, v] of Object.entries(inVaults)) {

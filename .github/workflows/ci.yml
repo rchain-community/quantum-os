@@ -96,6 +96,15 @@ jobs:
       - name: rgov substitution selftest
         run: node packages/browser/src/rgov-apply.js --selftest
 
+      # The three governance contracts (Inbox, Group, Issue). Checks the half
+      # that ships: sources well-formed, the invariants the design rests on
+      # (one state cell, the Nil identity guard, privilege as data rather than
+      # the installer's capability, a read facet that answers no message body),
+      # and call sites that cannot carry an argument out of position. The live
+      # half is scripts/localnet/rgov-core-check.mjs, which needs a chain.
+      - name: rgov core contracts selftest
+        run: node packages/browser/src/rgov-core.js --selftest
+
       # The room key and hashed room id (room-crypto.js) — the one file the
       # browser and the Node agents both run, so one derivation, not two.
       - name: Room crypto selftest

@@ -1,0 +1,391 @@
+# rgov core — the three contracts
+
+**Built and verified.** [`packages/browser/src/rgov-core.js`](packages/browser/src/rgov-core.js),
+81/81 selftest in CI, 69/69 live on the playground, reachable from a room through `/gov chain`.
+This is the design and the evidence for it, written after an audit established that most of what
+rgov does on-chain either belongs to the node or belongs nowhere.
+
+## Why only three
+
+The core governance capabilities are **inbox send/receive, groups, issues, delegation, trust
+metric**. Four of those five are already the node's, probed live on `rnodeapi.rhobot.net`:
+
+| powerbox | bound? | what it is |
+|---|---|---|
+| `rho:gov:trustLevels` | **yes** | the trust metric — admin-rooted fixed point |
+| `rho:gov:resolveWeights` | **yes** | delegation, resolved transitively |
+| `rho:gov:tally` | **yes** | weighted approval / ranked-choice counting |
+| `rho:gov:censure` | **yes** | ⅔-quorum accountability with voucher slashing |
+| `rho:gov:delegate` · `:inbox` · `:group` · `:issue` | no | — |
+
+So delegation is **not a contract**: it is a *record* (who delegates to whom) plus a function the
+node already computes over it. The same is true of trust, tallying and censure. What is left to
+build is **durable state**, and there are exactly three kinds of it:
+
+1. **Inbox** — the capability vault. Messages carry authority, so this is the security-critical one.
+2. **Group** — membership, roles, delegations, ratings, censures.
+3. **Issue** — proposals, options, ballots, status.
+
+The resulting shape: **state in contracts, computation native, naming in the genesis directory.**
+
+**The semantics are already specified and in production off-chain.**
+[`packages/browser/src/gov.ts`](packages/browser/src/gov.ts) implements them for the room
+(`Member`, `Delegation`, `Issue`, `resolveWeights`, `trustLevels`, `trustWeightsFor`,
+`TRUST_MAX = 5`). The on-chain core matches **those** shapes — not rgov's 2021 versions, of which
+10 of 28 client actions answer at all and six do not parse.
+
+## The one interface rule
+
+> **Every verb on a read facet is named after the argument of the native it feeds.**
+
+`Group.ratingsOf` returns exactly `trustLevels`' first argument. `Group.adminsOf` returns its
+second. `Group.delegationsOf(g, issue)` returns `resolveWeights`' second, topic-over-global already
+composed. `Issue.ballotsOf` returns `tally`'s first. A client does one read per parameter and one
+native call, and **no governance policy lives in a contract** — which is what keeps policy
+upgradable without a hard fork, since the natives are the node's and the contracts hold only facts.
+
+## Three facets, not one
+
+Every contract publishes three facets, and the split *is* the security model:
+
+| facet | who holds it | what it may do |
+|---|---|---|
+| **`read`** | everyone | never mutates; never returns a capability or a message body |
+| **`self`** | everyone | mutates **only the caller's own row** |
+| **`admin`** | the installer | migration (`dump`/`load`) only, and identity-gated |
+
+**Privilege inside a group is data, not a facet** — a correction the build forced. An earlier
+draft put `invite`, `setRole`, `enroll`, `lock` and `close` behind `admin`. That is wrong: it would
+make whoever *deployed the contract* an admin of every group inside it. They live on `self` and
+check the group's own `admins` set, or the issue's own opener. What is left for `admin` is
+migration, which really is the installer's business and nobody else's.
+
+That in turn makes the facet map safe to publish whole: holding the `admin` bundle is not
+sufficient, because `admin` re-derives the caller and compares against the installer's address.
+The three are still three separable bundles — you can hand out `read` alone — but the security
+does not depend on keeping one of them secret.
+
+`self` is safe to publish because of the identity rule below: a caller cannot name a row that is
+not theirs. That is what dissolves rgov's admin bottleneck — `delegate`, `rate`, `censure`, `join`,
+`cast`, `send` and `receive` are all public verbs, and none of them needs an admin to have acted
+first (requirement 5: onboarding works in both directions).
+
+## Identity: derived, never claimed
+
+rgov keys everything to a caller-supplied string, which is why its actions can be run on anyone's
+behalf. Here, every mutating verb takes the caller's deployer id as its **first** parameter — as a
+*name*, unquoted — and derives the caller's REV address inside the contract:
+
+```rholang
+contract doX(_id, @arg, ret) = {
+  new aret in {
+    revAddr!("fromDeployerId", *_id, *aret) |
+    for (@me <- aret) { … }            // `me` is the row key. It was not supplied.
+  }
+}
+```
+
+The address is the public member id the natives' maps are keyed by; the deployer id is the
+unforgeable part. This is `wrapped-token.js`'s own spelling, the rule it relies on for `burn` and
+`transfer` ("self-identified on-chain via `rho:rev:address "fromDeployerId"`, never a
+caller-supplied string").
+
+### Verified live (2026-09-23, `rnodeapi.rhobot.net`)
+
+A `deriver` contract doing exactly the above was installed by **alice** with `insertArbitrary`, then
+called from separate signed deploys:
+
+| | result |
+|---|---|
+| alice calls it | her own address; equal to the address derived in her own program |
+| **bob calls alice's deployed contract** | **bob's address** — the contract sees the *caller*, not the installer |
+| alice passes bob's public key as bytes where the deployer id belongs | **`Nil`** |
+| alice passes a plain string | **`Nil`** |
+
+The middle row is the property the whole `self` facet rests on, and it holds across deploys and
+across identities. Forgery is not expressible: the powerbox will not derive an address from
+anything that is not a real deployer id.
+
+### …but it answers `Nil` rather than failing
+
+Both forgery attempts returned `Nil` — **no error, no refusal, just `Nil`** (law 38 again: the node
+does not tell you that a thing did not work). A contract that skips the check would happily write a
+row keyed `Nil`, and that row would be reachable by *anyone* who can produce a `Nil`. So:
+
+> **Every verb guards the derived address before it touches state.**
+> `match me { Nil => { state!(s) | ret!(("gov-error", "no identity")) } _ => { … } }`
+
+That guard is not defensive decoration; it is the difference between "a caller cannot name another's
+row" and "there is one shared row anybody can write". It belongs in the `--selftest` and in
+`rgov-core-check` as a negative scenario, not just in review — both of which it now is.
+
+## State: one cell, consumed and restored
+
+```rholang
+state!({}) | … contract doX(…) = { for (@s <- state) { state!(s') | ret!(…) } }
+```
+
+One cell per contract, `for (@s <- state) { state!(…) }` — never a peek, never a second send onto
+the same channel. This is not a style preference: the audit's worst finding was that
+`@[*deployerId, "MasterContractAdmin"]!({…})` is a **linear send**, so every bootstrap run left
+another directory on that channel and every consumer peeked an arbitrary one. Two values consumed
+off it compared **unequal** — two live directories, nothing erroring anywhere. A single consumed-and-
+restored cell cannot accumulate, and every write serialises against every other.
+
+Every creating verb is **idempotent** and says which happened (`"created"` / `"already"`), so a
+re-run repairs rather than doubling.
+
+---
+
+## 1. Inbox — the capability vault
+
+rgov's inbox is "a rholang par, unordered": one undifferentiated pile per identity, scanned in full
+on every read, holding capabilities. Two consequences — read cost that grows with history and never
+falls, and a read cap that, once leaked, leaks *everything you were ever sent*.
+
+**A set of named lockers instead**, using the `lockerTag` seam rgov already has but never populates:
+
+```
+boxes: { <ownerAddr>: { <lockerTag>: { "policy": "open"|"invite", "msgs": [ msg, … ] } } }
+msg  : { "from": <addr>, "type": <str>, "subtype": <str>, "at": <int>, "body": <proc> }
+```
+
+`body` may be a `bundle+` name — that is the point of the thing.
+
+| facet | verb | notes |
+|---|---|---|
+| `self` | `newLocker(deployerId, tag, policy, ret)` | idempotent; `"created"` / `"already"` |
+| `self` | `send(deployerId, toAddr, tag, msg, ret)` | `from` is **derived**, never taken from `msg`; refused if the locker's policy is `invite` and the sender holds no send cap |
+| `self` | `receive(deployerId, tag, ret)` | **consumes** — returns the locker's messages and empties it. The authority-bearing read |
+| `self` | `take(deployerId, tag, type, subtype, ret)` | consumes only the matching messages |
+| `self` | `grantRead(deployerId, tag, ret)` | a read-only facet bound to **one** locker |
+| `self` | `grantSend(deployerId, tag, ret)` | an append-only facet bound to **one** locker |
+| `read` | `lockersOf(addr, ret)` | tag names and message **counts** only |
+| `read` | `countIn(addr, tag, type, ret)` | counts only |
+| `admin` | `dump(ret)` / `load(deployerId, s, ret)` | migration; `load` refuses a non-empty cell |
+
+**The public `read` facet never returns a message body.** Metadata is public; contents require a
+per-locker cap. That is requirement 2 (reporting without write authority) and requirement 4 (blast
+radius) answered by the same mechanism — and it is `Directory.rho`'s own `grant` pattern, one key at
+a time, applied per locker:
+
+```rholang
+contract doGrantRead(_id, @tag, ret) = {
+  new a in {
+    revAddr!("fromDeployerId", *_id, *a) |
+    for (@me <- a) {
+      match me {
+        Nil => { ret!(("gov-error", "no identity")) }
+        _   => {
+          new readOne in {
+            contract readOne(@_unused, r2) = {
+              for (@s <- state) {
+                state!(s) |
+                r2!(s.getOrElse(me, {}).getOrElse(tag, {}).getOrElse("msgs", []))
+              }
+            } |
+            ret!(bundle+{*readOne})
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+(The `@_unused` first parameter is the ≥2-params rule from `locker.js` — a one-binder persistent
+receive in a nested `new` was rchain-rust#19. That is **closed and verified fixed**, but the shape
+costs nothing and the whole corpus is written this way.)
+
+`peek` is deliberately **not** a public verb. Peek-vs-consume is a security distinction here, not an
+ergonomic one: a non-consuming read of a locker full of capabilities is the strictly more dangerous
+operation, so it is the one that requires a cap.
+
+## 2. Group — the state the natives read
+
+```
+groups: { <groupId>: {
+  "name": <str>, "createdAt": <int>,
+  "admins":  Set(<addr>, …),
+  "members": { <addr>: {"role": "admin"|"member", "label": <str>, "at": <int>} },
+  "deleg":   { <addr>: <addr> },                       // standing
+  "topic":   { <issueId>: { <addr>: <addr> } },        // per-issue override
+  "ratings": { <rater>: { <ratee>: <0..5> } },
+  "censures":{ <censurer>: { <target>: 1 } },
+  "policy":  "open" | "invite"
+} }
+```
+
+| facet | verb | notes |
+|---|---|---|
+| `self` | `create(deployerId, groupId, name, policy, ret)` | caller is sole admin; idempotent |
+| `self` | `join(deployerId, groupId, label, ret)` | the **pull** path. `open` → member; `invite` → `"pending"` |
+| `self` | `delegate(deployerId, groupId, toAddr, issueId, ret)` | own row only; `issueId` `Nil` = standing |
+| `self` | `rate(deployerId, groupId, rateeAddr, level, ret)` | own row only; stored **raw** |
+| `self` | `censure(deployerId, groupId, targetAddr, on, ret)` | own row only |
+| `admin` | `invite(deployerId, groupId, addr, ret)` | the **push** path — returns a one-shot `acceptOne` cap for the inbox |
+| `admin` | `setRole(deployerId, groupId, addr, role, ret)` | |
+| `read` | `ratingsOf(groupId, ret)` | → `trustLevels` arg 1 |
+| `read` | `adminsOf(groupId, ret)` | → `trustLevels` arg 2 |
+| `read` | `delegationsOf(groupId, issueId, ret)` | → `resolveWeights` arg 2, topic over standing |
+| `read` | `censuresOf(groupId, ret)` · `vouchersOf(groupId, ret)` | → `censure` args 1 and 3 |
+| `read` | `membersOf(groupId, ret)` · `roll(groupId, ret)` | |
+| `admin` | `dump` / `load` | migration |
+
+**Ratings are stored raw and capped by the node.** `gov.ts` caps a rating at the rater's own level
+minus one, and `trustLevels` re-caps during aggregation — so a forged high rating is already
+neutralised where the policy lives. Re-implementing the cap in the contract would put the same rule
+in two places that can disagree across an upgrade. The contract's job is to record who said what.
+
+**Both onboarding directions are first-class** (requirement 5). `join` needs no prior admin act;
+`invite` needs no prior member act. Neither is a precondition of the other, and there is no
+`MasterContractAdmin` anywhere — the group's admin set is ordinary state in the group's own row.
+
+## 3. Issue — proposals and ballots
+
+```
+issues: { <issueId>: {
+  "groupId": <str>, "title": <str>, "by": <addr>, "at": <int>,
+  "status": "open"|"locked"|"closed",
+  "mode": "approval"|"ranked",
+  "groupRead": <proc>,                       // the Group read facet this issue trusts
+  "options": [ <optionId>, … ],
+  "ballots": { <addr>: [ <optionId>, … ] },
+  "results": { <addr>: <result> }            // proposed tallies, by proposer
+} }
+```
+
+| facet | verb | notes |
+|---|---|---|
+| `self` | `open(deployerId, groupId, issueId, title, mode, options, groupRead, ret)` | idempotent |
+| `self` | `addOption(deployerId, issueId, optionId, ret)` | while `open` |
+| `self` | `cast(deployerId, issueId, choices, ret)` | membership checked through `groupRead`; latest ballot per voter wins |
+| `self` | `propose(deployerId, issueId, result, ret)` | record a computed tally under the proposer's name |
+| `admin` | `enroll(deployerId, issueId, addr, ret)` | returns a `castOne` cap bound to (issue, voter) — for the inbox |
+| `admin` | `lock` / `close(deployerId, issueId, ret)` | freeze options / freeze ballots |
+| `read` | `ballotsOf(issueId, ret)` | → `tally` arg 1 |
+| `read` | `votersOf` · `optionsOf` · `statusOf` · `issuesOf(groupId)` · `resultsOf` | |
+| `admin` | `dump` / `load` | migration |
+
+**No contract counts votes.** `tally` is the node's, deterministic over published ballots and
+published weights, so anyone can recompute it. `propose` therefore records results *keyed by who
+proposed them* rather than blessing one — the ballots are the authoritative state, a result is a
+claim about them, and disagreement is visible instead of arbitrated. This is the same stance
+`polls.ts` takes in the room ("deterministic and joiner-local — no central counter").
+
+**`open` takes the Group read facet it trusts** and records it. That is one cross-contract edge,
+deliberately chosen over an unchecked roll argument, and it is auditable: the facet an issue used is
+part of the issue.
+
+### The end-to-end path
+
+```
+Group.ratingsOf ─┐
+Group.adminsOf  ─┴─▶ rho:gov:trustLevels ──▶ levels ─┐
+Group.delegationsOf(g, issue) ───────────────────────┴─▶ rho:gov:resolveWeights ──▶ weights ─┐
+Issue.ballotsOf ─────────────────────────────────────────────────────────────────────────────┴─▶ rho:gov:tally ──▶ winner
+Group.censuresOf + levels + Group.vouchersOf ──▶ rho:gov:censure ──▶ (discredited, newLevels)
+```
+
+Five reads, four native calls, and `Issue.propose` to publish the result. `Inbox` carries the
+`acceptOne` and `castOne` caps that make enrollment work without anyone holding an admin facet they
+did not earn.
+
+---
+
+## Naming, addressing, migration
+
+Each contract is deployed once and registered **by name** in the genesis directory through that
+name's own `grant` facet — per-name authority, not one all-powerful admin cap
+([`Directory.rho:22`](https://github.com/rchain-community/rgov)). A client holds one constant,
+`PORT_READ_CAP`, asks the directory for `"Inbox"`, and gets `{read, self}`.
+
+Upgrading is therefore: deploy v2, `dump` v1 through its `admin` facet, `load` into v2, re-point the
+name. **No client changes and no uri to redistribute** — which is requirement 3, and the reason no
+application needs to be frozen in genesis to be findable. A client that wants to pin a specific
+version pins the unforgeable it resolved instead of re-resolving the name.
+
+## What is deliberately absent
+
+- **No `MasterContractAdmin`.** The linear send that silently accumulated a second directory.
+- **No bootstrapper-keyed dictionary.** rgov keys everything to the bootstrapper's `deployerId`, so
+  no member can onboard without them.
+- **No per-class registration through a shared admin channel.** Per-name `grant` instead.
+- **No policy in the contracts.** Caps, quorums, weights and tie-breaks are the natives'.
+- **No chat, kudos, ballot, mint or crowdfund.** Later, registered by name — which is exactly what
+  the directory design makes cheap.
+
+## Built and verified (2026-09-23)
+
+[`packages/browser/src/rgov-core.js`](packages/browser/src/rgov-core.js) — the three contract
+sources, their install programs and every call-site builder, plain JS in the `locker.js` /
+`wrapped-token.js` shape. `node packages/browser/src/rgov-core.js --selftest` is **81/81** and runs
+in CI. The live half, `scripts/localnet/rgov-core-check.mjs`, installed all three on
+`rnodeapi.rhobot.net` and walked a scenario: **69 ok, 0 failed** across 3 identities.
+
+What that run actually established, beyond "it parses":
+
+| | |
+|---|---|
+| `newLocker` twice | `("created", …)` then `("already", …)` — idempotent |
+| bob sends to alice's locker | `from` is **bob's derived address**, not what he put in the message |
+| public `read` asked for a body (`peek`) | `("gov-error", "bad verb or arity", "peek")` — there is no such verb |
+| `receive` | returns the message *and empties the locker*; the count goes 1 → 0 |
+| bob calls `setRole` | `("gov-error", "not an admin")` — privilege is the group's data |
+| `rate` with one argument instead of three | **`("gov-error", "bad verb or arity", "rate")`** — not silence |
+| a granted read cap | answers that locker's bodies, and reaches no other locker |
+| a granted send cap, **delivered through the Inbox** and used by the recipient | wrote into alice's invite-only locker |
+| `enroll`'s bearer ballot | cast under **the guest's** address, not the enroller's |
+| bob calls `admin` | `("gov-error", "not the installer")` |
+| `load` over live state | `("gov-error", "not empty")` |
+| `ratingsOf` → `trustLevels` → `resolveWeights` → `tally` → `censure` | `{alice: 5, bob: 3}` → `{bob: 4}` → `"yes"` |
+
+That last row is the design working end to end, and the weights confirm the contracts match
+`gov.ts` rather than rgov: alice is 5 by the admin root, bob is 3 because a rating is capped below
+the rater's level, and bob's voting weight is **4 = 1 + level**, which is `trustWeightsFor`.
+
+### One thing the build found in shipped code
+
+`rho:registry:lookup` on this node answers **the bare stored value**: `rec.keys().toList()` gives
+`["admin","read","self"]` and matching it against `(_, caps)` reports "not a tuple".
+[`locker.js`](packages/browser/src/locker.js) unwraps a `(_, caps)` tuple — the Scala shape — and
+falls to its own default branch, so a locker call there would report `["no locker at", uri]` for a
+locker that is present and healthy. `rgov-core.js` accepts either shape and funnels both into one
+channel. Whether locker.js broke with a registry change or was never exercised this way is not
+established here; it is worth a look before anyone relies on `/rholang register|bind|resolve`.
+
+## Build order
+
+1. ~~**Probe** `rho:rev:address("fromDeployerId", …)` on a passed-through deployer id.~~ **Done —
+   it holds** (see *Verified live* above), with the `Nil` guard as the one amendment it forced.
+2. ~~**`packages/browser/src/rgov-core.js`**~~ **Done** — 78/78 selftest, in CI.
+3. ~~**Deploy to the playground**~~ **Done** — `scripts/localnet/rgov-core-check.mjs`, 28/28 live.
+   Still owed: a scenario for the verbs the walk did not reach (`grantRead`/`grantSend`, `take`,
+   `setPolicy`, `censure`/`uncensure`, per-issue `delegate`, `enroll`'s ballot cap, `dump`/`load`),
+   and the negative case that needs a second installer — a non-installer calling `admin`.
+4. ~~**Wire `/gov`**~~ **Done** — `/gov chain` (`install` · `push` · `pull` · `inbox|group|issue
+   <uri>`), carried between peers on the existing `group-meta` envelope, plus a self-signed
+   `gov-chain` envelope for a member's own REV address. See
+   [Governance.md § The group on chain](Governance.md#the-group-on-chain--gov-chain).
+
+   Two things that fell out of wiring it, both of which the design implies rather than adds:
+   - **A push is per-member.** `delegate`/`rate`/`censure` are `self` verbs, so an admin *cannot*
+     push a member's rows and a member needs no admin to push their own.
+   - **A member must publish a chain address first.** The contracts key rows by REV address; a room
+     knows peerIds and anchors. `Member.revAddr` carries it, self-signed, and a push skips — out
+     loud — any row whose target has not published one rather than guessing at a vote's destination.
+5. **Register the three by name** in the genesis directory, which is what makes step 4 a constant
+   rather than three uris to distribute.
+
+## Provenance
+
+The audit that produced this: `scripts/localnet/rgov-check.mjs` (two tiers, live against
+`rnodeapi.rhobot.net`) and `scripts/localnet/macro-check.mjs` (14 ok, 0 failed, 6 skipped — all four
+`rho:gov:*` natives confirmed with `gov.ts`-shaped arguments). The genesis decision — genesis carries
+the directory and its admission policy, nothing else of rgov — is posted upstream as
+[rchain-rust#71](https://github.com/rchain-community/rchain-rust/issues/71). The node behaviours
+this design steers around are laws 38 and 40 in
+[`porting-a-client.md`](https://github.com/rchain-community/rchain-rust/blob/dev/docs/src/developer/porting-a-client.md):
+a `for` that matches no datum reports no error, and a call at the wrong arity does nothing.
+
+Off-chain semantics: [Governance.md](Governance.md) · [`gov.ts`](packages/browser/src/gov.ts).
