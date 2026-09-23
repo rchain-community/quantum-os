@@ -256,8 +256,18 @@ verb is named after the argument of the native it feeds. Full design: [RGov_Core
 | `/gov chain` | what the group has recorded, your chain address, how many members have published one |
 | `/gov chain install` | *(admin)* deploy Inbox, Group and Issue and record the three uris for everyone |
 | `/gov chain inbox\|group\|issue <uri>` | *(admin)* record one somebody already deployed |
-| `/gov chain push` | write **your own** rows: join, your delegation, your ratings, your censures |
-| `/gov chain pull` | report what the contracts hold — a report, never a merge |
+| `/gov chain push` | write **your own** rows: join, your delegation, ratings, censures, the issues you opened, and your ballots |
+| `/gov chain pull` | report what the contracts hold, including each issue's ballots — a report, never a merge |
+| `/gov chain inbox` | open your locker if needed and **receive** — which *consumes*, because a capability read twice by two holders is the bug an inbox of capabilities must not have |
+| `/gov chain send <peer> <msg>` | put a message in a member's locker. Unlike `/gov say`, this reaches somebody who was not in the room — and a body may be a capability, so it hands over authority rather than text |
+
+**Why uris and not names.** The design wants one public constant and a name per contract, and
+`PORT_READ_CAP` really is the master directory's `read` facet, so `read("Inbox", ret)` resolves. But
+that map is genesis content with no published `write` or `grant`, and the `Directory` entry is a
+*factory* — every call mints a fresh empty directory, so a write to it changes nothing anyone else
+can see. Until the node exposes a restricted per-name grant, an installed contract has no name to
+be found under, and a uri is what there is. [RGov_Core.md](RGov_Core.md#naming-addressing-migration)
+has the measurements.
 
 **Push is per-member by construction, not by policy.** `delegate`, `rate` and `censure` are `self`
 verbs on the contract: the caller's identity is *derived* inside it from their deployer id, so an
