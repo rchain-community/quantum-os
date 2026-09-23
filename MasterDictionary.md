@@ -199,6 +199,12 @@ This is a genesis change, so it belongs on the hard-fork tracker
 ([rchain-rust#51](https://github.com/rchain-community/rchain-rust/issues/51)) alongside
 [#71](https://github.com/rchain-community/rchain-rust/issues/71).
 
+**Filed upstream 2026-09-23**: the design, the measurements and the prototype's results are on
+[#71](https://github.com/rchain-community/rchain-rust/issues/71#issuecomment-5803106296) — which is
+the issue this answers ("the genesis application directory is unwritable after genesis") — and
+registered as a category-A genesis change on
+[#51](https://github.com/rchain-community/rchain-rust/issues/51#issuecomment-5803110912).
+
 ## What it changes here
 
 `rgov-core.js`'s three contracts stop being addressed by uri. `/gov chain install` publishes
