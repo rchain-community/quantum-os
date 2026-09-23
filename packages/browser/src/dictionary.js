@@ -431,6 +431,21 @@ export function selftest() {
   ok("guards a Nil identity before touching state",
      /Nil => \{ ret!\(\("dir-error", "no identity"\)\) \}/.test(src));
 
+  // A deployerId is UNFORGEABLE but DELEGABLE BY DISCLOSURE: it behaves like a
+  // key, not like a signature. Measured on the node — a contract that stores
+  // `*deployerId` in readable state hands its identity to anyone who reads it,
+  // and the holder can then act as that identity anywhere, including here.
+  // Forging one is impossible (a public key, or a string, yields Nil), so the
+  // only exposure is a contract that gives one away. These do not: every use of
+  // the caller's id is the address derivation and nothing else.
+  for (const [name, src] of Object.entries({ Dictionary: DICTIONARY_RHO })) {
+    const uses = (src.match(/\*_id/g) || []).length;
+    const derivations = (src.match(/revAddr!\("fromDeployerId", \*_id,/g) || []).length;
+    ok(`${name}: the caller's deployerId is derived and never stored or returned`,
+       uses > 0 && uses === derivations,
+       `${uses} uses of *_id, ${derivations} of them the address derivation`);
+  }
+
   // The access-control system, such as it is.
   ok("the prefix check derives the root from the caller",
      /path\.slice\(0, me\.length\(\) \+ 1\) == me \+\+ "\/"/.test(src),
