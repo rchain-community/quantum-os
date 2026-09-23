@@ -3462,6 +3462,10 @@ function handleCommand(raw: string): string[] {
       const g = focused();
       if (!g) { sys("no focused group — /gov show <name> first (or /gov new)"); break; }
       const meId = myPeerId();
+      // The durable half of this identity. A peerId is per-tab and can change;
+      // the anchor does not, and `memberKeyFor` falls back to it — but only if
+      // it is actually passed, which none of these checks used to do.
+      const meAnchor = dyncapState?.anchor;
 
       if (gsub === "status") {
         sys(`🏛 ${g.name} — ${Object.keys(g.members).length} members, ${g.issues.length} issues`);
@@ -3483,7 +3487,7 @@ function handleCommand(raw: string): string[] {
       if (gsub === "member") {
         const op = (gParts[1] || "").toLowerCase();
         if (op === "add" || op === "remove") {
-          if (!isAdmin(g, meId)) { sys("only an admin can manage members"); break; }
+          if (!isAdmin(g, meId, meAnchor)) { sys("only an admin can manage members"); break; }
           const pid = gParts[2] ? findPeerByName(gParts[2]) : null;
           if (!pid) { sys(`usage: /gov member ${op} <peer>  (peer not found)`); break; }
           if (op === "add") { const role: Role = (gParts[3] || "").toLowerCase() === "admin" ? "admin" : "member"; govSetMember(g, pid, role, peerLabel(pid)); sys(`added ${peerLabel(pid)} as ${role}`); }
@@ -3499,12 +3503,12 @@ function handleCommand(raw: string): string[] {
           for (const i of g.issues) sys(`  ▸ ${i.title} — ${issueResultText(g, i)}`);
           break;
         }
-        if (!isMember(g, meId)) { sys("only members can add issues"); break; }
+        if (!isMember(g, meId, meAnchor)) { sys("only members can add issues"); break; }
         const iss = govNewIssue(g, grest); sys(`▸ issue recorded: ${iss.title}`);
         break;
       }
       if (gsub === "delegate") {
-        if (!isMember(g, meId)) { sys("only members can delegate"); break; }
+        if (!isMember(g, meId, meAnchor)) { sys("only members can delegate"); break; }
         // /gov delegate <member> [on <issue title>]
         const onIdx = gParts.findIndex((t) => t.toLowerCase() === "on");
         const pid = gParts[1] ? findPeerByName(gParts[1]) : null;
@@ -3533,7 +3537,7 @@ function handleCommand(raw: string): string[] {
       if (gsub === "trust") {
         // /gov trust <member> <level>  — confer a trust level STRICTLY BELOW your
         // own (0 clears). Admins are the root (level TRUST_MAX); trust descends.
-        if (!isMember(g, meId)) { sys("only members can rate trust"); break; }
+        if (!isMember(g, meId, meAnchor)) { sys("only members can rate trust"); break; }
         const pid = gParts[1] ? findPeerByName(gParts[1]) : null;
         if (!pid || !isMember(g, pid)) { sys(`usage: /gov trust <member> <0-${TRUST_MAX}>   (0 clears; confers a level below your own)`); break; }
         if (pid === meId) { sys("can't rate your own trust — trust is given by others"); break; }
@@ -3553,7 +3557,7 @@ function handleCommand(raw: string): string[] {
         // /gov censure <member> — flag a member as holding undeserved trust.
         // Credible only from equal-or-higher standing; discredits the target and
         // slashes everyone who vouched for them (accountability).
-        if (!isMember(g, meId)) { sys("only members can censure"); break; }
+        if (!isMember(g, meId, meAnchor)) { sys("only members can censure"); break; }
         const pid = gParts[1] ? findPeerByName(gParts[1]) : null;
         if (!pid || !isMember(g, pid)) { sys(`usage: /gov ${gsub} <member>`); break; }
         if (pid === meId) { sys("can't censure yourself"); break; }
@@ -3569,7 +3573,7 @@ function handleCommand(raw: string): string[] {
         break;
       }
       if (gsub === "vote") {
-        if (!isMember(g, meId)) { sys("only members can open a vote"); break; }
+        if (!isMember(g, meId, meAnchor)) { sys("only members can open a vote"); break; }
         let rest = grest; let method: PollMethod = "approval";
         if (/\branked\b/i.test(rest)) { method = "ranked"; rest = rest.replace(/\branked\b/i, "").trim(); }
         const bar = rest.indexOf("|");
@@ -3587,7 +3591,7 @@ function handleCommand(raw: string): string[] {
         // Group funds as a /note currency. Thin orchestration over /note.
         const op = (gParts[1] || "").toLowerCase();
         if (op === "declare") {
-          if (!isAdmin(g, meId)) { sys("only an admin can set up the treasury"); break; }
+          if (!isAdmin(g, meId, meAnchor)) { sys("only an admin can set up the treasury"); break; }
           if (g.treasury) { sys(`treasury already set: ${g.treasury}`); break; }
           const cur = govCurrency(g, "");
           handleCommand(`/note declare ${cur}`);
@@ -3598,7 +3602,7 @@ function handleCommand(raw: string): string[] {
         }
         if (!g.treasury) { sys("no treasury yet — an admin runs /gov treasury declare"); break; }
         if (op === "grant") {
-          if (!isAdmin(g, meId)) { sys("only an admin can fund from the treasury"); break; }
+          if (!isAdmin(g, meId, meAnchor)) { sys("only an admin can fund from the treasury"); break; }
           const pid = gParts[2] ? findPeerByName(gParts[2]) : null;
           const n = parseInt(gParts[3] ?? "", 10);
           if (!pid || !isMember(g, pid) || isNaN(n) || n < 1) { sys("usage: /gov treasury grant <member> <amount>"); break; }
@@ -3620,7 +3624,7 @@ function handleCommand(raw: string): string[] {
         if (!pid || !isMember(g, pid) || isNaN(n) || n < 1) { sys("usage: /gov kudos <member> <amount>  ·  /gov kudos balance"); break; }
         if (pid === meId) { sys("award kudos to others, not yourself"); break; }
         if (!g.kudos) {
-          if (!isAdmin(g, meId)) { sys("kudos isn't set up yet — an admin must award first"); break; }
+          if (!isAdmin(g, meId, meAnchor)) { sys("kudos isn't set up yet — an admin must award first"); break; }
           const cur = govCurrency(g, "K");
           handleCommand(`/note declare ${cur}`);
           g.kudos = cur; saveGroups(); renderGroups();
@@ -3641,7 +3645,7 @@ function handleCommand(raw: string): string[] {
                        : `${g.name} has no locker recorded. An admin: /gov locker rho:id:…  (/rholang locker install mints one)`);
           break;
         }
-        if (!isAdmin(g, meId)) { sys("only an admin records the group's locker"); break; }
+        if (!isAdmin(g, meId, meAnchor)) { sys("only an admin records the group's locker"); break; }
         if (!looksLikeRegistryUri(want)) { sys(`not a registry URI: ${want}`); break; }
         g.locker = want;
         saveGroups(); renderGroups(); refreshGroupCard(g);
@@ -3658,12 +3662,50 @@ function handleCommand(raw: string): string[] {
                     : `${g.name} has no on-chain record. Deploy one, then: /gov uri rho:id:…`);
           break;
         }
-        if (!isAdmin(g, meId)) { sys("only an admin records the group's on-chain record"); break; }
+        if (!isAdmin(g, meId, meAnchor)) { sys("only an admin records the group's on-chain record"); break; }
         if (!looksLikeRegistryUri(want)) { sys(`not a registry URI: ${want}   (expected rho:id:…, as /rholang register prints)`); break; }
         g.uri = want;
         saveGroups(); renderGroups(); refreshGroupCard(g);
         signedBroadcast({ kind: "group-meta", groupId: g.id, uri: want });
         sys(`📇 ${g.name} on chain: ${want}  — every member now has it; /rholang read ${want} to fetch it`);
+        break;
+      }
+      if (gsub === "claim") {
+        // Re-attach an orphaned group to this identity.
+        //
+        // A member record written before anchors were stamped carries no
+        // durable identity, so a creator whose peerId moved cannot be matched
+        // back to it and loses admin of their own group with no way to regain
+        // it. This is the way back — and it is deliberately narrow.
+        //
+        // THE GATE IS THAT THE GROUP HAS AT MOST ONE MEMBER. Then there is
+        // nobody a claim could take anything from: either the sole record is
+        // this identity under an old peerId, or the group is empty. It is not a
+        // permission check that can be argued with, it is a situation in which
+        // the question does not arise. A group with two members is somebody
+        // else's to grant, and `/gov member add` is how they grant it.
+        if (isAdmin(g, meId, meAnchor)) { sys(`you are already an admin of “${g.name}”`); break; }
+        const keys = Object.keys(g.members);
+        if (keys.length > 1) {
+          sys(`“${g.name}” has ${keys.length} members — an existing admin adds you: /gov member add <peer>`);
+          whoIsAdmin(g, meId, meAnchor, sys);
+          break;
+        }
+        void (async () => {
+          const okClaim = await confirmDialog("Claim this group?",
+            `“${g.name}” has ${keys.length === 0 ? "no members" : "one member record that does not match this identity"}.\n` +
+            `Claiming makes ${govLabel()} its admin and moves that record onto this peer.`,
+            "Claim");
+          if (!okClaim) { sys("cancelled"); return; }
+          if (keys.length === 1 && keys[0] !== meId) rekeyMember(g, keys[0], meId);
+          g.creator = meId;
+          g.creatorLabel = govLabel();
+          g.members[meId] = { peerId: meId, role: "admin", label: govLabel(), at: Date.now(),
+                              ...(meAnchor ? { anchor: meAnchor } : {}) };
+          saveGroups(); renderGroups(); refreshGroupCard(g);
+          signedBroadcast({ kind: "group-member", groupId: g.id, peerId: meId, role: "admin", label: govLabel() });
+          sys(`🏛 claimed “${g.name}” — you are admin, and this identity is now anchored to it`);
+        })();
         break;
       }
       if (gsub === "chain") {
@@ -3690,7 +3732,7 @@ function handleCommand(raw: string): string[] {
 
         if (verb === "inbox" || verb === "group" || verb === "issue") {
           const want = parts.slice(1).join(" ").trim();
-          if (!isAdmin(g, meId)) { sys("only an admin records the group's contracts"); break; }
+          if (!isAdmin(g, meId, meAnchor)) { sys("only an admin records the group's contracts"); whoIsAdmin(g, meId, meAnchor, sys); break; }
           if (!looksLikeRegistryUri(want)) { sys(`not a registry URI: ${want}`); break; }
           g.chain = { ...refs, [verb]: want };
           saveGroups(); refreshGroupCard(g);
@@ -3700,7 +3742,7 @@ function handleCommand(raw: string): string[] {
         }
 
         if (verb === "install") {
-          if (!isAdmin(g, meId)) { sys("only an admin installs the group's contracts"); break; }
+          if (!isAdmin(g, meId, meAnchor)) { sys("only an admin installs the group's contracts"); whoIsAdmin(g, meId, meAnchor, sys); break; }
           if (!cfg.key) { sys("no key — /rholang key generate first"); break; }
           sys("installing Inbox, Group and Issue — three deploys, one each…");
           sys("  each uri is minted by the registry, so it comes back as that deploy's answer");
@@ -3737,8 +3779,8 @@ function handleCommand(raw: string): string[] {
           // creates the group, because somebody has to.
           if (!refs.group) { sys("no group contract — an admin: /gov chain install"); break; }
           if (!cfg.key) { sys("no key — /rholang key generate first"); break; }
-          if (!isMember(g, meId)) { sys("only members push"); break; }
-          const mine = memberKeyFor(g, meId);
+          if (!isMember(g, meId, meAnchor)) { sys("only members push"); break; }
+          const mine = memberKeyFor(g, meId, meAnchor);
           if (mine && g.members[mine].revAddr !== myAddr && myAddr) {
             g.members[mine].revAddr = myAddr; saveGroups();
             signedBroadcast({ kind: "gov-chain", groupId: g.id, member: meId, revAddr: myAddr });
@@ -3749,8 +3791,8 @@ function handleCommand(raw: string): string[] {
           };
           void (async () => {
             const steps: [string, string][] = [];
-            if (isAdmin(g, meId)) steps.push(["create the group", rgov.createGroupProgram(refs.group!, g.id, g.name, "open")]);
-            steps.push(["join", rgov.joinGroupProgram(refs.group!, g.id, memberLabel(g, meId))]);
+            if (isAdmin(g, meId, meAnchor)) steps.push(["create the group", rgov.createGroupProgram(refs.group!, g.id, g.name, "open")]);
+            steps.push(["join", rgov.joinGroupProgram(refs.group!, g.id, memberLabel(g, meId, meAnchor))]);
             const del = g.delegations[mine ?? meId];
             if (del) {
               const to = addrOf(del.delegate);
@@ -3807,13 +3849,13 @@ function handleCommand(raw: string): string[] {
         break;
       }
       if (gsub === "say") {
-        if (!isMember(g, meId)) { sys("only members can post to the group"); break; }
+        if (!isMember(g, meId, meAnchor)) { sys("only members can post to the group"); break; }
         if (!grest) { sys("usage: /gov say <message>"); break; }
         signedBroadcast({ kind: "group-msg", groupId: g.id, text: grest });
         addMessage("", `🏛 ${g.name}: ${grest}`, "self");
         break;
       }
-      sys("usage: /gov new <name> · show <name> · member add|remove <peer> · issue <title> · delegate <peer> [on <issue>] · undelegate [on <issue>] · vote <issue> | opts [ranked] · treasury declare|grant <m> <n>|balance · kudos <m> <n>|balance · say <msg> · chain · status · list");
+      sys("usage: /gov new <name> · show <name> · member add|remove <peer> · issue <title> · delegate <peer> [on <issue>] · undelegate [on <issue>] · vote <issue> | opts [ranked] · treasury declare|grant <m> <n>|balance · kudos <m> <n>|balance · say <msg> · chain · claim · status · list");
       break;
     }
 
@@ -7846,7 +7888,7 @@ async function connect(): Promise<void> {
           const status = await verifyDyncapIfPresent(from, d); setActiveRoom(ctx);
           if (status.startsWith("  · refused")) return;
           const g = groupStore.get(String(d.groupId ?? ""));
-          if (!g || !isAdmin(g, from)) return;                 // only admins manage membership
+          if (!g || !isAdmin(g, from, dyncapChains.get(from)?.anchor)) return;   // only admins manage membership
           const peerId = String(d.peerId ?? ""); if (!peerId) return;
           if (d.remove === true) { delete g.members[peerId]; delete g.delegations[peerId]; }
           else g.members[peerId] = { peerId, role: d.role === "admin" ? "admin" : "member", label: String(d.label ?? peerLabel(peerId)), at: Date.now() };
@@ -7857,7 +7899,7 @@ async function connect(): Promise<void> {
           const status = await verifyDyncapIfPresent(from, d); setActiveRoom(ctx);
           if (status.startsWith("  · refused")) return;
           const g = groupStore.get(String(d.groupId ?? ""));
-          if (!g || !isAdmin(g, from)) return;                  // only admins set group currencies
+          if (!g || !isAdmin(g, from, dyncapChains.get(from)?.anchor)) return;    // only admins set group currencies
           if (typeof d.treasury === "string") g.treasury = d.treasury;
           if (typeof d.kudos === "string") g.kudos = d.kudos;
           if (typeof d.uri === "string" && looksLikeRegistryUri(d.uri)) g.uri = d.uri;
@@ -8872,7 +8914,7 @@ function lockerFromGroups(): { group: string; uri: string } | null {
   const focused = focusedGroup ? groupStore.get(focusedGroup) : undefined;
   const ordered = [focused, ...groupStore.values()].filter((g): g is Group => !!g);
   for (const g of ordered) {
-    if (g.locker && isMember(g, me)) return { group: g.name, uri: g.locker };
+    if (g.locker && isMember(g, me, dyncapState?.anchor)) return { group: g.name, uri: g.locker };
   }
   return null;
 }
@@ -9499,15 +9541,49 @@ function govWeights(g: Group, issue: Issue, poll: Poll): Record<string, number> 
 function createGroup(name: string): Group {
   const id = `grp-${myPeerId().slice(-4)}-${Date.now().toString(36)}`;
   const me = myPeerId(); const label = govLabel();
+  // Stamp the creator's own anchor. A peerId is per-tab and can change — a new
+  // lease, a cleared storage, a /login in another browser — while the anchor is
+  // the durable identity. Without it `memberKeyFor` has nothing to fall back on,
+  // so a creator whose peerId moved stopped being recognised as a member at all
+  // and lost admin of their own group with no way to get it back.
+  const anchor = dyncapState?.anchor;
   const g: Group = { id, name, creator: me, creatorLabel: label, createdAt: Date.now(),
-    members: { [me]: { peerId: me, role: "admin", label, at: Date.now() } }, delegations: {}, issues: [] };
+    members: { [me]: { peerId: me, role: "admin", label, at: Date.now(), ...(anchor ? { anchor } : {}) } }, delegations: {}, issues: [] };
   groupStore.set(id, g); saveGroups(); renderGroups();
   signedBroadcast({ kind: "group-open", id, name, creatorLabel: label, createdAt: g.createdAt });
   return g;
 }
 
+/**
+ * Why a permission was refused, in the one case that is almost never the
+ * obvious one: your identity moved.
+ *
+ * A peerId is per-tab and can change — a new lease, cleared storage, a /login
+ * in another browser. The anchor is durable and a member record carries it, so
+ * a moved identity is normally re-attached. A record written before anchors
+ * were stamped has none, and then the only symptom is a flat refusal on a group
+ * you created. Say enough to recognise that, without printing a wall.
+ */
+function whoIsAdmin(g: Group, meId: string, meAnchor: string | undefined,
+                    say: (t: string) => void): void {
+  const admins = Object.values(g.members).filter((m) => m.role === "admin" || m.peerId === g.creator);
+  say(`  admins of “${g.name}”: ${admins.map((m) => `${m.label} (${m.peerId.slice(0, 8)}…)`).join(", ") || "none recorded"}`);
+  say(`  you are ${meId.slice(0, 8)}…${meAnchor ? ` · anchor ${meAnchor.slice(0, 8)}…` : " · no dyncap anchor"}`);
+  const anchorless = admins.filter((m) => !m.anchor);
+  if (anchorless.length && !admins.some((m) => m.peerId === meId)) {
+    say("  those admin records carry no durable anchor, so an identity that moved cannot be");
+    say("  matched back to them. If that group was yours: /gov claim — it only works while you");
+    say("  are the sole member, which is the one case where it cannot take anything from anyone.");
+  }
+}
+
 function govSetMember(g: Group, peerId: string, role: Role, label: string): void {
-  g.members[peerId] = { peerId, role, label, at: Date.now() };
+  // Carry whatever durable identity we already have for them: their own
+  // verified dyncap anchor if this browser has seen one, or an anchor already
+  // on record. See createGroup for why a member record without one is a member
+  // who can silently stop being one.
+  const anchor = dyncapChains.get(peerId)?.anchor ?? g.members[peerId]?.anchor;
+  g.members[peerId] = { peerId, role, label, at: Date.now(), ...(anchor ? { anchor } : {}) };
   saveGroups(); renderGroups(); refreshGroupCard(g);
   signedBroadcast({ kind: "group-member", groupId: g.id, peerId, role, label });
 }
@@ -9632,8 +9708,8 @@ function issueResultText(g: Group, issue: Issue): string {
 
 function buildGroupCard(g: Group): HTMLElement {
   const me = myPeerId();
-  const admin = isAdmin(g, me);
-  const member = isMember(g, me);
+  const admin = isAdmin(g, me, dyncapState?.anchor);
+  const member = isMember(g, me, dyncapState?.anchor);
   const card = document.createElement("div");
   card.className = "gov-card";
 
@@ -9835,7 +9911,7 @@ function refreshGroupCard(g: Group): void {
 // an open-vote / vote control. Like a poll card, it persists in the transcript.
 function buildIssueCard(g: Group, issue: Issue): HTMLElement {
   const me = myPeerId();
-  const member = isMember(g, me);
+  const member = isMember(g, me, dyncapState?.anchor);
   const card = document.createElement("div"); card.className = "gov-card";
   const h = document.createElement("div"); h.className = "gov-title";
   h.textContent = `▸ ${issue.title} `;
