@@ -329,6 +329,13 @@ stored, and resolved again next week. Publishing it means `insertArbitrary`, whi
 remove: an address that must be handed around out of band, with no migration path. It is what the
 node currently permits.
 
+**The redesign is written up in [MasterDictionary.md](MasterDictionary.md)** — names rooted in the
+identity that owns them (`<revAddr>/<path>`), so publishing is self-service and squatting is not
+expressible; short names as a governed tier of aliases; versions with pinning and freezing; and
+per-name grants that can be *revoked*. It also records a measurement that makes the case: `Directory`,
+`Echo` and `Log` in the genesis map are **the same unforgeable** — one stateless factory under three
+names — so the current dictionary stores nothing at all, and there is no state to migrate.
+
 **What the node owes this design**, and the one upstream ask that unblocks it: a *restricted* grant
 on the master directory — per-name authority, so a name's owner can write it and nobody else can.
 With that, registration replaces every uri here, upgrading becomes "deploy v2, `dump`, `load`,
