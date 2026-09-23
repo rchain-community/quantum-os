@@ -3826,6 +3826,16 @@ function handleCommand(raw: string): string[] {
                   steps.push([`open issue “${iss.title}”`,
                     rgov.openIssueProgram(refs.issue!, iss.id, g.id, iss.title,
                       poll?.method === "ranked" ? "ranked" : "approval", opts, roll)]);
+                  // `open` is idempotent, so on a re-push it reports "already"
+                  // and the roll it recorded the first time stands. Members
+                  // publish their chain addresses at their own pace, so that
+                  // roll is whoever happened to have one at the moment the
+                  // issue was first pushed — and anyone later could never cast.
+                  // Refreshing it is the opener's job and nobody else's.
+                  if (iss.status !== "closed") {
+                    steps.push([`refresh the roll for “${iss.title}” (${roll.length})`,
+                      rgov.setRollProgram(refs.issue!, iss.id, roll)]);
+                  }
                 }
                 const myBallot = poll?.ballots?.[mine ?? meId];
                 if (myBallot?.length) {

@@ -247,6 +247,18 @@ await write("inbox: bob receives the cap and USES it", bob,
 await read("inbox: the cap wrote into the invite-only locker", C.countInProgram(INBOX, A, "private", "secret"),
   (v) => v[0] === 1);
 
+// Requirement 5, the push half: a first message to somebody who has never acted
+// must not bounce. Carol has done nothing at all on this contract.
+const carolA = revAddressOf(keyOf("carol"));
+await write("inbox: a first send to a stranger CREATES their locker", alice,
+  C.sendProgram(INBOX, carolA, "inbox", `{"type": "hello", "body": "welcome"}`),
+  (v) => JSON.stringify(v).includes("locker created"));
+await read("inbox: the stranger now has a locker", C.countInProgram(INBOX, carolA, "inbox", "hello"),
+  (v) => v[0] === 1);
+await write("inbox: but only the DEFAULT tag is auto-created", alice,
+  C.sendProgram(INBOX, carolA, "vault", `{"type": "x", "body": "y"}`),
+  (v) => JSON.stringify(v).includes("no such locker"));
+
 // ── Group: the rest ─────────────────────────────────────────────────────────
 await write("group: alice (admin) promotes bob", alice,
   C.writeProgram(GROUP, "self", "setRole", ['"g1"', JSON.stringify(B), '"admin"']),
@@ -307,6 +319,17 @@ await write("issue: enroll mints a ballot cap that casts for a guest", alice,
 await read("issue: the guest's ballot landed under THEIR address", C.ballotsOfProgram(ISSUE, "i1"),
   (v) => Array.isArray(v[0]?.[carolAddr]));
 
+// The electorate must be refreshable: `open` is idempotent, so a roll fixed at
+// first push would lock out anyone who publishes a chain address later.
+await write("issue: the opener refreshes the roll", alice,
+  C.setRollProgram(ISSUE, "i1", [A, B, carolAddr]),
+  (v) => JSON.stringify(v).includes("roll") && JSON.stringify(v).includes("3"));
+await write("issue: a non-opener cannot refresh it", bob,
+  C.setRollProgram(ISSUE, "i1", [B]),
+  (v) => JSON.stringify(v).includes("not the opener"));
+await read("issue: the new roll took", C.readProgram(ISSUE, "votersOf", ['"i1"']),
+  (v) => v[0]?.length === 3);
+
 await write("issue: bob CANNOT close someone else's issue", bob,
   C.closeIssueProgram(ISSUE, "i1"), (v) => JSON.stringify(v).includes("not the opener"));
 await write("issue: alice records a proposed tally", alice,
@@ -318,6 +341,8 @@ await write("issue: alice closes it", alice, C.closeIssueProgram(ISSUE, "i1"),
   (v) => JSON.stringify(v).includes("closed"));
 await write("issue: a closed issue refuses a ballot", bob, C.castProgram(ISSUE, "i1", ["yes"]),
   (v) => JSON.stringify(v).includes("not open"));
+await write("issue: a closed issue refuses a roll change too", alice,
+  C.setRollProgram(ISSUE, "i1", [A]), (v) => JSON.stringify(v).includes("closed"));
 
 // ── admin: migration, and who may do it ─────────────────────────────────────
 await write("admin: bob is NOT the installer", bob, C.dumpProgram(GROUP),
