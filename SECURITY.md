@@ -66,6 +66,49 @@ about what is kept where, they are the simplest thing that works. The property
 that makes them unusable here is the one that costs nothing there: reachability
 by anyone is only a problem where there is anyone.
 
+## `rho:rchain:deployerId` is a key, not a signature
+
+The on-chain governance contracts ([RGov_Core.md](RGov_Core.md)) and the
+dictionary ([MasterDictionary.md](MasterDictionary.md)) settle "who is calling"
+by derivation: a verb takes the caller's deployer id as a name parameter and
+derives their REV address inside the contract.
+
+```rholang
+contract selfFacet(_id, @verb, @args, ret) = {
+  revAddr!("fromDeployerId", *_id, *a) | for (@me <- a) { … }
+}
+```
+
+**A deployer id cannot be forged.** Measured on `rnodeapi.rhobot.net`: passing a
+public key as bytes, or a plain string, where a deployer id belongs derives
+**`Nil`** — not somebody's address. There is no source syntax for one, so a
+caller cannot construct another's. That is what makes the whole `self`-facet
+model work, and it holds.
+
+**But it can be given away, and then it is gone.** A deployer id is a bearer
+value: whoever holds one can act as that identity, anywhere, for as long as it
+exists. Demonstrated end to end — alice deployed a contract that stored
+`*deployerId` and handed it to any caller; bob fetched it, derived **alice's**
+address from it, and used it to publish under **alice's** root in a dictionary
+that had correctly refused him a moment earlier.
+
+Nothing was forged. The identity was disclosed, and disclosure is transfer.
+
+**So the rule is the one that applies to a private key.** Never put
+`*deployerId` anywhere a reader can reach it: not in a state cell, not in a
+returned value, not in a message body, not forwarded to a facet you do not
+control. Derive the address — a string, and safe to store — and keep the id
+itself in the one place it arrived.
+
+Every contract here follows that, and it is enforced rather than reviewed:
+`rgov-core.js` and `dictionary.js` both assert in their `--selftest` that every
+use of `*_id` in the contract source *is* the address derivation and nothing
+else. A future verb that stashed one would fail CI.
+
+The same caution applies to anything reached with a deployer id in hand: passing
+`*deployerId` to a facet resolved from the registry hands that facet your
+identity for the duration of the call, so it matters whose facet it is.
+
 ## Security architecture
 
 ### ZFA capability tokens

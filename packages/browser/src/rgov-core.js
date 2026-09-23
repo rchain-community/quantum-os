@@ -1023,6 +1023,21 @@ export function selftest() {
        "rholang's if is a process, not an expression");
   }
 
+  // A deployerId is UNFORGEABLE but DELEGABLE BY DISCLOSURE: it behaves like a
+  // key, not like a signature. Measured on the node — a contract that stores
+  // `*deployerId` in readable state hands its identity to anyone who reads it,
+  // and the holder can then act as that identity anywhere, including here.
+  // Forging one is impossible (a public key, or a string, yields Nil), so the
+  // only exposure is a contract that gives one away. These do not: every use of
+  // the caller's id is the address derivation and nothing else.
+  for (const [name, src] of Object.entries(ALL)) {
+    const uses = (src.match(/\*_id/g) || []).length;
+    const derivations = (src.match(/revAddr!\("fromDeployerId", \*_id,/g) || []).length;
+    ok(`${name}: the caller's deployerId is derived and never stored or returned`,
+       uses > 0 && uses === derivations,
+       `${uses} uses of *_id, ${derivations} of them the address derivation`);
+  }
+
   // --- the read/self split -------------------------------------------------
   ok("Inbox: the public read facet answers no message body",
      !/doRead[\s\S]*?getOrElse\("msgs", \{\}\)\)\s*\}/.test(INBOX_RHO.split("contract doRead")[1] ?? "") ||

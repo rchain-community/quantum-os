@@ -347,6 +347,18 @@ whose uri is **derived from a public key** and so is computable rather than comm
 slot per key, and it collides with the slot a deploy's answer goes to (see `locker.js`), so it is
 not free — but it is the difference between an address you can derive and one you must be told.
 
+## The one rule a caller must follow
+
+A deployer id is **unforgeable but delegable by disclosure** — a key, not a
+signature. A contract that stores `*deployerId` where a reader can reach it hands
+its identity to whoever reads it, and that holder can then act as that identity
+anywhere, including here. Demonstrated end to end on the playground; the rule and
+the evidence are in [SECURITY.md](SECURITY.md#rhorchaindeployerid-is-a-key-not-a-signature).
+
+These contracts never disclose one — every use of the caller's id is the address
+derivation and nothing else, asserted in `--selftest` so a future verb that
+stashed one fails CI.
+
 ## What is deliberately absent
 
 - **No `MasterContractAdmin`.** The linear send that silently accumulated a second directory.
