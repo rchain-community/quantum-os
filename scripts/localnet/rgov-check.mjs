@@ -20,6 +20,7 @@
 //                   GitHub and cached under .rgov-cache/ (gitignored)
 //   --only <name>   run one case
 //   --no-stub       do not stub the identity urns (see stubIdentity below)
+//   --genesis       skip the bootstrap: use the genesis governance set
 //   --verbose       print each program and rnode's raw answer
 //
 // TIER 2 — `--tier 2`, needs a funded key:
@@ -55,7 +56,7 @@
 
 import { readFileSync, mkdirSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { applyRawRgov } from "../../packages/browser/src/rgov-apply.js";
+import { applyRawRgov, withArgs } from "../../packages/browser/src/rgov-apply.js";
 
 const arg = (flag, dflt) => {
   const i = process.argv.indexOf(flag);
@@ -72,6 +73,13 @@ const STUB = !process.argv.includes("--no-stub");
 const TIER = Number(arg("--tier", "1"));
 const KEY_NAME = arg("--key-name", "alice");
 const PHLO = Number(arg("--phlo", "5000000"));
+// Both rhobot chains now carry the governance set at GENESIS, reachable at the
+// port constant below — so there is nothing to install, no master directory to
+// publish, and no MemberDirectory to coax into registering GetMe. `--genesis`
+// skips straight to the client actions, which is the configuration that
+// matters from here on.
+const GENESIS_READCAP = "rho:id:wxc4mwdh7otq4fd6iuxt84inepssyz5tugojf7ao68dkh4ebbncy";
+const GENESIS = process.argv.includes("--genesis");
 
 const RAW = "https://raw.githubusercontent.com/rchain-community/rgov/master/";
 const CACHE = join(import.meta.dirname, ".rgov-cache");
@@ -237,11 +245,26 @@ async function deployResult(sig, attempts = 20) {
 }
 
 async function tier2() {
-  const { DEFAULT_CONFIG, deployTerm } = await import("../qos-cli/rholang-client.mjs");
+  const { DEFAULT_CONFIG, deployTerm, evalTerm } = await import("../qos-cli/rholang-client.mjs");
   const keyLine = readFileSync(join(import.meta.dirname, "pk.txt"), "utf8")
     .split("\n").find((l) => l.startsWith(`${KEY_NAME}=`));
   if (!keyLine) { console.error(`no ${KEY_NAME}= in scripts/localnet/pk.txt`); process.exit(2); }
   const cfg = { ...DEFAULT_CONFIG, url: NODE, key: keyLine.split("=")[1].trim(), phloLimit: PHLO };
+
+  if (GENESIS) {
+    const readcap = GENESIS_READCAP;
+    console.log(`rgov-check (tier 2 — GENESIS governance, no bootstrap) — ${NODE}`);
+    console.log(`acting as ${KEY_NAME}; readcap ${readcap}\n`);
+    // Say what the chain actually carries before running anything against it:
+    // the genesis set is not the same list as rgov's own class directory.
+    const probe = await evalTerm({ ...cfg, url: NODE }, `
+new rl(\`rho:registry:lookup\`), ch, all in {
+  rl!(\`${readcap}\`, *ch) | for (r <- ch) { r!(*all) | for (@m <- all) { return!(m.keys().toList()) } }
+}`).catch((e) => ({ values: [String(e?.message ?? e)] }));
+    console.log(`directory: ${probe.values?.[0] ?? "(no answer)"}\n`);
+    await runActions(cfg, readcap, {});
+    return;
+  }
 
   // A bootstrap is NOT idempotent and cannot be made so from here.
   // `@[*deployerId, "MasterContractAdmin"]!({read, write, grant})` is a linear
@@ -396,22 +419,72 @@ in {
     ok++;
   }
 
-  // --- 2d: claim an identity, then run the client actions ----------------
+  await runActions(cfg, readcap, uris);
+}
+
+/** The client actions, as signed deploys, with real scenario arguments. */
+async function runActions(cfg, readcap, uris) {
+  const { deployTerm } = await import("../qos-cli/rholang-client.mjs");
+  let aOk = 0, aBad = 0;
+  // --- claim an identity, then run the client actions --------------------
   //
   // Every action is run as a signed deploy, as one identity, with the default
   // arguments its own `match [...]` header carries and `$masterURI` replaced by
   // the ReadcapURI just published. newInbox goes first because it is what
   // populates `@[*deployerId, lockerTag]`, which the rest read.
   console.log("\n— governance actions (signed, as " + KEY_NAME + ") —");
-  const ordered = [["newInbox", "src/actions/newinbox.rho"],
-    ...ACTIONS.filter(([n]) => n !== "newInbox" && !/orphan|createInboxandCastVote/.test(n))];
-  let aOk = 0, aBad = 0;
+  // A SCENARIO, not defaults. The files ship with placeholders ("$issue",
+  // `$delegate`, "?") that no harness ever filled, so running them as written
+  // means every inner receive waits for an object nobody created — which
+  // reads as "blocked" and teaches nothing. These are real values, and the
+  // order below exists so a thing is created before it is referenced.
+  const scenario = {
+    lockerTag: "inbox",
+    // newGroup creates it; addMember/addGroupToIssue then name it.
+    name: "audit-group",
+    group: "audit-group",
+    issue: "audit-issue",
+    proposals: '"keep","drop"',
+    theVote: "keep",
+    choices: '"keep"',
+    ballot: "audit-ballot",
+    channel: "audit-chat",
+    message: "hello from rgov-check",
+    type: "chat",
+    subtype: "",
+    from: "bob", to: "carol", sub: "audit", body: "audit message",
+    revAddress: "1111bRUvDCJ2ZtDMtCYU1ScW19uTRbVd9VHUmtPunMEQzS4oSxEkY", // carol
+    // Filled from the chain below: the claimant's own inbox uri, and a real
+    // registered class uri for lookupURI.
+    toInboxURI: "", delegateURI: "", themBoxReg: "", URI: uris.Directory ?? "",
+    userid: "bob", value: "42",
+  };
+  const order = ["newInbox", "newGroup", "joinGroup", "addMember", "newMemberDirectory",
+    "getRoll", "checkRegistration", "newChat", "sendChat", "readChat", "peekInbox",
+    "receiveFromInbox", "newBallot", "castBallot", "newIssue", "addVoterToIssue",
+    "addGroupToIssue", "castVote", "displayVote", "delegateVote", "tallyVotes",
+    "share", "sendMail", "peekKudos", "awardKudos", "makeMint", "lookupURI", "createURI"];
+  const byName = new Map(ACTIONS.map(([n, p2]) => [n, p2]));
+  const ordered = order.filter((n) => byName.has(n)).map((n) => [n, byName.get(n)]);
   for (const [name, path] of ordered) {
     if (ONLY && !name.toLowerCase().includes(ONLY.toLowerCase())) continue;
     const label = name.padEnd(20);
     const src = await source(path);
     if (src === null) { console.log(`${status.miss}${label}${path}`); continue; }
-    const program = applyRawRgov(src.replace(/\$masterURI/g, readcap));
+    // The claimant's own inbox uri, once newInbox has run — it is what the
+    // "send it to a member" actions need as a destination.
+    if (name === "newInbox" && !scenario.toInboxURI) { /* filled after the run below */ }
+    const subbed = withArgs(src.replace(/\$masterURI/g, readcap), { ...scenario, ReadcapURI: readcap });
+    if (subbed.error) { console.log(`${status.fail}${label}${subbed.error}`); aBad++; continue; }
+    if (subbed.headerArity !== null && subbed.headerArity !== subbed.patternArity) {
+      // The file cannot work at any argument values: its match subject and its
+      // pattern are different lengths, so the case never fires.
+      console.log(`${status.fail}${label}ARITY MISMATCH — header supplies ${subbed.headerArity}, pattern binds ${subbed.patternArity} (${subbed.names.join(", ")})`);
+      aBad++;
+      continue;
+    }
+    if (subbed.missing.length) console.log(`         ${name}: no scenario value for ${subbed.missing.join(", ")}`);
+    const program = applyRawRgov(subbed.program);
     const dep = await deployTerm(cfg, program, { waitAttempts: 0 }).catch((e) => ({ ok: false, message: String(e?.message ?? e) }));
     if (!dep.ok) { console.log(`${status.fail}${label}${String(dep.message).slice(0, 140)}`); aBad++; continue; }
     const r = await deployResult(dep.sig);
@@ -424,11 +497,16 @@ in {
       aBad++;
     } else {
       console.log(`${status.ok}${label}${blob.slice(0, 110)}`);
+      if (name === "newInbox") {
+        const u = blob.match(/rho:id:[a-z0-9]+/)?.[0];
+        if (u) { scenario.toInboxURI = u; scenario.delegateURI = u; scenario.themBoxReg = u;
+                 console.log(`         (claimant inbox uri ${u} — used for toInboxURI/delegateURI/themBoxReg)`); }
+      }
       aOk++;
     }
   }
-  console.log(`\nclasses: ${ok} installed, ${bad} failed · actions: ${aOk} answered, ${aBad} did not`);
-  process.exit(bad === 0 && aBad === 0 ? 0 : 1);
+  console.log(`\nactions: ${aOk} answered, ${aBad} did not`);
+  process.exit(aBad === 0 ? 0 : 1);
 }
 
 if (TIER === 2) await tier2();

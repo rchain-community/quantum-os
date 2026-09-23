@@ -124,6 +124,62 @@ export function applyRawRgov(source) {
   return body + (missing ? "\n" + "}".repeat(missing) : "") + "\n";
 }
 
+/** The pattern variables of an rgov file, in binding order: the `[a, b, c]`
+ *  of the `[a, b, c] => {` line that follows its `match` header. */
+export function rawPatternNames(source) {
+  const m = /match\s*\[[\s\S]*?\]\s*\{\s*\[([^\]]*)\]\s*=>/.exec(String(source));
+  if (!m) return null;
+  const inner = m[1].trim();
+  return inner === "" ? [] : inner.split(",").map((x) => x.trim());
+}
+
+/**
+ * Rewrite an rgov file's `match [...]` header with real arguments.
+ *
+ * The files ship with example arguments baked in, and most of them are
+ * placeholders the harness never filled — `"$inbox"`, `` `$delegate` ``,
+ * `Set($choices)`, `"?"`. Running them as-is means every inner receive waits
+ * for an object nobody created, which reads as "blocked" and tells you
+ * nothing. This substitutes by NAME: each pattern variable is looked up in
+ * `values`, quoted by `TYPES` below, and written back into the header.
+ *
+ * It also reports arity, because rgov has at least one file where the header
+ * and the pattern disagree — `share.rho` binds four variables against three
+ * arguments, so its match can never fire no matter what is passed.
+ */
+export const TYPES = {
+  // Anything ending in URI is a registry uri and must be backticked.
+  toInboxURI: "uri", delegateURI: "uri", URI: "uri", ReadcapURI: "MasterURI",
+  themBoxReg: "uri",
+  proposals: "set", choices: "set",
+  // everything else is a plain string
+};
+
+export function withArgs(source, values) {
+  const names = rawPatternNames(source);
+  if (!names) return { error: "no match/pattern header found" };
+  const missing = names.filter((n) => !(n in values));
+  const args = names.map((n) => prepareArg(values[n] ?? "", TYPES[n] ?? "string"));
+  const src = String(source);
+  const header = /match\s*\[[\s\S]*?\]\s*\{/.exec(src);
+  if (!header) return { error: "no match header" };
+  const headerArity = (() => {
+    const inner = /match\s*\[([\s\S]*?)\]\s*\{/.exec(src)?.[1]?.trim();
+    if (inner === undefined) return null;
+    if (inner === "") return 0;
+    // Split on top-level commas only — `Set(a,b)` is one argument.
+    let depth = 0, n = 1;
+    for (const c of inner) {
+      if (c === "(" || c === "[") depth++;
+      else if (c === ")" || c === "]") depth--;
+      else if (c === "," && depth === 0) n++;
+    }
+    return n;
+  })();
+  const program = src.slice(0, header.index) + `match [${args.join(", ")}] {` + src.slice(header.index + header[0].length);
+  return { program, names, missing, headerArity, patternArity: names.length };
+}
+
 /** Do a template's pattern variables line up with its declared fields?
  *  Positional binding makes a mismatch silent, so it is worth asserting. */
 export function patternArity(body) {
@@ -202,6 +258,26 @@ export function selftest() {
   ok("patternArity counts two binders", patternArity("[a, b] => { Nil }") === 2);
   ok("patternArity counts none", patternArity("[] => { Nil }") === 0);
   ok("patternArity is null when there is no pattern", patternArity("Nil") === null);
+
+  // withArgs — substituting by name into a real rgov header shape.
+  const rgovFile = 'match ["$inbox", "$issue", `$delegate`] {\n[lockerTag, issue, delegateURI] => {\n  Nil\n}\n}';
+  ok("rawPatternNames reads the binding order",
+    JSON.stringify(rawPatternNames(rgovFile)) === '["lockerTag","issue","delegateURI"]', JSON.stringify(rawPatternNames(rgovFile)));
+  const sub = withArgs(rgovFile, { lockerTag: "inbox", issue: "audit", delegateURI: "rho:id:abc" });
+  ok("withArgs replaces the placeholder header",
+    sub.program.startsWith('match ["inbox", "audit", `rho:id:abc`] {'), JSON.stringify(sub.program?.slice(0, 60)));
+  ok("withArgs backticks a uri-typed name", sub.program.includes("`rho:id:abc`"));
+  ok("withArgs reports nothing missing when all names are supplied", sub.missing.length === 0);
+  const short = withArgs(rgovFile, { lockerTag: "inbox" });
+  ok("withArgs names the arguments it was not given",
+    JSON.stringify(short.missing) === '["issue","delegateURI"]', JSON.stringify(short.missing));
+  // share.rho's real defect: four binders, three arguments.
+  const mismatched = 'match ["inbox", "", ""] {\n[lockerTag, toInboxURI, type, subtype] => {\n Nil\n}\n}';
+  const mm = withArgs(mismatched, {});
+  ok("withArgs surfaces an arity mismatch (share.rho binds 4 against 3)",
+    mm.headerArity === 3 && mm.patternArity === 4, `header=${mm.headerArity} pattern=${mm.patternArity}`);
+  ok("a Set-typed argument is not split on its inner comma",
+    withArgs('match [Set($c)] {\n[proposals] => { Nil }\n}', { proposals: '"a","b"' }).headerArity === 1);
 
   console.log(`\nrgov-apply: ${pass}/${total} passed`);
   return pass === total;
