@@ -109,6 +109,33 @@ The same caution applies to anything reached with a deployer id in hand: passing
 `*deployerId` to a facet resolved from the registry hands that facet your
 identity for the duration of the call, so it matters whose facet it is.
 
+## An inbox has no whole-contract dump
+
+The three governance contracts each carry an `admin` facet for migration, gated
+to whoever installed them. For `Group` and `Issue` that is harmless: their state
+is what the public `read` facet already answers.
+
+For `Inbox` it was not. Measured on the playground: `admin dump` returned message
+**bodies** in clear, so the installer of an inbox could read every locker in it,
+capabilities included. A read facet that promises not to answer a body is worth
+nothing if another verb answers all of them at once.
+
+Nothing was lost by removing it, because `dump`/`load` could never have migrated
+an inbox anyway. `load` takes a term the **client** writes, and there is no
+source syntax for an unforgeable name — so that path would have moved the data
+and silently dropped every capability, which for a vault is the only content
+that mattered.
+
+Migration is per-identity and stays on chain: `export` your own lockers and
+`import` them into the new contract **in one term**, so the unforgeables pass
+from contract to contract without ever being serialised out to a client.
+Verified end to end — a capability delivered into a locker, migrated to a second
+Inbox, then taken out of the *new* contract and used successfully against the
+*old* one.
+
+Nobody can move your capabilities for you. For a vault that is the correct
+property, not a limitation.
+
 ## Security architecture
 
 ### ZFA capability tokens
