@@ -464,7 +464,7 @@ export async function run(args) {
   }
 
   const askHint = advisor.enabled ? "" : " (needs --ai)";
-  const faucetHint = facilKey ? ` · \`/${CMD} faucet [address]\` (sends ${FAUCET_REV} TEST REV to a REV address — test systems only)` : "";
+  const faucetHint = facilKey ? ` · \`/${CMD} faucet\` (sends ${FAUCET_REV} TEST REV to your own address, which your browser fills in; pass one to override — test systems only)` : "";
   const helpText = () => `I'm ${myName}, ${role.blurb} Commands: \`/${CMD}\` (am I here?) · \`/${CMD} help\` · \`/${CMD} ask <question>\`${askHint} · \`/${CMD} optimize <problem>\`${askHint} (facilitate an annealing-style optimization round) · \`/${CMD} chair <topic>\`${askHint} (chair a structured deliberation → define · alternatives · evaluate · disagreements · agreements · closure, then record the decision; \`/${CMD} next\`/\`back\`/\`close\`/\`cancel\` to steer) · \`/${CMD} start <label> [payoffs a,b,c,d] [stag=…] [hare=…] [predict: …]\` / \`/${CMD} stop\` (record a live game: every poll, estimate, lemma and message, timestamped and signed → a structured record; \`/${CMD} games\`, \`/${CMD} summarize\`${askHint}, \`/${CMD} publish\`) · \`/${CMD} list [n]\` (the room's screen history, oldest→newest — default 25, max 500) · \`/${CMD} trust\` (my standing) · \`/${CMD} health\` (uptime, peers, budget, CPU) · \`/${CMD} off\` / \`/${CMD} on\` (mute/unmute)${faucetHint}. I'm a full member — \`/gov trust\` me up or \`/gov censure\` me down. About this room (and how to make your own): ${ABOUT_URL}`;
   const statusText = () => `👋 Yes, I'm here — ${myName} (${role.name})${muted ? ` — currently muted (\`/${CMD} on\` to wake me)` : ""}.${standing.governed ? ` Trust ${standing.level}${standing.discredited ? " — stood down" : ` (≤${standing.budget}/5min)`}.` : ""} \`/${CMD} help\` · \`/${CMD} trust\`.`;
   const introText = () => `Hi — I'm ${myName}, ${role.blurb} Say \`/${CMD}\` or \`/${CMD} help\` to reach me${advisor.enabled ? `, or \`/${CMD} ask <q>\` to ask me anything` : ""}. I'm a full room member — \`/gov trust\`/\`/gov censure\` me; \`/${CMD} trust\` shows my standing. About this room: ${ABOUT_URL}`;
@@ -491,12 +491,12 @@ export async function run(args) {
     // back to a stale address on file, which would look like the new one was
     // accepted when it was actually just ignored.
     if (explicit && !REV_ADDR_RE.test(explicit)) {
-      directReply(fromId, `That doesn't look like a REV address — \`/${CMD} faucet <address>\` (find yours via \`/rholang key show\` in your browser).`);
+      directReply(fromId, `That doesn't look like a REV address — \`/${CMD} faucet\` on its own uses yours, or pass one explicitly.`);
       return;
     }
     const addr = explicit || (known[fromId]?.revAddress ?? "");
     if (!addr) {
-      directReply(fromId, `I can send ${FAUCET_REV} test REV — what's your REV address? \`/${CMD} faucet <address>\` (find yours via \`/rholang key show\`).`);
+      directReply(fromId, `I can send ${FAUCET_REV} test REV, but I have no address for you — a browser fills that in automatically, so this usually means no deploy key yet: \`/rholang key generate\`, then \`/${CMD} faucet\` on its own.`);
       return;
     }
     if (explicit && known[fromId]?.revAddress !== explicit) {
@@ -509,7 +509,7 @@ export async function run(args) {
       if (!out.ok) { directReply(fromId, `Deploy failed: ${out.message.slice(0, 300)}`); return; }
       if (out.confirmed) directReply(fromId, `✅ Sent ${FAUCET_REV} test REV to ${addr}.`);
       else if (out.message) directReply(fromId, `⚠️ Deploy landed but the transfer didn't confirm: ${out.message.slice(0, 300)}`);
-      else directReply(fromId, `Deploy accepted, but I couldn't confirm the transfer within the wait window — check your balance (\`/rholang eval\`, \`$balance(me)\`) in a bit.`);
+      else directReply(fromId, `Deploy accepted, but I couldn't confirm the transfer within the wait window — check your balance with \`$balance($me)\` in a bit — that is a \`/rholang eval\` under the hood, if you want to see the program.`);
     } catch (e) { directReply(fromId, `Faucet error: ${e?.message ?? e}`); }
   }
   // Intent phrases an ask-mode question routes here on, BEFORE the LLM ever

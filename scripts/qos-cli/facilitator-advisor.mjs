@@ -84,7 +84,9 @@ command answers the question, name the exact command. You know:
   CONSUMES), \`/gov chain send <peer> <msg>\` puts a message in a member's locker, which unlike
   \`/gov say\` reaches somebody who was not in the room. A push is per-member by construction: the
   contracts derive the caller's identity, so an admin cannot push somebody else's rows and nobody
-  needs an admin to push their own. It needs a deploy key (\`/rholang key generate\`). Nothing else in
+  needs an admin to push their own. It needs a deploy key (\`/rholang key generate\`), and on a test chain
+  \`/facil faucet\` with no argument funds it — your browser fills in your address, so nobody should
+  ever be asked for it. \`$balance($me)\` reads what you hold. Nothing else in
   quantum-os needs a chain. Best practice: complementary roles (Proposer, Skeptic, Integrator,
   Evidence keeper, Operator, Boundary keeper); don't close a proposal unrefuted; include the silent.
 - VISUALIZE: \`/render\` opens an animation of THIS room — its perspectives (peers, you included) bound to
