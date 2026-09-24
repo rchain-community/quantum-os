@@ -344,6 +344,66 @@ await write("issue: a closed issue refuses a ballot", bob, C.castProgram(ISSUE, 
 await write("issue: a closed issue refuses a roll change too", alice,
   C.setRollProgram(ISSUE, "i1", [A]), (v) => JSON.stringify(v).includes("closed"));
 
+// ── migration: does a CAPABILITY survive it? ────────────────────────────────
+// The whole reason the vault refuses admin dump/load. A client cannot serialise
+// an unforgeable, so the only migration that preserves one happens in a single
+// term, contract to contract.
+const INBOX2 = uriOf(await write("install a SECOND Inbox to migrate into", alice, C.installInboxProgram()));
+if (INBOX2) {
+  // Put a live capability in alice's locker: bob grants a send cap for his own
+  // locker and delivers it to her, in one term.
+  await write("bob delivers a send-cap into alice's locker", bob,
+    viaSelf(INBOX, `@found!(*deployerId, "grantSend", ["inbox"], *ret) |
+            for (@answer <- ret) {
+              match answer {
+                ("granted", "send", _, cap) => {
+                  @found!(*deployerId, "send", [${JSON.stringify(A)}, "inbox",
+                          {"type": "cap", "body": cap}], *ret2) |
+                  for (@sent <- ret2) { deployId!(["delivered", sent]) }
+                }
+                _ => { deployId!(["unexpected", answer]) }
+              }
+            }`),
+    (v) => JSON.stringify(v).includes("delivered"));
+
+  await write("alice migrates her lockers to the new Inbox", alice,
+    C.migrateLockersProgram(INBOX, INBOX2), (v) => JSON.stringify(v).includes("imported"));
+  await read("the capability arrived at the new contract",
+    C.countInProgram(INBOX2, A, "inbox", "cap"), (v) => v[0] === 1);
+  await write("importing twice is refused", alice,
+    C.migrateLockersProgram(INBOX, INBOX2), (v) => JSON.stringify(v).includes("already has lockers"));
+
+  // THE point: take the migrated capability out of the NEW contract and use it.
+  // If an unforgeable had been serialised anywhere in between, this is dead.
+  await write("the MIGRATED capability still works", alice,
+    viaSelf(INBOX2, `@found!(*deployerId, "receive", ["inbox"], *ret) |
+            for (@answer <- ret) {
+              match answer {
+                ("received", msgs) => {
+                  match msgs.getOrElse("cap", []) {
+                    [m ..._] => {
+                      match m {
+                        {"body": cap, ..._} => {
+                          @cap!({"type": "afterMigration", "body": "it lived"}, *r2) |
+                          for (@x <- r2) { deployId!(["usedAfterMigration", x]) }
+                        }
+                        _ => { deployId!(["no body", m]) }
+                      }
+                    }
+                    _ => { deployId!(["no cap message", msgs]) }
+                  }
+                }
+                _ => { deployId!(["unexpected", answer]) }
+              }
+            }`),
+    (v) => JSON.stringify(v).includes("usedAfterMigration"));
+  await read("…and it wrote into bob's locker on the OLD contract",
+    C.countInProgram(INBOX, B, "inbox", "afterMigration"), (v) => v[0] === 1);
+
+  await write("a vault refuses whole-contract dump", alice, C.dumpProgram(INBOX2),
+    (v) => JSON.stringify(v).includes("no whole-contract dump"));
+}
+
 // ── admin: migration, and who may do it ─────────────────────────────────────
 await write("admin: bob is NOT the installer", bob, C.dumpProgram(GROUP),
   (v) => JSON.stringify(v).includes("not the installer"));
@@ -352,7 +412,7 @@ await write("admin: alice can dump", alice, C.dumpProgram(GROUP),
 await write("admin: load refuses a non-empty cell", alice, C.loadProgram(GROUP, "{}"),
   (v) => JSON.stringify(v).includes("not empty"));
 await write("admin: version", alice, C.writeProgram(GROUP, "admin", "version", [], { asAdmin: true }),
-  (v) => JSON.stringify(v).includes("Group/1"));
+  (v) => JSON.stringify(v).includes("Group/3"));
 
 // ── the natives read what the contracts wrote ────────────────────────────────
 const rl = (x) => JSON.stringify(x);

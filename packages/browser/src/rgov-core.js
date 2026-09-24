@@ -84,7 +84,7 @@ const q = (s) => JSON.stringify(String(s));
  * facets, and the identity derivation with its Nil guard. VERBS is replaced
  * with the contract's own dispatchers.
  */
-const preamble = (version) => `new state, ownerCh, readFacet, selfFacet, adminFacet,
+const preamble = (version, { vault = false } = {}) => `new state, ownerCh, readFacet, selfFacet, adminFacet,
     doSelf, doRead, doAdmin, HELPERS
     revAddr(\`rho:rev:address\`),
     insertArbitrary(\`rho:registry:insertArbitrary\`),
@@ -128,8 +128,25 @@ in {
   contract doAdmin(@verb, @args, ret) = {
     for (@s <- state) {
       match [verb, args] {
-        ["dump", []]    => { state!(s) | ret!(("dump", s)) }
         ["version", []] => { state!(s) | ret!(("version", ${q(version)})) }
+${vault ? `
+        // A VAULT HAS NO WHOLE-CONTRACT DUMP. Measured: dump returns message
+        // bodies in clear, so the installer of an inbox could read every
+        // locker in it, capabilities included — the read facet's promise not to
+        // answer a body is worth nothing if one verb answers all of them.
+        //
+        // Nothing is lost by refusing, because dump/load could never migrate an
+        // inbox anyway: "load" takes a term the CLIENT writes, and there is no
+        // source syntax for an unforgeable name. It would have moved the data
+        // and silently dropped every capability — the only contents that matter.
+        //
+        // Migration is per-identity and stays on chain: "export" your own
+        // lockers and "import" them into the new contract IN ONE TERM, so the
+        // unforgeables never leave the tuplespace. Nobody can move your
+        // capabilities for you, which is the correct property for a vault.
+        ["dump", []]    => { state!(s) | ret!(("gov-error", "no whole-contract dump", "a vault is per-identity: self export/import, in one term")) }
+        ["load", [s2]]  => { state!(s) | ret!(("gov-error", "no whole-contract load", "a vault is per-identity: self export/import, in one term")) }` : `
+        ["dump", []]    => { state!(s) | ret!(("dump", s)) }
         // Refuses a non-empty cell: loading over live state would silently
         // discard it, and there is no undo on a chain.
         ["load", [s2]]  => {
@@ -137,7 +154,7 @@ in {
             true  => { state!(s2) | ret!(("loaded", s2.keys().toList().length())) }
             false => { state!(s) | ret!(("gov-error", "not empty")) }
           }
-        }
+        }`}
         _ => { state!(s) | ret!(("gov-error", "bad verb or arity", verb)) }
       }
     }
@@ -304,6 +321,23 @@ const INBOX_VERBS = `contract doSelf(@me, @verb, @args, ret) = {
           }
         }
 
+        // Migration, per identity. Your own lockers and nobody else's — which is
+        // the whole reason the vault has no admin dump. Bodies come back in
+        // full, capabilities included, because they are yours.
+        ["export", []] => { state!(s) | ret!(("export", s.getOrElse(me, {}))) }
+
+        // The other half. Refuses a tag that already exists rather than merging
+        // into it: a silent merge across two versions of a vault is how a
+        // capability ends up in a locker its owner did not expect.
+        ["import", [lockers]] => {
+          let @mine <- s.getOrElse(me, {}) in {
+            match mine.keys().toList().length() == 0 {
+              false => { state!(s) | ret!(("gov-error", "already has lockers", me)) }
+              true  => { state!(s.set(me, lockers)) | ret!(("imported", lockers.keys().toList().length())) }
+            }
+          }
+        }
+
         _ => { state!(s) | ret!(("gov-error", "bad verb or arity", verb)) }
       }
     }
@@ -324,7 +358,7 @@ const INBOX_VERBS = `contract doSelf(@me, @verb, @args, ret) = {
     }
   } |`;
 
-export const INBOX_RHO = preamble("Inbox/2").replace("HELPERS\n", "").replace("VERBS", INBOX_VERBS);
+export const INBOX_RHO = preamble("Inbox/3", { vault: true }).replace("HELPERS\n", "").replace("VERBS", INBOX_VERBS);
 
 // ---------------------------------------------------------------------------
 // 2. Group — the state the natives read
@@ -605,7 +639,7 @@ const GROUP_VERBS = `${GROUP_FOLDS}
     }
   } |`;
 
-export const GROUP_RHO = preamble("Group/1").replace("HELPERS", GROUP_HELPERS).replace("VERBS", GROUP_VERBS);
+export const GROUP_RHO = preamble("Group/3").replace("HELPERS", GROUP_HELPERS).replace("VERBS", GROUP_VERBS);
 
 // ---------------------------------------------------------------------------
 // 3. Issue — proposals and ballots
@@ -791,7 +825,7 @@ const ISSUE_VERBS = `contract doSelf(@me, @verb, @args, ret) = {
     }
   } |`;
 
-export const ISSUE_RHO = preamble("Issue/2")
+export const ISSUE_RHO = preamble("Issue/3")
   .replace("HELPERS\n", "")
   .replace("new state, ownerCh,", "new state, ownerIdx, ownerCh,")
   .replace("state!({}) |", "state!({}) | ownerIdx!({}) |")
@@ -955,6 +989,51 @@ export const setRollProgram = (uri, iid, voters) =>
 export const ballotsOfProgram = (uri, iid) => readProgram(uri, "ballotsOf", [q(iid)]);
 export const issuesOfProgram  = (uri, gid) => readProgram(uri, "issuesOf", [q(gid)]);
 
+/**
+ * Move one identity's lockers from an old Inbox to a new one, IN ONE TERM.
+ *
+ * This is the only way a capability can be migrated, and the reason the vault
+ * has no whole-contract dump. `dump`/`load` cannot do it: `load` takes a term
+ * the *client* writes, and there is no source syntax for an unforgeable name —
+ * so that path would move the data and silently drop every capability, which
+ * for a vault is everything that mattered. Here both calls happen in one
+ * program, so the unforgeables pass from contract to contract without ever
+ * being serialised out to a client.
+ *
+ * It forwards `*deployerId` to two facets. That is the caution in SECURITY.md
+ * applied deliberately: both are contracts the caller resolved themselves, and
+ * a migration is exactly the moment to be sure which ones they are.
+ */
+export function migrateLockersProgram(oldUri, newUri) {
+  return `new lookup(\`rho:registry:lookup\`), deployerId(\`rho:rchain:deployerId\`),
+    deployId(\`rho:rchain:deployId\`), oldCh, newCh, oldCaps, newCaps, r1, r2 in {
+  lookup!(\`${oldUri}\`, *oldCh) | lookup!(\`${newUri}\`, *newCh) |
+  for (@oldRec <- oldCh; @newRec <- newCh) {
+    match oldRec { (_, c) => { oldCaps!(c) } c => { oldCaps!(c) } } |
+    match newRec { (_, c) => { newCaps!(c) } c => { newCaps!(c) } } |
+    for (@oc <- oldCaps; @nc <- newCaps) {
+      match [oc, nc] {
+        [{"self": oldSelf, ..._}, {"self": newSelf, ..._}] => {
+          @oldSelf!(*deployerId, "export", [], *r1) |
+          for (@ex <- r1) {
+            match ex {
+              ("export", lockers) => {
+                @newSelf!(*deployerId, "import", [lockers], *r2) |
+                for (@res <- r2) { return!(res) | deployId!(res) }
+              }
+              _ => { return!(("gov-error", "export failed", ex)) | deployId!(("gov-error", "export failed", ex)) }
+            }
+          }
+        }
+        _ => { return!(("gov-error", "no self facet")) | deployId!(("gov-error", "no self facet")) }
+      }
+    }
+  }
+}`;
+}
+
+export const exportLockersProgram = (uri) => writeProgram(uri, "self", "export", []);
+
 // --- migration -------------------------------------------------------------
 export const dumpProgram = (uri) => writeProgram(uri, "admin", "dump", [], { asAdmin: true });
 export const loadProgram = (uri, stateTerm) => writeProgram(uri, "admin", "load", [String(stateTerm)], { asAdmin: true });
@@ -1014,7 +1093,21 @@ export function selftest() {
        "law 40 — a call at the wrong arity does nothing and nothing errors");
     ok(`${name}: admin is gated to the installer`,
        /match me == owner \{/.test(src) && /"gov-error", "not the installer"/.test(src));
-    ok(`${name}: load refuses a non-empty cell`, /"gov-error", "not empty"/.test(src));
+    // The Inbox is a vault: it refuses whole-contract dump/load outright, since
+    // dump leaks every message body and load could never have carried a
+    // capability anyway. Group and Issue hold state the read facet already
+    // publishes, so for them dump/load is migration and not a disclosure.
+    if (name === "Inbox") {
+      ok(`${name}: refuses whole-contract dump and load`,
+         /"gov-error", "no whole-contract dump"/.test(src) && /"gov-error", "no whole-contract load"/.test(src),
+         "dump returns message bodies; load cannot carry an unforgeable");
+      ok(`${name}: migration is per-identity instead`,
+         /\["export", \[\]\]/.test(src) && /\["import", \[lockers\]\]/.test(src));
+      ok(`${name}: import refuses to merge into existing lockers`,
+         /"gov-error", "already has lockers"/.test(src));
+    } else {
+      ok(`${name}: load refuses a non-empty cell`, /"gov-error", "not empty"/.test(src));
+    }
     // `if` is a PROCESS in rholang, so using one where a value belongs stores a
     // conditional and the next read of that field dies with "Expected a single
     // expression". setRole did exactly this and only the live check caught it.
@@ -1131,6 +1224,12 @@ export function selftest() {
      /^new return, lookup/.test(r), r.slice(0, 60));
   ok("read: reaches the read facet and no other",
      /\{"read": found, \.\.\._\}/.test(r) && !/"self":/.test(r));
+
+  const mig = migrateLockersProgram(URI, "rho:id:zzzz");
+  ok("migration keeps export and import in ONE term",
+     /@oldSelf!\(\*deployerId, "export", \[\], \*r1\)/.test(mig) && /@newSelf!\(\*deployerId, "import", \[lockers\], \*r2\)/.test(mig),
+     "the only way an unforgeable survives — a client cannot serialise one");
+  ok("migration resolves both contracts itself", balanced(mig) && /lookup!\(`rho:id:zzzz`/.test(mig));
 
   ok("admin: dump reaches the admin facet", /\{"admin": found, \.\.\._\}/.test(dumpProgram(URI)));
 

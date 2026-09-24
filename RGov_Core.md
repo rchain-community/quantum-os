@@ -162,7 +162,8 @@ msg  : { "from": <addr>, "type": <str>, "subtype": <str>, "at": <int>, "body": <
 | `self` | `grantSend(deployerId, tag, ret)` | an append-only facet bound to **one** locker |
 | `read` | `lockersOf(addr, ret)` | tag names and message **counts** only |
 | `read` | `countIn(addr, tag, type, ret)` | counts only |
-| `admin` | `dump(ret)` / `load(deployerId, s, ret)` | migration; `load` refuses a non-empty cell |
+| `admin` | `version` only | **no whole-contract dump**: it returned message bodies |
+| `self` | `export()` · `import(lockers)` | migration, per identity, in one term |
 
 **The public `read` facet never returns a message body.** Metadata is public; contents require a
 per-locker cap. That is requirement 2 (reporting without write authority) and requirement 4 (blast
@@ -230,7 +231,7 @@ groups: { <groupId>: {
 | `read` | `delegationsOf(groupId, issueId, ret)` | → `resolveWeights` arg 2, topic over standing |
 | `read` | `censuresOf(groupId, ret)` · `vouchersOf(groupId, ret)` | → `censure` args 1 and 3 |
 | `read` | `membersOf(groupId, ret)` · `roll(groupId, ret)` | |
-| `admin` | `dump` / `load` | migration |
+| `admin` | `dump` / `load` / `version` | migration; `load` refuses a non-empty cell |
 
 **Ratings are stored raw and capped by the node.** `gov.ts` caps a rating at the rater's own level
 minus one, and `trustLevels` re-caps during aggregation — so a forged high rating is already
@@ -265,7 +266,7 @@ issues: { <issueId>: {
 | `admin` | `lock` / `close(deployerId, issueId, ret)` | freeze options / freeze ballots |
 | `read` | `ballotsOf(issueId, ret)` | → `tally` arg 1 |
 | `read` | `votersOf` · `optionsOf` · `statusOf` · `issuesOf(groupId)` · `resultsOf` | |
-| `admin` | `dump` / `load` | migration |
+| `admin` | `dump` / `load` / `version` | migration; `load` refuses a non-empty cell |
 
 **No contract counts votes.** `tally` is the node's, deterministic over published ballots and
 published weights, so anyone can recompute it. `propose` therefore records results *keyed by who
