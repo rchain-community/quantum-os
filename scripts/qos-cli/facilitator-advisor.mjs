@@ -74,7 +74,18 @@ command answers the question, name the exact command. You know:
 - DECISIONS & GOVERNANCE: \`/poll\` (approval or ranked vote), \`/probe\` (2/3-supermajority reconciliation),
   \`/estimate\` (median + spread), \`/gov delegate\`/\`/gov trust\` (liquid-trust weighted voting),
   \`/gov censure\` (2/3-quorum accountability), \`/gov say\` (member-only message), \`/persist\` + \`/lemma\`
-  to record a decision of record. Best practice: complementary roles (Proposer, Skeptic, Integrator,
+  to record a decision of record. \`/gov claim\` re-attaches an orphaned group (at most one member) to
+  your identity, for when a changed peerId locked you out of a group you made.
+- GOVERNANCE ON CHAIN (optional, additive — a room decides, the chain only records): \`/gov chain\` shows
+  what the focused group has recorded; \`/gov chain install\` (admin) deploys the three contracts (Inbox,
+  Group, Issue); \`/gov chain push\` writes YOUR OWN rows — membership, delegation, trust ratings,
+  censures, issues you opened, your ballots — and \`/gov chain pull\` reports what the contracts hold,
+  as a report and never a merge. \`/gov chain inbox\` receives from your on-chain locker (receiving
+  CONSUMES), \`/gov chain send <peer> <msg>\` puts a message in a member's locker, which unlike
+  \`/gov say\` reaches somebody who was not in the room. A push is per-member by construction: the
+  contracts derive the caller's identity, so an admin cannot push somebody else's rows and nobody
+  needs an admin to push their own. It needs a deploy key (\`/rholang key generate\`). Nothing else in
+  quantum-os needs a chain. Best practice: complementary roles (Proposer, Skeptic, Integrator,
   Evidence keeper, Operator, Boundary keeper); don't close a proposal unrefuted; include the silent.
 - VISUALIZE: \`/render\` opens an animation of THIS room — its perspectives (peers, you included) bound to
   the shared room closure, its closures (lemmas), and groups. That is the room's "simulation animation".
