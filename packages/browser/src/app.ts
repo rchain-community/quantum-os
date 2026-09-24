@@ -3723,7 +3723,8 @@ function handleCommand(raw: string): string[] {
           for (const k of ["inbox", "group", "issue"] as const) {
             sys(`  ${k.padEnd(6)} ${refs[k] ?? "— not recorded"}`);
           }
-          sys(myAddr ? `  you are ${myAddr}` : "  you have no deploy key — /rholang key generate");
+          sys(myAddr ? `  you are ${memberLabel(g, meId, meAnchor)} — ${myAddr}`
+                     : "  you have no deploy key — /rholang key generate");
           const known = Object.values(g.members).filter((m) => m.revAddr).length;
           sys(`  ${known}/${Object.keys(g.members).length} members have published a chain address`);
           sys("  /gov chain install · push · pull · <inbox|group|issue> <uri>");
@@ -3864,9 +3865,27 @@ function handleCommand(raw: string): string[] {
           sys(`reading ${g.name} from ${refs.group}…`);
           void (async () => {
             const say = (l: string) => addMessage("", l, "system");
+            // The chain keys every row by REV address, because a derived address
+            // is the only identity a contract can be sure of. A room knows
+            // people by name, so translate on the way out: a report nobody can
+            // read is a report nobody will check, which defeats the point of
+            // pull reporting rather than merging. Anyone whose address the room
+            // has not learned stays an address, shortened — never guessed at.
+            const known = new Map<string, string>();
+            for (const m of Object.values(g.members)) {
+              if (m.revAddr) known.set(m.revAddr, m.label || m.peerId.slice(0, 8));
+            }
+            let sawUnknown = false;
+            const humanise = (t: string) =>
+              t.replace(/1111[1-9A-HJ-NP-Za-km-z]{20,60}/g, (addr) => {
+                const label = known.get(addr);
+                if (label) return label;
+                sawUnknown = true;
+                return `${addr.slice(0, 8)}…${addr.slice(-4)}`;
+              });
             const one = async (label: string, program: string) => {
               const r = await evalTerm(cfg, program);
-              say(`  ${label.padEnd(14)} ${r.values.length ? r.values.join(" | ") : "—"}`);
+              say(`  ${label.padEnd(14)} ${r.values.length ? humanise(r.values.join(" | ")) : "—"}`);
               return r;
             };
             await one("members", rgov.readProgram(refs.group!, "membersOf", [JSON.stringify(g.id)]));
@@ -3884,6 +3903,10 @@ function handleCommand(raw: string): string[] {
               }
             }
             say("  (a report, not a merge — the room's own state is untouched)");
+            if (sawUnknown) {
+              say("  names shown for members this room knows; a shortened address is somebody it does not —");
+              say("  they appear once they run /gov chain push, which is what publishes the mapping");
+            }
           })();
           break;
         }

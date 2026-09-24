@@ -160,6 +160,15 @@ jobs:
       - name: POSIX-net socket test
         run: node packages/browser/test/posix-net.test.mjs
 
+      # Every /gov subcommand findable in Governance.md, and the chain family
+      # present in the room agent's own knowledge. Both regressions happened:
+      # /gov claim shipped documented nowhere (and it is the recovery path for
+      # somebody locked out of their own group), and /gov chain shipped without
+      # reaching askKnowledge, so /facil ask denied it existed. Caught by a
+      # person both times.
+      - name: Gov commands are documented
+        run: node packages/browser/test/gov-docs.test.mjs
+
       # The local /search + /solve enumerator (#119) — possibilities/events
       # shapes, the listener rollups, the /solve cascade, and a conformance
       # block of digests captured from quantum-logical-framework's
