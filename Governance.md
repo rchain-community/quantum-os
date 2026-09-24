@@ -177,6 +177,7 @@ clicking it in the Governance sidebar, or implicitly when there's only one group
 | Command | Effect |
 |---|---|
 | `/gov new <name>` | Create a group (you become admin); focus + show its card |
+| `/gov claim` | Re-attach an **orphaned** group to this identity. A peerId is per-tab and can change; a member record written before anchors were stamped carries no durable identity, so a creator whose peerId moved could lose admin of their own group with no way back. Gated on the group having **at most one member** — not a permission check but a situation in which the question does not arise: either the sole record is this identity under an old peerId, or the group is empty, and there is nobody a claim could take anything from. A group with two members is somebody else's to grant, and `member add` is how they grant it |
 | `/gov show <name>` · `/gov list` | Focus + render a group / list all groups |
 | `/gov member add <peer> [admin]` · `member remove <peer>` | Manage roster (admin only); membership is capability-backed |
 | `/gov issue <title>` · `/gov issue list` | Record / list issues to decide. Each issue gets its own **issue card** (title, group, weighted result, open-vote/vote) that persists in the transcript and replays on reload, like a poll card |

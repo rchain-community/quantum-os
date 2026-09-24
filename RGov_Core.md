@@ -1,7 +1,7 @@
 # rgov core — the three contracts
 
 **Built and verified.** [`packages/browser/src/rgov-core.js`](packages/browser/src/rgov-core.js),
-81/81 selftest in CI, 69/69 live on the playground, reachable from a room through `/gov chain`.
+91/91 selftest in CI, 84/84 live on the playground, reachable from a room through `/gov chain`.
 This is the design and the evidence for it, written after an audit established that most of what
 rgov does on-chain either belongs to the node or belongs nowhere.
 
@@ -374,9 +374,9 @@ stashed one fails CI.
 
 [`packages/browser/src/rgov-core.js`](packages/browser/src/rgov-core.js) — the three contract
 sources, their install programs and every call-site builder, plain JS in the `locker.js` /
-`wrapped-token.js` shape. `node packages/browser/src/rgov-core.js --selftest` is **84/84** and runs
+`wrapped-token.js` shape. `node packages/browser/src/rgov-core.js --selftest` is **91/91** and runs
 in CI. The live half, `scripts/localnet/rgov-core-check.mjs`, installed all three on
-`rnodeapi.rhobot.net` and walked a scenario: **76 ok, 0 failed** across 3 identities.
+`rnodeapi.rhobot.net` and walked a scenario: **84 ok, 0 failed** across 3 identities.
 
 What that run actually established, beyond "it parses":
 
@@ -416,7 +416,7 @@ established here; it is worth a look before anyone relies on `/rholang register|
 
 1. ~~**Probe** `rho:rev:address("fromDeployerId", …)` on a passed-through deployer id.~~ **Done —
    it holds** (see *Verified live* above), with the `Nil` guard as the one amendment it forced.
-2. ~~**`packages/browser/src/rgov-core.js`**~~ **Done** — 78/78 selftest, in CI.
+2. ~~**`packages/browser/src/rgov-core.js`**~~ **Done** — 91/91 selftest, in CI.
 3. ~~**Deploy to the playground**~~ **Done** — `scripts/localnet/rgov-core-check.mjs`, 28/28 live.
    Every verb is now covered, including the capability-delivery path end to end and the negatives.
 4. ~~**Wire `/gov`**~~ **Done** — `/gov chain` (`install` · `push` · `pull` · `inbox|group|issue
