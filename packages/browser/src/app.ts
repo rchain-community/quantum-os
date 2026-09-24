@@ -6045,7 +6045,28 @@ function handleCommand(raw: string): string[] {
     case "skeptic":
     case "observer":
     case "greeter": {
-      const out = "/" + cmd + (arg ? " " + arg : "");
+      // An agent cannot know your REV address — it is derived from a key only
+      // this browser holds — so anything that needs one has to carry it. A
+      // bare `faucet` is the case that matters: being asked "what's your REV
+      // address?" by something that could not possibly know it, when the
+      // browser knows it perfectly well, is a question that should not be
+      // asked. `$me` is resolved here too, so it works in any agent command.
+      let relayArg = arg;
+      const agentVerb = arg.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+      if ((agentVerb === "faucet" || agentVerb === "testrev") && !arg.trim().slice(agentVerb.length).trim()) {
+        const k = loadNodeConfig().key;
+        if (k) {
+          try { relayArg = `${agentVerb} ${revAddressOf(k)}`; } catch { /* keep the bare form */ }
+        } else {
+          sys("no deploy key yet, so there is no address to ask for — /rholang key generate first");
+          break;
+        }
+      } else if (/\$me\b/.test(arg)) {
+        relayArg = resolveClientTokens(arg, sys);
+        // resolveClientTokens quotes it for rholang; an agent wants it bare.
+        relayArg = relayArg.replace(/"(1111[1-9A-HJ-NP-Za-km-z]{20,60})"/g, "$1");
+      }
+      const out = "/" + cmd + (relayArg ? " " + relayArg : "");
       if (qpeer) qpeer.broadcast({ kind: "chat", text: out });
       sys(`→ relayed to the room's ${cmd} agent(s) — each answers for itself (there may be several, or none). The browser doesn't vouch for any.`);
       break;
