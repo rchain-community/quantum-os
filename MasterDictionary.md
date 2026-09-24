@@ -233,7 +233,7 @@ with two identities. The claims that had to hold:
 
 The four bolded rows are the design: squatting is not expressible, a grant can be withdrawn, a seal
 holds, and the governed tier is governed. `node packages/browser/src/dictionary.js --selftest` is
-29/29 and runs in CI.
+30/30 and runs in CI.
 
 ## Open questions
 
