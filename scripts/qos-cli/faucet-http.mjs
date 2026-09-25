@@ -120,7 +120,15 @@ export function createFaucetServer({
       return;
     }
     // rnode's shape first (deployId, amount in dust, to), then ours.
-    json(res, 200, { deployId: out.deployId ?? "", amount: Number(amount), to: address, ok: true, address, detail: out.message ?? "" });
+    // `confirmed` says the recipient's balance was SEEN to rise, not merely
+    // that the deploy was accepted — a wallet polling this should be able to
+    // tell "it arrived" from "it is on its way" without guessing.
+    json(res, 200, {
+      deployId: out.deployId ?? "", amount: Number(amount), to: address, ok: true, address,
+      confirmed: out.confirmed === true,
+      ...(typeof out.balance === "number" ? { balance: out.balance } : {}),
+      detail: out.message ?? (out.confirmed ? "balance confirmed" : "accepted; settling"),
+    });
   });
 
   return { server, admit };

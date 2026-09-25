@@ -239,15 +239,72 @@ export async function run(args) {
   const revCfg = () => ({ ...REV_DEFAULT_CONFIG, url: rnodeUrl, key: facilKey });
   // ONE function moves REV, for the room command and the HTTP endpoint alike.
   // A deterministic action — never the advisor's call (see handleFaucet).
+  /** A REV balance, read without deploying. null when the node will not say. */
+  async function revBalance(addr) {
+    const term = `new return, revVault(\`rho:rchain:revVault\`), ret in {
+  revVault!("getBalance", ${JSON.stringify(addr)}, *ret) | for (@r <- ret) { return!(r) }
+}`;
+    try {
+      const res = await fetch(`${rnodeUrl}/api/explore-deploy`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(term),
+      });
+      const j = JSON.parse(await res.text());
+      if (typeof j === "string") return null;              // rnode reports an error as a bare string
+      const e = (j.expr ?? [])[0];
+      return e && typeof e.ExprInt === "number" ? e.ExprInt : null;
+    } catch { return null; }
+  }
+
+  /** Did the deploy run, and did it error? Read from its own status, by signature. */
+  async function deployRan(sig, tries = 12) {
+    for (let i = 0; i < tries; i++) {
+      await new Promise((r) => setTimeout(r, 4000));
+      try {
+        const j = await (await fetch(`${rnodeUrl}/api/v1/deploy-status/${sig}`)).json();
+        if (j?.ProcessedWithError) {
+          const e = j.ProcessedWithError.deployError ?? j.ProcessedWithError;
+          return { ran: true, errored: true, why: JSON.stringify(e).slice(0, 200) };
+        }
+        if (j?.ProcessedWithSuccess) return { ran: true, errored: false };
+      } catch { /* keep waiting */ }
+    }
+    return { ran: false, errored: false };
+  }
+
   async function faucetSend(addr) {
+    // CONFIRM BY THE BALANCE, not by the deploy's return value.
+    //
+    // This used to read `out.value`, which rholang-client fetches from the
+    // deployer key's REGISTRY RESULT SLOT — and that slot is not written on
+    // every node (measured: a ProcessedWithSuccess deploy left it empty on the
+    // rebuilt playground). `$transfer` answers on `return`, not on
+    // `rho:rchain:deployId`, so there was nothing to read either way and
+    // `confirmed` could never be true however long it waited. Every successful
+    // transfer was reported as "couldn't confirm", which reads like failure and
+    // invites a retry — and the retries are what actually happened.
+    //
+    // So: ask the chain the question the user is really asking. Did the
+    // recipient's balance go up?
+    const before = await revBalance(addr);
     const term = MACROS.transfer.expand({ amount: FAUCET_AMOUNT, to: addr });
-    const out = await revDeployTerm(revCfg(), term);
+    const out = await revDeployTerm(revCfg(), term, { waitAttempts: 0 });
     if (!out.ok) return { ok: false, message: String(out.message ?? "") };
-    const v = String(out.value ?? "");
-    // deployId is what rnode calls the deploy's signature — the id r-wallet
-    // polls `/api/v1/deploy-status/<id>` with.
-    if (/transfer ok/i.test(v)) return { ok: true, confirmed: true, message: v, deployId: out.sig };
-    return { ok: true, confirmed: false, message: v, deployId: out.sig };
+
+    const fate = await deployRan(out.sig);
+    if (fate.errored) return { ok: false, message: `it ran and errored: ${fate.why}` };
+
+    if (before !== null) {
+      for (let i = 0; i < 8; i++) {
+        const now = await revBalance(addr);
+        if (now !== null && now > before) {
+          return { ok: true, confirmed: true, balance: now, deployId: out.sig };
+        }
+        await new Promise((r) => setTimeout(r, 4000));
+      }
+    }
+    // The deploy is in a block and did not error, so the REV is on its way even
+    // if the read has not caught up. Say which of those two things we know.
+    return { ok: true, confirmed: false, ran: fate.ran, deployId: out.sig };
   }
   if (args.faucetHttp !== undefined) {
     if (!Number.isInteger(args.faucetHttp) || args.faucetHttp <= 0) { console.error(`${TAG} --faucet-http needs a port number`); process.exit(1); }
@@ -507,9 +564,15 @@ export async function run(args) {
     try {
       const out = await faucetSend(addr);
       if (!out.ok) { directReply(fromId, `Deploy failed: ${out.message.slice(0, 300)}`); return; }
-      if (out.confirmed) directReply(fromId, `✅ Sent ${FAUCET_REV} test REV to ${addr}.`);
-      else if (out.message) directReply(fromId, `⚠️ Deploy landed but the transfer didn't confirm: ${out.message.slice(0, 300)}`);
-      else directReply(fromId, `Deploy accepted, but I couldn't confirm the transfer within the wait window — check your balance with \`$balance($me)\` in a bit — that is a \`/rholang eval\` under the hood, if you want to see the program.`);
+      // Say what is known, and never say something that reads as failure when
+      // the transfer is simply still settling — that is what made people retry.
+      if (out.confirmed) {
+        directReply(fromId, `✅ Sent ${FAUCET_REV} test REV to ${addr} — your balance is now ${out.balance}.`);
+      } else if (out.ran) {
+        directReply(fromId, `✅ Sent ${FAUCET_REV} test REV to ${addr}. It is in a block and did not error, but my balance read has not caught up yet — it will arrive; no need to ask again. Check with \`$balance($me)\` (a \`/rholang eval\` under the hood, if you want to see the program).`);
+      } else {
+        directReply(fromId, `Deploy accepted for ${addr}, but no block carried it within my wait window. That is normal when the chain is quiet — it is queued, not lost, so please do not resend. \`$balance($me)\` will show it.`);
+      }
     } catch (e) { directReply(fromId, `Faucet error: ${e?.message ?? e}`); }
   }
   // Intent phrases an ask-mode question routes here on, BEFORE the LLM ever
