@@ -131,3 +131,41 @@ A non-`capture` macro rejects `as`; an unbalanced pattern, or `as` with no `<pat
 **Known gaps.** The browser signs **ECDSA P-256** where RChain needs secp256k1 (Web Crypto has no secp256k1) — a pipeline placeholder, nothing signed today is valid on a real network. Macros expand to *standalone* programs (`new ret in { … }`), so embedding one mid-expression yields rholang the linter rejects. The agent and browser halves are not yet a closed loop.
 
 **Local testing.** A single standalone node runs everything: `rnode run -s --autopropose --no-upnp --host 127.0.0.1 …` (`--host` matters — without it the node guesses an external IP and Kademlia fails to bind). Ports 40401 external gRPC / 40402 internal (eval, propose, repl) / 40403 HTTP. `rnode --grpc-port 40402 eval f.rho` runs rholang with no signing and no block — the fastest loop. `No value set for `rho:qucalc:zfa`` means the node is running a build from before the QuCalc processes landed; a running node keeps its binary image after the file on disk is replaced.
+
+## "It worked but reported nothing" — the result slot is not written everywhere
+
+A deploy's answer normally reaches you through the **deployer key's registry result
+slot**: `wrapProgram` wraps the program so a send to `return` is forwarded there with
+`rho:registry:insertSigned`, and `readResults` / `/rholang read` fetch it back. One key,
+one slot, one job.
+
+**That slot is not written on every node.** Measured on the rebuilt playground: a deploy
+that came back `ProcessedWithSuccess` left the key's slot at `nonce: null`, so a program
+that ran perfectly reported nothing at all. The deploy is fine; the readback is not.
+
+It is worth knowing because the symptom is never "the readback is broken" — it is whatever
+the caller concluded from an empty answer, and it has been three different-looking bugs:
+
+| what it looked like | what it was |
+|---|---|
+| `locker.js`: every verb answered nothing | the answer went only to `return` |
+| `rgov-core.js`: "installed, but no uri came back" | same |
+| the room agent's faucet: *"couldn't confirm the transfer"* for transfers that **had landed** | same — and no wait would ever have helped |
+
+**The fix is to answer somewhere else as well.** `rho:rchain:deployId` comes back inside
+the deploy's own `/api/v1/deploy-status/<sig>`, which is not subject to this, so a program
+that wants to be readable sends to both:
+
+```rholang
+for (@answer <- ret) { return!(answer) | deployId!(answer) }
+```
+
+`deployAnswer(cfg, sig)` in [`rholang.ts`](../packages/browser/src/rholang.ts) reads that
+path, and `/rholang deploy` falls back to it before reporting silence. `locker.js` and
+`rgov-core.js` both answer on both channels.
+
+**Where there is nothing to read, confirm by the effect instead.** A REV transfer is the
+clearest case: the macro answers on `return` only, so rather than reading a value the room
+agent's faucet reads the *recipient's balance* before and after, and checks the deploy's
+status for an error. That confirms the thing the user actually cares about, and it cannot
+be defeated by a readback path that is missing.
