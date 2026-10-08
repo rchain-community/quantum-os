@@ -55,8 +55,20 @@ async function write(label, key, program, check) {
   fail++; console.log(`FAIL ${label}: not processed`); return null;
 }
 
+// Read at the NEWEST block. Plain /api/explore-deploy evaluates against the last
+// FINALIZED block, which trails a write by a block or more, so a read right after
+// a write saw the state from before it — 16 of rgov-core-check's and 5 of
+// dictionary-check's failures on rchain-rust bc80abb were exactly that.
+async function exploreLatest(program) {
+  const blocks = await (await fetch(`${NODE}/api/blocks/1`)).json().catch(() => []);
+  const blockHash = blocks?.[0]?.blockHash;
+  if (!blockHash) return fetch(`${NODE}/api/explore-deploy`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(program) });
+  return fetch(`${NODE}/api/explore-deploy-by-block-hash`, { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ term: program, blockHash, usePreStateHash: false }) });
+}
+
 async function read(label, program, check) {
-  const res = await fetch(`${NODE}/api/explore-deploy`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(program) });
+  const res = await exploreLatest(program);
   const text = await res.text();
   let j; try { j = JSON.parse(text); } catch { fail++; console.log(`FAIL ${label}: ${text.slice(0, 160)}`); return null; }
   if (typeof j === "string") { fail++; console.log(`FAIL ${label}: ${j.slice(0, 200)}`); return null; }
