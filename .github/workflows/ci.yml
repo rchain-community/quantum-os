@@ -176,6 +176,12 @@ jobs:
       - name: QuCalc search test
         run: node packages/browser/test/qucalc-search.test.mjs
 
+      # Tier-2 rnode room members (#138): a single node stays inconclusive;
+      # identical inputs may agree; same-input post-state/result divergence is
+      # explicit falsifier evidence. Pure decision logic, no live rnode needed.
+      - name: Rholang multi-rnode probe test
+        run: node packages/browser/test/rholang-probe.test.mjs
+
   docs:
     name: Document network
     runs-on: ubuntu-latest
