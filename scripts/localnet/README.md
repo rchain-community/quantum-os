@@ -119,7 +119,15 @@ goes up as a JSON string. `rholang.ts` already does this.
 
 ## What is known about rnode
 
-Checked against `dev` at `0a2141be1`, the build `bin/rnode` ships.
+**The build `bin/rnode` ships** is rchain-rust `dev` at `bc80abb` (2026-10-08),
+static musl (`cargo build --release -p rchain-node --bin rnode --target
+x86_64-unknown-linux-musl`), `sha256:a22e0ead719f…`. On a fresh genesis from
+these files it passes `rgov-core-check` 84/84, `dictionary-check` 27/27,
+`locker-check` 9/9 and `macro-check` 14/14 (6 skipped). The build it replaced
+answered registry lookups in the pre-C18 `(uri, value)` shape and did not match
+map patterns with a remainder, so `rgov-core-check` passed 6 of 84 on it.
+
+The notes below were checked against the previous build, `dev` at `0a2141be1`.
 
 **`match` selects the branch it should.** First written branch wins, a `_`
 wildcard is reached when nothing before it matches, and a later branch does not
