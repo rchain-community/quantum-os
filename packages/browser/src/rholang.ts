@@ -812,8 +812,9 @@ export async function deployTerm(cfg: NodeConfig, term: string): Promise<DeployO
     timestamp: Date.now(),
     phloPrice: cfg.phloPrice,
     phloLimit: cfg.phloLimit,
-    // A deploy is valid only after a block rnode already has; the current
-    // height is always safe, and 0 (genesis) is the floor.
+    // A deploy is valid only after a block rnode already has; the current height is always
+    // safe. 0 is not: with the expiry horizon it is the one value that can never be
+    // included (issue #356).
     validAfterBlockNumber: Math.max(0, (status.latestBlockNumber ?? 0) - 1),
     // The node's own answer wins over the persisted config: a shard's name is
     // whatever the node currently reports it as (e.g. rnode grew a leading
